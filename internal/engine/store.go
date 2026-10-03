@@ -83,7 +83,11 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	for _, q := range []string{
+		// Default cache is 2MiB and autocheckpoint is 1000 pages. A garbage backlog
+		// larger than that misses the cache and checkpoints mid-pass, so time per
+		// row grows with the table. 16MiB and a 40MiB WAL threshold keep one pass linear.
 		"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL",
+		"PRAGMA cache_size=-16384", "PRAGMA wal_autocheckpoint=10000",
 		`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS grants (folder TEXT NOT NULL, principal TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,principal))`,
 		`CREATE INDEX IF NOT EXISTS grants_principal ON grants(principal,folder)`,
