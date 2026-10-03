@@ -473,9 +473,18 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 	ack := s.Meta.Transaction(finishCtx, func(m *Metadata) error {
 		v, ok := m.Tickets[t.ID]
 		_, authorized := access(m, p, id, true, false)
-		if ok && authorized == nil && v.Principal == p && v.AuthEpoch == m.Folders[id].AuthEpoch && v.Expires.After(s.now()) && putErr == nil {
+		// Bytes are already stored. A transfer that consumed its window still
+		// needs one reservation for the commit that follows this acknowledgment.
+		if ok && authorized == nil && v.Principal == p && v.AuthEpoch == m.Folders[id].AuthEpoch && putErr == nil && (v.Expires.After(s.now()) || v.Writing) {
 			v.Uploaded = true
 			v.Writing = false
+			ttl := s.ReservationTTL
+			if ttl <= 0 {
+				ttl = 5 * time.Minute
+			}
+			if !v.Expires.After(s.now().Add(ttl)) {
+				v.Expires = s.now().Add(ttl)
+			}
 			m.Tickets[t.ID] = v
 			return nil
 		}

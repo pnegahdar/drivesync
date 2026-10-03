@@ -188,10 +188,11 @@ const maintenanceBatch = 128
 
 // Each garbage batch is its own transaction: the writer is released between
 // batches, and the delete is one statement rather than one round trip per blob.
-// SQLite pages 256 rows. A page of 512 held the writer past the ceiling on a
-// slow race-detector runner; 256 still clears a 16k backlog inside the pass.
+// SQLite pages 128 rows. A page of 512, then 256, held the writer past the
+// ceiling on a slow race-detector runner (269ms at 256). 128 stays under it
+// and still clears a 16k backlog inside the pass.
 const garbageBatch = 64
-const garbagePage = 256
+const garbagePage = 128
 
 func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbage []string) context.Context {
 	return context.WithValue(ctx, scopeKey{}, Scope{Folder: folder, Paths: paths, Tickets: tickets, Garbage: garbage})
@@ -515,16 +516,20 @@ func (s *Server) maintenanceRows(ctx context.Context, folder string, tombstones 
 func (s *Server) renew(ctx context.Context, p Principal, id, tid string) error {
 	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	t, e := s.ticket(ctx, p, id, tid)
-	if e != nil {
+	// The read that noticed a short window can itself outlast that window.
+	// An idle reservation stays expired. An upload already holding it does not.
+	inFlight := errors.Is(e, ErrExpired)
+	if e != nil && !inFlight {
 		return e
 	}
 	ttl := s.ReservationTTL
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	if t.Expires.Sub(s.now()) >= ttl/2 {
+	if e == nil && t.Expires.Sub(s.now()) >= ttl/2 {
 		return nil
 	}
+	observed := t.Expires
 	ctx = context.WithValue(ctx, scopeKey{}, Scope{Principal: p, Folder: id, NoFiles: true, Write: true, Tickets: []string{tid}, Garbage: []string{}})
 	return s.Meta.Transaction(ctx, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
@@ -534,14 +539,22 @@ func (s *Server) renew(ctx context.Context, p Principal, id, tid string) error {
 		if !ok || t.Principal != p || t.FolderID != id || t.AuthEpoch != m.Folders[id].AuthEpoch {
 			return ErrDenied
 		}
-		if !t.Expires.After(s.now()) {
-			return ErrExpired
-		}
 		ttl := s.ReservationTTL
 		if ttl <= 0 {
 			ttl = 5 * time.Minute
 		}
-		if t.Expires.Sub(s.now()) >= ttl/2 {
+		// Same instant the pre-check saw while it was still valid. Carrying
+		// the renewal across this write is what the stream already earned.
+		if !inFlight && t.Expires.Equal(observed) {
+			t.Expires = s.now().Add(ttl)
+			m.Tickets[tid] = t
+			return nil
+		}
+		if !t.Expires.After(s.now()) {
+			if !t.Writing {
+				return ErrExpired
+			}
+		} else if t.Expires.Sub(s.now()) >= ttl/2 {
 			return nil
 		}
 		t.Expires = s.now().Add(ttl)
