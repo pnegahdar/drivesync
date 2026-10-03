@@ -27,7 +27,7 @@ func TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes(t *testing.T) {
 		t.Fatal(e)
 	}
 	dir := filepath.Join(t.TempDir(), "w")
-	r, e := drivesync.Attach(bg, a, f.ID, key, dir, drivesync.Options{Manual: true})
+	r, e := drivesync.Attach(bg, a, f.ID, key, dir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -52,7 +52,7 @@ func TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes(t *testing.T) {
 	}
 	_ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &old)
 	peerDir := filepath.Join(t.TempDir(), "peer")
-	peer, pe := drivesync.Attach(bg, s.Client(alice), f.ID, key, peerDir, drivesync.Options{Manual: true})
+	peer, pe := drivesync.Attach(bg, s.Client(alice), f.ID, key, peerDir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 	if pe != nil {
 		t.Fatal(pe)
 	}

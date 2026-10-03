@@ -1,0 +1,132 @@
+=== RUN   TestQARemoteDeleteLeaksIgnoredSecretViaConflictCopy
+    replicaqa_content_test.go:42: ignored secret reached peer b as " (conflict from a 20261003T153628.764633000Z-e83b59273c8385f9867130736902ff5d).env"
+    replicaqa_content_test.go:46: ignored local file keep.conf was deleted by a remote delete: stat /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQARemoteDeleteLeaksIgnoredSecretViaConflictCopy1451093527/002/a/keep.conf: no such file or directory
+--- FAIL: TestQARemoteDeleteLeaksIgnoredSecretViaConflictCopy (0.16s)
+=== RUN   TestQACaseAliasRenameRollsBackRemoteUpdate
+    replicaqa_content_test.go:89: peer's Readme.md update was overwritten without a conflict: remote Readme.md="readme v1", files on m=map[Readme (case conflict defa45ad94fa915aa1fda2ac71e0437a).md:readme v2 from a peer Readme.md:readme v1]
+--- FAIL: TestQACaseAliasRenameRollsBackRemoteUpdate (0.11s)
+=== RUN   TestQAPeerModesMakeLocalFilesWorldWritable
+    replicaqa_content_test.go:121: peer modes applied verbatim: tools=-rwxrwxrwx tools/run.sh=-rwxrwxrwx
+--- FAIL: TestQAPeerModesMakeLocalFilesWorldWritable (0.06s)
+=== RUN   TestQAGrowingFileNeverUploads
+    replicaqa_content_test.go:159: growing file never uploaded after 15 syncs (159 appends); last error: path has an active upload; uploads once growth stops: true
+--- FAIL: TestQAGrowingFileNeverUploads (0.28s)
+=== RUN   TestQAGitignoreStylePatternsSilentlyUploadExcludedFiles
+    replicaqa_content_test.go:179: secrets.env matched an ignore line but was uploaded; status errors=[]
+    replicaqa_content_test.go:179: .env matched an ignore line but was uploaded; status errors=[]
+    replicaqa_content_test.go:179: build/out.bin matched an ignore line but was uploaded; status errors=[]
+--- FAIL: TestQAGitignoreStylePatternsSilentlyUploadExcludedFiles (0.04s)
+=== RUN   TestQAIgnoredRowsMakeIdleSyncLinear
+    replicaqa_content_test.go:216: idle sync with an empty local tree takes 85.3644ms; 3101 ignored rows are reprocessed and rewritten each pull
+--- FAIL: TestQAIgnoredRowsMakeIdleSyncLinear (4.71s)
+=== RUN   TestQADeletesAreCommittedOneAtATime
+    replicaqa_content_test.go:242: rm -rf of 401 entries took 401 Commit calls (165.677416ms)
+--- FAIL: TestQADeletesAreCommittedOneAtATime (1.35s)
+=== RUN   TestQAGitLockFilesPropagate
+    replicaqa_content_test.go:260: a transient git lock file was materialized on the peer
+--- FAIL: TestQAGitLockFilesPropagate (0.13s)
+=== RUN   TestQALongRemotePathNeverRescanned
+    replicaqa_content_test.go:280: first sync (1024-byte path): <nil>
+    replicaqa_content_test.go:289: file materialized by a download is never rescanned: remote="v1" status errors=0 skipped=["/private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQALongRemotePathNeverRescanned1845839532/002/r/0-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/2-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/3-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/4-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd: open /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQALongRemotePathNeverRescanned1845839532/002/r/0-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/1-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/2-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/3-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd/4-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd: file name too long"]
+--- FAIL: TestQALongRemotePathNeverRescanned (0.12s)
+=== RUN   TestQALostCacheStateResurrectsRemoteDeletes
+    replicaqa_content_test.go:328: losing cache state silently resurrected a file deleted by a peer (state was /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQALostCacheStateResurrectsRemoteDeletes3924452412/001/Library/Caches/drivesync/93b40d9177be0b69f1dc2e2af0ac20c3/2d352a4e0b8d17abee17ec35647c7df9)
+--- FAIL: TestQALostCacheStateResurrectsRemoteDeletes (0.16s)
+=== RUN   TestQARemoteUpdateInRenameAwaySaveGapIsLost
+    replicaqa_content_test.go:360: lost a version: map[doc.md:local save]
+--- FAIL: TestQARemoteUpdateInRenameAwaySaveGapIsLost (0.19s)
+=== RUN   TestQABulkMoveReuploadsAndRedownloadsEverything
+    replicaqa_content_test.go:388: renaming a 4 MB directory uploaded 4198354 and re-downloaded 4198354 bytes
+--- FAIL: TestQABulkMoveReuploadsAndRedownloadsEverything (2.91s)
+=== RUN   TestQACommonLocalNamesNeverSync
+    replicaqa_content_test.go:443: never synced: ["logs/2026-10-03T10:00:00.log" "Why?.md" "draft." "Icon\r"] (Sync err=<nil>, skipped=4)
+--- FAIL: TestQACommonLocalNamesNeverSync (0.03s)
+=== RUN   TestQAKillChild
+    replicaqa_crash_test.go:23: child process only
+--- SKIP: TestQAKillChild (0.00s)
+=== RUN   TestQAKillNineDuringLargeSync
+    replicaqa_crash_test.go:149: kills=14 files=236 conflicts=20
+--- PASS: TestQAKillNineDuringLargeSync (8.64s)
+=== RUN   TestQARetryAcknowledgementLostOnInterruptedDelete
+    replicaqa_crash_test.go:180: acknowledged sync with a network blip: connection reset by peer
+    replicaqa_crash_test.go:184: acknowledged mass removal paused again after a transient failure: 16 of 17 tracked entries disappeared; deletes paused (Retry acknowledges intentional removal); remote still has 17 entries
+--- FAIL: TestQARetryAcknowledgementLostOnInterruptedDelete (0.09s)
+=== RUN   TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes
+=== RUN   TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/unmounted_volume
+=== RUN   TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/root_renamed
+=== RUN   TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/restored_copy_with_marker
+--- PASS: TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes (1.90s)
+    --- PASS: TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/unmounted_volume (1.61s)
+    --- PASS: TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/root_renamed (0.15s)
+    --- PASS: TestQAHoldsUnmountedMovedOrRestoredRootNeverDeletes/restored_copy_with_marker (0.13s)
+=== RUN   TestQAHoldsSharedStateDirRefused
+--- PASS: TestQAHoldsSharedStateDirRefused (0.06s)
+=== RUN   TestQAHoldsDiskFullDuringDownload
+--- PASS: TestQAHoldsDiskFullDuringDownload (1.45s)
+=== RUN   TestQAHoldsReadOnlyRemount
+    replicaqa_holds_test.go:141: attach on read-only mount refused: sync /var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQAHoldsReadOnlyRemount511787610/002/vol: read-only file system
+--- PASS: TestQAHoldsReadOnlyRemount (1.68s)
+=== RUN   TestQAHoldsBranchSwitchWithConcurrentPeerEdits
+--- PASS: TestQAHoldsBranchSwitchWithConcurrentPeerEdits (8.45s)
+=== RUN   TestQAHoldsStatePermissions
+--- PASS: TestQAHoldsStatePermissions (0.04s)
+=== RUN   TestQAHoldsMtimeOnlyChangeDoesNotUpload
+--- PASS: TestQAHoldsMtimeOnlyChangeDoesNotUpload (0.05s)
+=== RUN   TestQADeviceNumberChangeOnRemountWedges
+    replicaqa_roots_test.go:66: st_dev before=&{16777245 16832 4 18 501 20 0 [0 0 0 0] {1791041823 0} {1791041823 0} {1791041823 0} {1791041823 0} 136 0 4096 0 0 0 [0 0]} after=&{16777244 16832 4 18 501 20 0 [0 0 0 0] {1791041823 0} {1791041823 0} {1791041823 0} {1791041823 0} 136 0 4096 0 0 0 [0 0]}
+    replicaqa_roots_test.go:80: same volume remounted with a new st_dev; replica paused permanently (Retry does not help): peer="v1" err=attachment root identity missing or changed; sync paused
+--- FAIL: TestQADeviceNumberChangeOnRemountWedges (3.26s)
+=== RUN   TestQAUnreadableSubdirectoryPreventsAttach
+    replicaqa_roots_test.go:107: restart of an existing replica refused because one subdirectory is unreadable: open /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQAUnreadableSubdirectoryPreventsAttach126087476/002/a/cache: permission denied
+--- FAIL: TestQAUnreadableSubdirectoryPreventsAttach (0.05s)
+=== RUN   TestQATwoReplicasCanShareOneRoot
+    replicaqa_roots_test.go:125: second replica attached to /var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQATwoReplicasCanShareOneRoot3313193415/002/shared while /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestQATwoReplicasCanShareOneRoot3313193415/003/state-a is active on it
+--- FAIL: TestQATwoReplicasCanShareOneRoot (0.05s)
+=== RUN   TestQALaterAttachmentEnclosingStateLeaksPlaintextPaths
+    replicaqa_roots_test.go:155: folder 2 received .state/private/index.sqlite-wal containing folder 1's plaintext path names (168952 bytes)
+--- FAIL: TestQALaterAttachmentEnclosingStateLeaksPlaintextPaths (0.12s)
+=== RUN   TestQAConcurrentNestedAttachRace
+    replicaqa_roots_test.go:206: iteration 0: nested attachments both attached; child folder's file uploaded into parent folder: true
+--- FAIL: TestQAConcurrentNestedAttachRace (0.05s)
+=== RUN   TestQAMovingAnAttachmentIntoAnotherLeaksAcrossFolders
+    replicaqa_roots_test.go:235: vault replica: attachment root identity missing or changed; sync paused
+    replicaqa_roots_test.go:236: work replica: <nil>
+    replicaqa_roots_test.go:238: vault content "hunter2" was uploaded into the work folder
+--- FAIL: TestQAMovingAnAttachmentIntoAnotherLeaksAcrossFolders (0.12s)
+=== RUN   TestQAUnlistableRootDeletesEverywhere
+=== RUN   TestQAUnlistableRootDeletesEverywhere/3files
+    replicaqa_tier1_test.go:33: first sync with unlistable root: <nil>
+    replicaqa_tier1_test.go:43: unlistable root propagated deletes: remote=0 files, peer b=0 files (want 3); a still has them on disk: 3
+=== RUN   TestQAUnlistableRootDeletesEverywhere/6files
+    replicaqa_tier1_test.go:33: first sync with unlistable root: 6 of 6 tracked entries disappeared; deletes paused (Retry acknowledges intentional removal)
+    replicaqa_tier1_test.go:36: after Retry: <nil>
+    replicaqa_tier1_test.go:43: unlistable root propagated deletes: remote=0 files, peer b=0 files (want 6); a still has them on disk: 6
+--- FAIL: TestQAUnlistableRootDeletesEverywhere (0.33s)
+    --- FAIL: TestQAUnlistableRootDeletesEverywhere/3files (0.13s)
+    --- FAIL: TestQAUnlistableRootDeletesEverywhere/6files (0.20s)
+=== RUN   TestQAMassDeleteGuardBypassedDuringPull
+    replicaqa_tier1_test.go:82: sync with removal during pull: <nil>
+    replicaqa_tier1_test.go:84: mass removal during pull bypassed the guard: remote has 0 of 11 entries
+--- FAIL: TestQAMassDeleteGuardBypassedDuringPull (0.36s)
+=== RUN   TestQANestedMountUnmountDeletesPeerCopies
+    replicaqa_tier1_test.go:133: sync after unmount: <nil>
+    replicaqa_tier1_test.go:136: unmounting a nested volume deleted its files on every peer; peer now has 12 files
+--- FAIL: TestQANestedMountUnmountDeletesPeerCopies (1.72s)
+=== RUN   TestQARootMarkerRemovalWedgesPermanently
+    replicaqa_tier1_test.go:177: sync: attachment root identity missing or changed; sync paused
+    replicaqa_tier1_test.go:179: after Retry: attachment root identity missing or changed; sync paused
+    replicaqa_tier1_test.go:184: after re-Attach with the same state: attachment root identity missing or changed; sync paused
+    replicaqa_tier1_test.go:187: replica is permanently paused after its marker was removed from an unchanged root (same device/inode); peer has "v1", err=attachment root identity missing or changed; sync paused
+--- FAIL: TestQARootMarkerRemovalWedgesPermanently (0.73s)
+=== RUN   TestQASymlinkedRootSilentlyStopsUploads
+    replicaqa_tier1_test.go:218: local edits silently stopped uploading after the root became a same-inode symlink: peer has "v1", sync err=nil, status errors=[] skipped=[]
+--- FAIL: TestQASymlinkedRootSilentlyStopsUploads (0.09s)
+=== RUN   TestQAExFATRootRewritesPeerModes
+    replicaqa_volumes_test.go:47: exFAT replica re-uploaded an untouched download (version 1 -> 2) and changed the peer's mode to -rwx------
+--- FAIL: TestQAExFATRootRewritesPeerModes (1.99s)
+=== RUN   TestQAHFSPlusNormalizationConverges
+    replicaqa_volumes_test.go:76: remote after HFS+ replica: ["café/" "café/résumé.txt"]
+--- PASS: TestQAHFSPlusNormalizationConverges (1.43s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/internal/engine	43.061s
+FAIL

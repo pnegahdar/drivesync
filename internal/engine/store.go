@@ -414,17 +414,19 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		return e
 	}
 	m.Finish()
+	accounts := []any{}
 	for key, a := range m.Accounts {
 		if a == beforeAccounts[key] {
 			continue
 		}
-		b, e := json.Marshal(a)
-		if e != nil {
-			return e
+		b, err := json.Marshal(a)
+		if err != nil {
+			return err
 		}
-		if _, e = tx.ExecContext(ctx, "INSERT INTO accounts(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", key, b); e != nil {
-			return e
-		}
+		accounts = append(accounts, key, b)
+	}
+	if e = writeValues(ctx, tx, "INSERT INTO accounts(id,data) VALUES ", " ON CONFLICT(id) DO UPDATE SET data=excluded.data", 2, accounts); e != nil {
+		return e
 	}
 
 	next := map[string]map[string][]byte{"folders": {}, "grants": {}, "files": {}, "tickets": {}, "garbage": {}}
@@ -465,77 +467,79 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		next["tickets"][id] = b
 	}
 	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
-		var upsert, remove *sql.Stmt
-		defer func() {
-			if upsert != nil {
-				upsert.Close()
-			}
-			if remove != nil {
-				remove.Close()
-			}
-		}()
+		prefix := "INSERT INTO " + table + "(id,folder,data) VALUES "
+		suffix := " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
+		if table == "files" {
+			prefix = "INSERT INTO files(folder,path,data) VALUES "
+			suffix = " ON CONFLICT(folder,path) DO UPDATE SET data=excluded.data"
+		}
+		if table == "grants" {
+			prefix = "INSERT INTO grants(folder,principal,data) VALUES "
+			suffix = " ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
+		}
+		if table == "folders" {
+			prefix = "INSERT INTO folders(id,owner,data) VALUES "
+			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
+		}
+		updated, created := []any{}, []any{}
 		for id, b := range next[table] {
 			if bytes.Equal(b, old[table][id]) {
 				continue
 			}
-			query := "INSERT INTO " + table + "(id,folder,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
-			folder := ""
-			if table == "tickets" {
-				folder = m.Tickets[id].FolderID
-			}
-			if table == "garbage" {
-				folder = m.Garbage[id].FolderID
-			}
-			args := []any{id, folder, b}
+			var args []any
 			switch table {
-			case "files":
-				query = "INSERT INTO files(folder,path,data) VALUES(?,?,?) ON CONFLICT(folder,path) DO UPDATE SET data=excluded.data"
+			case "files", "grants":
 				args = []any{id[:32], id[33:], b}
 			case "folders":
-				query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
-				if _, exists := old[table][id]; !exists {
-					query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?)"
-				}
 				args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
-			case "grants":
-				query = "INSERT INTO grants(folder,principal,data) VALUES(?,?,?) ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
-				args = []any{id[:32], id[33:], b}
+			case "tickets":
+				args = []any{id, m.Tickets[id].FolderID, b}
+			case "garbage":
+				args = []any{id, m.Garbage[id].FolderID, b}
 			}
-			if upsert == nil {
-				upsert, e = tx.PrepareContext(ctx, query)
-				if e != nil {
-					return e
-				}
-			}
-			if _, e = upsert.ExecContext(ctx, args...); e != nil {
-				if table == "folders" && strings.Contains(e.Error(), "UNIQUE constraint failed") {
-					return ErrConflict
-				}
-				return e
+			if table == "folders" && old[table][id] == nil {
+				created = append(created, args...)
+			} else {
+				updated = append(updated, args...)
 			}
 		}
+		if e = writeValues(ctx, tx, prefix, suffix, 3, updated); e != nil {
+			return e
+		}
+		if e = writeValues(ctx, tx, prefix, "", 3, created); e != nil {
+			if strings.Contains(e.Error(), "UNIQUE constraint failed") {
+				return ErrConflict
+			}
+			return e
+		}
+		var remove *sql.Stmt
 		for id := range old[table] {
 			if _, ok := next[table][id]; ok {
 				continue
 			}
-			query := "DELETE FROM " + table + " WHERE id=?"
+			q := "DELETE FROM " + table + " WHERE id=?"
 			args := []any{id}
 			if table == "files" {
-				query = "DELETE FROM files WHERE folder=? AND path=?"
+				q = "DELETE FROM files WHERE folder=? AND path=?"
 				args = []any{id[:32], id[33:]}
-			} else if table == "grants" {
-				query = "DELETE FROM grants WHERE folder=? AND principal=?"
+			}
+			if table == "grants" {
+				q = "DELETE FROM grants WHERE folder=? AND principal=?"
 				args = []any{id[:32], id[33:]}
 			}
 			if remove == nil {
-				remove, e = tx.PrepareContext(ctx, query)
+				remove, e = tx.PrepareContext(ctx, q)
 				if e != nil {
 					return e
 				}
 			}
 			if _, e = remove.ExecContext(ctx, args...); e != nil {
+				remove.Close()
 				return e
 			}
+		}
+		if remove != nil {
+			remove.Close()
 		}
 	}
 	if e = tx.Commit(); e != nil {
@@ -931,4 +935,18 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 		return Delta{}, e
 	}
 	return out, nil
+}
+
+// Bounded parameterized batches preserve the transaction boundary and avoid
+// preparing/executing a statement for every fixture or multi-path commit row.
+func writeValues(ctx context.Context, tx *sql.Tx, prefix, suffix string, width int, args []any) error {
+	for len(args) > 0 {
+		n := min(len(args), 256*width)
+		values := strings.TrimSuffix(strings.Repeat("("+strings.TrimSuffix(strings.Repeat("?,", width), ",")+"),", n/width), ",")
+		if _, e := tx.ExecContext(ctx, prefix+values+suffix, args[:n]...); e != nil {
+			return e
+		}
+		args = args[n:]
+	}
+	return nil
 }

@@ -37,7 +37,7 @@ func TestEmptyMountpointPropagatesMassDelete(t *testing.T) {
 		t.Fatal(e)
 	}
 	peerDir := filepath.Join(t.TempDir(), "peer")
-	peer, e := drivesync.Attach(bg, s.Client(alice), f.ID, key, peerDir, drivesync.Options{Manual: true})
+	peer, e := drivesync.Attach(bg, s.Client(alice), f.ID, key, peerDir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 	if e != nil {
 		t.Fatal(e)
 	}

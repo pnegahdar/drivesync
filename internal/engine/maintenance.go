@@ -273,7 +273,7 @@ func (s *Server) collect(ctx context.Context) error {
 					if ok && current.Deleted && current.BlobID == row.BlobID {
 						current.BlobID = ""
 						current.SealedSize = 0
-						current.Metadata = nil
+						// Keep authenticated tombstone metadata until compaction.
 						m.Files[folder][pid] = current
 					}
 				}

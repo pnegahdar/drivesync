@@ -73,34 +73,40 @@ type Replica struct {
 	tombstones      map[string]uint64
 	retryAt         map[string]time.Time
 
-	client       Client
-	folder       string
-	session      string
-	key          FolderKey
-	dir          string
-	opts         Options
-	root         *os.Root
-	db           *sql.DB
-	lock         *os.File
-	index        map[string]IndexEntry
-	byID         map[string]string
-	byLocal      map[string]string
-	byFold       map[string]string
-	version      uint64
-	syncMu       sync.Mutex
-	mu           sync.Mutex
-	status       Status
-	quarantine   map[string]Row
-	ignoredRows  map[string]Row
-	retryRows    map[string]Row
-	blockedLocal map[string]bool
-	rejected     map[string]Rejection
-	ctx          context.Context
-	cancel       context.CancelFunc
-	done         chan struct{}
-	wake         chan struct{}
-	watcherClose func()
-	closed       sync.Once
+	client            Client
+	folder            string
+	session           string
+	key               FolderKey
+	dir               string
+	opts              Options
+	root              *os.Root
+	db                *sql.DB
+	lock              *os.File
+	rootLock          *os.File
+	generation        uint64
+	missingDeferred   map[string]uint64
+	ignoreFingerprint string
+	ignoredChanged    bool
+	adoption          bool
+	index             map[string]IndexEntry
+	byID              map[string]string
+	byLocal           map[string]string
+	byFold            map[string]string
+	version           uint64
+	syncMu            sync.Mutex
+	mu                sync.Mutex
+	status            Status
+	quarantine        map[string]Row
+	ignoredRows       map[string]Row
+	retryRows         map[string]Row
+	blockedLocal      map[string]bool
+	rejected          map[string]Rejection
+	ctx               context.Context
+	cancel            context.CancelFunc
+	done              chan struct{}
+	wake              chan struct{}
+	watcherClose      func()
+	closed            sync.Once
 }
 
 func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o Options) (*Replica, error) {
@@ -138,6 +144,11 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	if e != nil {
 		return nil, e
 	}
+	release, e := attachmentAdmission(dir)
+	if e != nil {
+		return nil, e
+	}
+	defer release()
 	if e = checkAttachments(ctx, dir, id); e != nil {
 		return nil, e
 	}
@@ -204,15 +215,27 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 		}
 	}
 	rctx, cancel := context.WithCancel(context.Background())
-	r := &Replica{tombstones: map[string]uint64{}, retryAt: map[string]time.Time{}, session: session, quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]IndexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
-	if e = ctx.Err(); e == nil {
+	r := &Replica{missingDeferred: map[string]uint64{}, tombstones: map[string]uint64{}, retryAt: map[string]time.Time{}, session: session, quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]IndexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
+	if _, me := os.Lstat(filepath.Join(dir, rootMarker)); errors.Is(me, os.ErrNotExist) {
+		b, _ := json.Marshal(rootIdentity{Folder: id, Token: randomID()})
+		e = writeMarker(filepath.Join(dir, rootMarker), b)
+	}
+	if e == nil {
+		e = ctx.Err()
+	}
+	if e == nil {
 		e = r.bindRoot()
+	}
+	if e == nil {
+		r.rootLock, e = lockState(filepath.Join(dir, rootMarker))
 	}
 	if e != nil {
 		cancel()
 		cleanup()
 		return nil, e
 	}
+	cleanupBase := cleanup
+	cleanup = func() { r.rootLock.Close(); cleanupBase() }
 	tombs, e := db.Query("SELECT id,version FROM tombstones")
 	if e != nil {
 		cancel()
@@ -273,6 +296,7 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 		return nil, e
 	}
 	_ = db.QueryRow("SELECT value FROM config WHERE key='version'").Scan(&r.version)
+	_ = db.QueryRow("SELECT value FROM config WHERE key='ignore'").Scan(&r.ignoreFingerprint)
 	pendingRows, pe := db.Query("SELECT id,data FROM pending")
 	if pe != nil {
 		cancel()
@@ -394,6 +418,9 @@ func (r *Replica) Close() error {
 		if ce := r.root.Close(); e == nil {
 			e = ce
 		}
+		if r.rootLock != nil {
+			r.rootLock.Close()
+		}
 		if ce := r.lock.Close(); e == nil {
 			e = ce
 		}
@@ -403,6 +430,11 @@ func (r *Replica) Close() error {
 func (r *Replica) RetryRejected() {
 	r.syncMu.Lock()
 	r.allowMassDelete = true
+	if r.validRoot() != nil {
+		if e := r.rebindRoot(); e != nil {
+			r.addError(e)
+		}
+	}
 	r.retryAt = map[string]time.Time{}
 	for pid, row := range r.quarantine {
 		r.retryRows[pid] = row
@@ -518,6 +550,9 @@ func (r *Replica) ignoreOne(p string, dir bool, patterns []string) bool {
 	if base == ".ds_store" || base == ".drivesyncignore" || strings.HasPrefix(base, ".drivesync") || strings.HasPrefix(base, ".~") || strings.HasPrefix(base, "~$") || strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") || strings.HasSuffix(base, ".tmp") {
 		return true
 	}
+	if strings.Contains("/"+p, "/.git/") && strings.HasSuffix(base, ".lock") {
+		return true
+	}
 	for _, raw := range patterns {
 		pattern := strings.ToLower(foldPath(strings.TrimSpace(raw)))
 		if pattern == "" || strings.HasPrefix(pattern, "#") {
@@ -528,10 +563,12 @@ func (r *Replica) ignoreOne(p string, dir bool, patterns []string) bool {
 		if onlyDir && !dir {
 			continue
 		}
-		if ok, _ := path.Match(pattern, p); ok {
+		anchored := strings.HasPrefix(pattern, "/")
+		pattern = strings.TrimPrefix(pattern, "/")
+		if globPath(strings.Split(pattern, "/"), strings.Split(p, "/")) {
 			return true
 		}
-		if !strings.Contains(pattern, "/") {
+		if !anchored && !strings.Contains(pattern, "/") {
 			if ok, _ := path.Match(pattern, base); ok {
 				return true
 			}
@@ -559,55 +596,79 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 	r.blockedLocal = map[string]bool{}
 	patterns := r.patterns()
 	skipped := []string{}
-	e := filepath.WalkDir(r.dir, func(full string, d fs.DirEntry, e error) error {
+	for _, rule := range patterns {
+		raw := strings.TrimSpace(rule)
+		_, err := path.Match(strings.ReplaceAll(raw, "**", "*"), "check")
+		if strings.HasPrefix(raw, "!") || strings.Contains(raw, "\\") || err != nil {
+			skipped = append(skipped, "unsupported ignore rule: "+raw)
+		}
+	}
+	e := fs.WalkDir(r.root.FS(), ".", func(local string, d fs.DirEntry, e error) error {
 		if e != nil {
-			skipped = append(skipped, full+": "+e.Error())
-			if rel, re := filepath.Rel(r.dir, full); re == nil {
-				r.blockLocal(filepath.ToSlash(rel))
+			if local == "." {
+				return e
 			}
+			r.blockLocal(local)
+			skipped = append(skipped, local+": "+e.Error())
+			return fs.SkipDir
+		}
+		if local == "." {
 			return nil
 		}
-		if full == r.dir {
-			return nil
+		if d.IsDir() {
+			info, err := d.Info()
+			if err == nil {
+				err = r.directoryBoundary(local, info)
+			}
+			if err != nil {
+				r.blockLocal(local)
+				skipped = append(skipped, local+": "+err.Error())
+				return fs.SkipDir
+			}
 		}
-		rel, e := filepath.Rel(r.dir, full)
-		if e != nil {
-			return e
-		}
-		local := filepath.ToSlash(rel)
 		if r.ignore(local, d.IsDir(), patterns) {
 			if d.IsDir() {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
-		if d.Type()&os.ModeSymlink != 0 {
+		if d.Type()&os.ModeSymlink != 0 || (!d.IsDir() && !d.Type().IsRegular()) {
 			r.blockLocal(local)
-			skipped = append(skipped, local+": symlink")
+			skipped = append(skipped, local+": unsupported entry or symlink")
 			return nil
 		}
 		p := r.remotePath(local)
-		if _, e = NormalizePath(p); e != nil {
+		if _, err := NormalizePath(p); err != nil {
 			r.blockLocal(local)
-			skipped = append(skipped, local+": invalid path")
+			r.reject(local, "", fmt.Errorf("name is not portable; remove reserved characters/names or shorten components (255 bytes): %w", err))
 			if d.IsDir() {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
 			return nil
 		}
 		if prior, ok := r.index[p]; d.IsDir() && ok && prior.Deleted && prior.Directory {
 			return nil
 		}
-		v, e := r.inspect(p, local)
-		if e != nil {
-			if errors.Is(e, os.ErrNotExist) {
+		v, err := r.inspect(p, local)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
 			r.blockLocal(local)
-			skipped = append(skipped, local+": "+e.Error())
+			skipped = append(skipped, local+": "+err.Error())
 			return nil
 		}
-		out[p] = v
+		if prior, ok := out[p]; ok {
+			delete(out, p)
+			r.blockLocal(local)
+			r.blockLocal(prior.Local)
+			r.reject(local, v.Hash, fmt.Errorf("ambiguous remote path %s", p))
+			r.reject(prior.Local, prior.Hash, fmt.Errorf("ambiguous remote path %s", p))
+			return nil
+		}
+		if !r.localBlocked(p) {
+			out[p] = v
+		}
 		return nil
 	})
 	r.mu.Lock()
@@ -631,8 +692,13 @@ func (r *Replica) safe(p string) error {
 		if s.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: symlink component %s", errLocalObstacle, p)
 		}
+		if s.IsDir() {
+			if e := r.directoryBoundary(strings.Join(parts[:i+1], "/"), s); e != nil {
+				return fmt.Errorf("%w: %v", errLocalObstacle, e)
+			}
+		}
 		if i < len(parts)-1 && !s.IsDir() {
-			return os.ErrNotExist
+			return errLocalObstacle
 		}
 	}
 	return nil
@@ -673,19 +739,19 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
 	}
 	h := blake3.New()
-	if _, e = io.Copy(h, f); e != nil {
+	if _, e = io.CopyN(h, f, v.Size); e != nil {
 		return v, e
 	}
 	v.Hash = fmt.Sprintf("%x", h.Sum(nil))
 	return v, nil
 }
 func sameFile(v LocalFile, i IndexEntry) bool {
-	return v.Hash == i.Hash && v.Directory == i.Directory && v.Mode == i.Mode
+	return v.Hash == i.Hash && v.Directory == i.Directory && v.Mode&0100 == i.Mode&0100
 }
 func (r *Replica) Sync(ctx context.Context) error {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
-	defer func() { r.allowMassDelete = false }()
+	r.generation++
 	if e := r.ctx.Err(); e != nil {
 		return e
 	}
@@ -696,6 +762,7 @@ func (r *Replica) Sync(ctx context.Context) error {
 	if e == nil {
 		r.mu.Lock()
 		r.status.Errors = nil
+		r.status.LastSync = time.Now()
 		r.mu.Unlock()
 	}
 	if pe := r.persistStatus(); pe != nil && e == nil {
@@ -722,17 +789,14 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 	}
 	writable := folder.Role == Owner || folder.Role == Writer
+	record(r.pull(ctx, nil))
 	local, e := r.ScanLocal()
 	if e != nil {
 		return e
 	}
 	deleteErr := r.deleteSafety(local)
 	record(deleteErr)
-	record(r.pull(ctx, local))
-	local, e = r.ScanLocal()
-	if e != nil {
-		return e
-	}
+
 	paths := make([]string, 0, len(local))
 	var up int64
 	for p, v := range local {
@@ -1041,7 +1105,7 @@ func (r *Replica) sync(ctx context.Context) error {
 					if e == nil {
 						var opened os.FileInfo
 						opened, e = file.Stat()
-						if e == nil && (!os.SameFile(before, opened) || opened.Size() != v.Size) {
+						if e == nil && (!os.SameFile(before, opened) || opened.Size() < v.Size) {
 							e = ErrBusy
 						}
 						if e != nil {
@@ -1064,7 +1128,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		pr, pw := io.Pipe()
 		sealedDone := make(chan error, 1)
 		go func() {
-			e := SealContent(pw, io.TeeReader(&contextReader{ctx, src}, h), r.key, r.folder, t.BlobID, pid)
+			e := SealContent(pw, io.TeeReader(io.LimitReader(&contextReader{ctx, src}, v.Size), h), r.key, r.folder, t.BlobID, pid)
 			_ = pw.CloseWithError(e)
 			sealedDone <- e
 		}()
@@ -1119,31 +1183,72 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 	}
 	sort.Slice(deleted, func(i, j int) bool { return len(deleted[i]) > len(deleted[j]) })
-	for _, p := range deleted {
-		i := r.index[p]
-		if r.exactExists(i.Local) {
+
+	for len(deleted) > 0 {
+		n := min(len(deleted), 256)
+		group := deleted[:n]
+		deleted = deleted[n:]
+		mutations := []Mutation{}
+		for _, p := range group {
+			i := r.index[p]
+			pid, _ := PathID(r.key, r.folder, p)
+			if r.exactExists(i.Local) {
+				continue
+			}
+			if _, pending := r.retryRows[pid]; pending {
+				continue
+			}
+			mutations = append(mutations, Mutation{PathID: pid, BaseVersion: i.Version, Deleted: true})
+		}
+		if len(mutations) == 0 {
 			continue
 		}
-		pid, _ := PathID(r.key, r.folder, p)
-		var tombstone Delta
 		if e = r.validRoot(); e != nil {
 			return e
 		}
-		tombstone, e = r.client.Commit(ctx, r.folder, []Mutation{{PathID: pid, BaseVersion: i.Version, Deleted: true}})
-		if e != nil && !errors.Is(e, ErrConflict) {
-			record(e)
+		d, err := r.client.Commit(ctx, r.folder, mutations)
+		if errors.Is(err, ErrConflict) {
+			var conflict *ConflictError
+			if errors.As(err, &conflict) {
+				bad := map[string]bool{}
+				for _, pid := range conflict.Paths {
+					bad[pid] = true
+				}
+				retry := mutations[:0]
+				for _, m := range mutations {
+					if !bad[m.PathID] {
+						retry = append(retry, m)
+					}
+				}
+				if len(retry) > 0 {
+					d, err = r.client.Commit(ctx, r.folder, retry)
+				}
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, ErrConflict) {
+				record(err)
+			}
 			continue
 		}
-		if e == nil {
+		for _, row := range d.Rows {
+			p := r.byID[row.PathID]
+			i := r.index[p]
 			i.Deleted = true
 			i.Hash = ""
-			i.Version = tombstone.Rows[0].Version
+			i.Version = row.Version
 			if e = r.save(i); e != nil {
 				return e
 			}
 		}
 	}
 	record(r.pull(ctx, local))
+	if firstError == nil {
+		if deleteErr == nil {
+			r.allowMassDelete = false
+		}
+		r.adoption = false
+	}
 	return firstError
 }
 
@@ -1155,7 +1260,13 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 	if e != nil {
 		return e
 	}
+	affected := map[string]bool{}
 	if delta.Full {
+		for _, set := range []map[string]Row{r.retryRows, r.ignoredRows, r.quarantine} {
+			for pid := range set {
+				affected[pid] = true
+			}
+		}
 		r.reconcileFull(&delta)
 	}
 	for _, row := range delta.Rows {
@@ -1169,9 +1280,16 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 		}
 		delta.Rows = append(delta.Rows, row)
 	}
-	for pid, row := range r.ignoredRows {
-		delta.Rows = append(delta.Rows, row)
-		delete(r.ignoredRows, pid)
+	r.patterns()
+	if r.ignoredChanged {
+		r.ignoredChanged = false
+		for pid, row := range r.ignoredRows {
+			delta.Rows = append(delta.Rows, row)
+			delete(r.ignoredRows, pid)
+		}
+	}
+	if len(delta.Rows) == 0 && !delta.Full {
+		return nil
 	}
 	latest := map[string]Row{}
 	for _, row := range delta.Rows {
@@ -1207,6 +1325,41 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 			metadata[row.PathID] = m
 		}
 	}
+	// Path-bound ciphertext needs a new upload for a rename, but a peer can
+	// move its verified plaintext instead of downloading the same bytes again.
+	moved := map[string]bool{}
+	sources := map[string][]Row{}
+	for _, row := range delta.Rows {
+		if row.Deleted {
+			if p, ok := r.byID[row.PathID]; ok {
+				i := r.index[p]
+				if !i.Deleted && !i.Directory && !r.ignore(i.Local, false, r.patterns()) {
+					sources[i.Hash] = append(sources[i.Hash], row)
+				}
+			}
+		}
+	}
+	for _, row := range delta.Rows {
+		m, ok := metadata[row.PathID]
+		if !ok || m.Directory {
+			continue
+		}
+		for len(sources[m.Hash]) > 0 {
+			list := sources[m.Hash]
+			old := list[len(list)-1]
+			sources[m.Hash] = list[:len(list)-1]
+			if old.Version != row.Version {
+				continue
+			}
+			i := r.index[r.byID[old.PathID]]
+			if e = r.moveRemote(row, m, i); e != nil {
+				continue
+			}
+			moved[old.PathID] = true
+			moved[row.PathID] = true
+			break
+		}
+	}
 	sort.SliceStable(delta.Rows, func(i, j int) bool {
 		a, b := delta.Rows[i], delta.Rows[j]
 		if a.Deleted != b.Deleted {
@@ -1229,6 +1382,11 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 	for len(pending) > 0 {
 		row := pending[0]
 		pending = pending[1:]
+		if moved[row.PathID] {
+			delete(r.retryRows, row.PathID)
+			delete(r.retryAt, row.PathID)
+			continue
+		}
 		if prior, ok := r.retryRows[row.PathID]; ok && prior.Version == row.Version && time.Now().Before(r.retryAt[row.PathID]) {
 			continue
 		}
@@ -1259,17 +1417,22 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 		return se
 	}
 	defer stateTx.Rollback()
-	if _, e = stateTx.Exec("DELETE FROM pending"); e != nil {
-		return e
+	for _, row := range delta.Rows {
+		affected[row.PathID] = true
 	}
-	for kind, set := range map[string]map[string]Row{"quarantine": r.quarantine, "ignored": r.ignoredRows, "retry": r.retryRows} {
-		for pid, row := range set {
-			b, me := json.Marshal(pendingRow{Row: row, Kind: kind, RetryAt: r.retryAt[pid]})
-			if me != nil {
-				return me
-			}
-			if _, me = stateTx.Exec("INSERT OR REPLACE INTO pending(id,data) VALUES(?,?)", pid, b); me != nil {
-				return me
+	for pid := range affected {
+		if _, e = stateTx.Exec("DELETE FROM pending WHERE id=?", pid); e != nil {
+			return e
+		}
+		for kind, set := range map[string]map[string]Row{"quarantine": r.quarantine, "ignored": r.ignoredRows, "retry": r.retryRows} {
+			if row, ok := set[pid]; ok {
+				b, me := json.Marshal(pendingRow{Row: row, Kind: kind, RetryAt: r.retryAt[pid]})
+				if me != nil {
+					return me
+				}
+				if _, me = stateTx.Exec("INSERT OR REPLACE INTO pending(id,data) VALUES(?,?)", pid, b); me != nil {
+					return me
+				}
 			}
 		}
 	}
@@ -1296,6 +1459,9 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 		}
 	}
 	if e = flushTombs(); e != nil {
+		return e
+	}
+	if _, e = stateTx.Exec("INSERT OR REPLACE INTO config(key,value) VALUES('ignore',?)", r.ignoreFingerprint); e != nil {
 		return e
 	}
 	if _, e = stateTx.Exec("INSERT INTO config(key,value) VALUES('version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", delta.Version); e != nil {
@@ -1438,8 +1604,31 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	i := r.index[p]
 	if row.Deleted {
 		r.tombstones[row.PathID] = max(r.tombstones[row.PathID], row.Version)
+		if !known && len(row.Metadata) > 0 {
+			m, e := OpenMetadata(r.key, r.folder, row)
+			if e != nil {
+				return e
+			}
+			p = m.Path
+			i = IndexEntry{Path: p, Local: p, Hash: m.Hash, Directory: m.Directory, Mode: m.Mode}
+			v, err := r.inspect(p, p)
+			if err == nil && v.Hash != m.Hash {
+				i.Deleted = true
+				i.Version = row.Version
+				return r.save(i)
+			}
+			if err == nil {
+				i.Mode = v.Mode
+			}
+			known = true
+		}
 		if !known {
 			return nil
+		}
+		if r.ignore(i.Local, i.Directory, r.patterns()) {
+			i.Deleted = true
+			i.Version = row.Version
+			return r.save(i)
 		}
 		if !r.exactExists(i.Local) {
 			i.Deleted = true
@@ -1510,6 +1699,14 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			}
 		}
 	}
+	if prior, ok := r.index[p]; ok && !prior.Deleted && prior.Local != p && !r.exactExists(prior.Local) && r.exactExists(p) {
+		if actual, err := r.inspect(p, p); err == nil && actual.Hash == prior.Hash {
+			prior.Local = p
+			if err = r.save(prior); err != nil {
+				return err
+			}
+		}
+	}
 	local := r.localPath(p, row.PathID)
 	if _, e = NormalizePath(local); e != nil {
 		return e
@@ -1521,6 +1718,17 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	if known && i.Version >= row.Version && !i.Awaiting {
 		return nil
 	}
+	if known && !i.Deleted && !i.Awaiting && !r.exactExists(i.Local) {
+		generation, seen := r.missingDeferred[row.PathID]
+		if !seen {
+			r.missingDeferred[row.PathID] = r.generation
+			return ErrBusy
+		}
+		if generation == r.generation {
+			return ErrBusy
+		}
+	}
+	delete(r.missingDeferred, row.PathID)
 	// Ignore a remote path locally but keep its row unacknowledged in the index. It remains on the server.
 	patterns := r.patterns()
 	if r.ignore(m.Path, m.Directory, patterns) || r.ignore(local, m.Directory, patterns) {
@@ -1536,7 +1744,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			if oe != nil {
 				return oe
 			}
-			e = f.Chmod(os.FileMode(m.Mode | 0600))
+			e = applyMode(f, m.Mode, false, r.localMode(local, false))
 			if e == nil {
 				e = f.Sync()
 			}
@@ -1547,7 +1755,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			if e = r.syncParent(local); e != nil {
 				return e
 			}
-			return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: m.Mode | 0600})
+			return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: r.localMode(local, false)})
 		}
 	}
 	if m.Directory {
@@ -1576,7 +1784,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 		if e = durableMkdirAll(r.root, local); e != nil {
 			return e
 		}
-		if e = r.root.Chmod(local, os.FileMode(m.Mode|0700)); e != nil {
+		if e = r.chmod(local, m.Mode, true); e != nil {
 			return e
 		}
 		opened, oe := r.root.Open(local)
@@ -1588,7 +1796,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 		if e != nil {
 			return e
 		}
-		return r.save(IndexEntry{Path: p, Local: local, Hash: "directory", Version: row.Version, Directory: true, Mode: m.Mode | 0700})
+		return r.save(IndexEntry{Path: p, Local: local, Hash: "directory", Version: row.Version, Directory: true, Mode: r.localMode(local, true)})
 	}
 	if e = durableMkdirAll(r.root, path.Dir(local)); e != nil {
 		return e
@@ -1617,7 +1825,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 		e = ErrIntegrity
 	}
 	if e == nil {
-		e = f.Chmod(os.FileMode(m.Mode | 0600))
+		e = applyMode(f, m.Mode, false, r.localMode(local, false))
 	}
 	if e == nil {
 		e = f.Sync()
@@ -1633,6 +1841,19 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	v, ve := r.inspect(p, local)
 	if ve == nil {
 		dirty := (!known || !sameFile(v, i)) && (v.Directory || v.Hash != m.Hash || v.Size != m.Size)
+		if dirty && !v.Directory && r.adoption {
+			conflict := variantPath(local, " (conflict from authority "+randomID()+")")
+			if e = r.root.Rename(temp, conflict); e != nil {
+				return e
+			}
+			if e = r.syncParent(conflict); e != nil {
+				return e
+			}
+			r.mu.Lock()
+			r.status.Conflicts = append(r.status.Conflicts, conflict)
+			r.mu.Unlock()
+			return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: r.localMode(local, false)})
+		}
 		if dirty || v.Directory {
 			if _, e = r.preserve(local); e != nil {
 				return e
@@ -1650,7 +1871,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	if e = r.syncParent(local); e != nil {
 		return e
 	}
-	return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: m.Mode | 0600})
+	return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: r.localMode(local, false)})
 }
 
 type countWriter struct {
@@ -1667,13 +1888,17 @@ func (w *countWriter) Write(p []byte) (int, error) {
 func mustReadDir(p string) []os.DirEntry { entries, _ := os.ReadDir(p); return entries }
 func (r *Replica) patterns() []string {
 	patterns := append([]string(nil), r.opts.Ignore...)
-	if info, e := r.root.Lstat(".drivesyncignore"); e != nil || info.Mode()&os.ModeSymlink != 0 {
-		return patterns
+	if info, e := r.root.Lstat(".drivesyncignore"); e == nil && info.Mode().IsRegular() {
+		if f, e := openLocal(r.root, ".drivesyncignore"); e == nil {
+			b, _ := io.ReadAll(io.LimitReader(f, 64*1024))
+			f.Close()
+			patterns = append(patterns, strings.Split(string(b), "\n")...)
+		}
 	}
-	if f, e := openLocal(r.root, ".drivesyncignore"); e == nil {
-		b, _ := io.ReadAll(io.LimitReader(f, 64*1024))
-		f.Close()
-		patterns = append(patterns, strings.Split(string(b), "\n")...)
+	fingerprint := fmt.Sprintf("%x", blake3.Sum256([]byte(strings.Join(patterns, "\n"))))
+	if fingerprint != r.ignoreFingerprint {
+		r.ignoredChanged = true
+		r.ignoreFingerprint = fingerprint
 	}
 	return patterns
 }
@@ -1761,12 +1986,12 @@ func (r *Replica) exactExists(p string) bool {
 		}
 		f, e := r.root.Open(dir)
 		if e != nil {
-			return false
+			return !errors.Is(e, os.ErrNotExist)
 		}
 		entries, e := f.ReadDir(-1)
 		f.Close()
 		if e != nil {
-			return false
+			return !errors.Is(e, os.ErrNotExist)
 		}
 		found := false
 		for _, v := range entries {
@@ -1789,7 +2014,7 @@ func (r *Replica) localBlocked(p string) bool {
 		}
 		p = path.Dir(p)
 		if p == "." {
-			return false
+			return r.blockedLocal["."]
 		}
 	}
 }
@@ -1805,4 +2030,106 @@ func (r *Replica) blockLocal(local string) {
 			break
 		}
 	}
+}
+
+func globPath(pattern, names []string) bool {
+	if len(pattern) == 0 {
+		return len(names) == 0
+	}
+	if pattern[0] == "**" {
+		for i := 0; i <= len(names); i++ {
+			if globPath(pattern[1:], names[i:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(names) == 0 {
+		return false
+	}
+	ok, _ := path.Match(pattern[0], names[0])
+	return ok && globPath(pattern[1:], names[1:])
+}
+
+func (r *Replica) localMode(local string, directory bool) uint32 {
+	if info, e := r.root.Lstat(local); e == nil {
+		return uint32(info.Mode().Perm())
+	}
+	if directory {
+		return 0700
+	}
+	return 0600
+}
+func applyMode(f *os.File, remote uint32, directory bool, local uint32) error {
+	mode := local&^0100 | remote&0100 | 0600
+	if directory {
+		mode |= 0100
+	}
+	return f.Chmod(os.FileMode(mode))
+}
+func (r *Replica) chmod(local string, remote uint32, directory bool) error {
+	f, e := openLocal(r.root, local)
+	if e != nil {
+		return e
+	}
+	defer f.Close()
+	return applyMode(f, remote, directory, r.localMode(local, directory))
+}
+
+func (r *Replica) moveRemote(row Row, m FileMetadata, old IndexEntry) error {
+	if foldPath(old.Local) == foldPath(m.Path) && old.Local != m.Path {
+		return ErrBusy
+	}
+	local := r.localPath(m.Path, row.PathID)
+	if known, ok := r.index[m.Path]; ok && !known.Deleted && !r.exactExists(known.Local) {
+		return ErrBusy
+	}
+	if r.ignore(local, false, r.patterns()) {
+		return ErrBusy
+	}
+	v, e := r.inspect(old.Path, old.Local)
+	if e != nil {
+		return e
+	}
+	if v.Hash != m.Hash || v.Size != m.Size {
+		return ErrBusy
+	}
+	if r.exactExists(local) && local != old.Local {
+		return ErrBusy
+	}
+	if e = r.safe(local); e != nil {
+		return e
+	}
+	if e = durableMkdirAll(r.root, path.Dir(local)); e != nil {
+		return e
+	}
+	if e = r.root.Rename(old.Local, local); e != nil {
+		return e
+	}
+	if e = r.chmod(local, m.Mode, false); e != nil {
+		return e
+	}
+	f, e := openLocal(r.root, local)
+	if e != nil {
+		return e
+	}
+	e = f.Sync()
+	f.Close()
+	if e != nil {
+		return e
+	}
+	if e = r.syncParent(local); e != nil {
+		return e
+	}
+	if e = r.syncParent(old.Local); e != nil {
+		return e
+	}
+	old.Deleted = true
+	old.Version = row.Version
+	if e = r.save(old); e != nil {
+		return e
+	}
+	pid, _ := PathID(r.key, r.folder, old.Path)
+	r.tombstones[pid] = row.Version
+	return r.save(IndexEntry{Path: m.Path, Local: local, Hash: m.Hash, Version: row.Version, Mode: r.localMode(local, false)})
 }

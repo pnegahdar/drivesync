@@ -66,7 +66,7 @@ func TestParseFolderKey(t *testing.T) {
 	if _, e := c.CreateFolder(context.Background(), FolderSpec{Name: "zero"}, FolderKey{}); !errors.Is(e, ErrKey) {
 		t.Fatal("zero create", e)
 	}
-	if _, e := Attach(context.Background(), c, "missing", FolderKey{}, t.TempDir(), Options{}); !errors.Is(e, ErrKey) {
+	if _, e := Attach(context.Background(), c, "missing", FolderKey{}, t.TempDir(), Options{StateDir: filepath.Join(t.TempDir(), "state")}); !errors.Is(e, ErrKey) {
 		t.Fatal("zero attach", e)
 	}
 }
@@ -149,7 +149,7 @@ func TestFolderAndReplicaAPI(t *testing.T) {
 			if e != nil || len(list) != 1 || list[0].Role != Writer {
 				t.Fatal(list, e)
 			}
-			if _, e = Attach(ctx, c, f.ID, NewFolderKey(), filepath.Join(t.TempDir(), "bad"), Options{Manual: true}); !errors.Is(e, ErrKey) {
+			if _, e = Attach(ctx, c, f.ID, NewFolderKey(), filepath.Join(t.TempDir(), "bad"), Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true}); !errors.Is(e, ErrKey) {
 				t.Fatal(e)
 			}
 			status := b.Status()

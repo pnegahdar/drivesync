@@ -28,7 +28,7 @@ func TestStationWithManyFoldersLosesPushAndReportsWrongError(t *testing.T) {
 			t.Fatal(e)
 		}
 		dir := filepath.Join(t.TempDir(), fmt.Sprint(i))
-		r, e := ds.Attach(bg, s.Client(station), f.ID, k, dir, ds.Options{Name: fmt.Sprint(i), RescanInterval: time.Hour, Debounce: 10 * time.Millisecond})
+		r, e := ds.Attach(bg, s.Client(station), f.ID, k, dir, ds.Options{StateDir: filepath.Join(t.TempDir(), "state"), Name: fmt.Sprint(i), RescanInterval: time.Hour, Debounce: 10 * time.Millisecond})
 		if e != nil {
 			t.Fatal(e)
 		}

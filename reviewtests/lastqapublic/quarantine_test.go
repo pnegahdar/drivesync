@@ -23,12 +23,12 @@ func TestLocalObstacleQuarantinesValidRemoteRowForever(t *testing.T) {
 		t.Fatal(e)
 	}
 	ad, bd := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
-	ra, e := drivesync.Attach(bg, a, f.ID, key, ad, drivesync.Options{Manual: true, Name: "a"})
+	ra, e := drivesync.Attach(bg, a, f.ID, key, ad, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true, Name: "a"})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer ra.Close()
-	rb, e := drivesync.Attach(bg, s.Client(alice), f.ID, key, bd, drivesync.Options{Manual: true, Name: "b"})
+	rb, e := drivesync.Attach(bg, s.Client(alice), f.ID, key, bd, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true, Name: "b"})
 	if e != nil {
 		t.Fatal(e)
 	}

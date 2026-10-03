@@ -51,12 +51,12 @@ func TestDefaultStateDirLeaksNestedFolderToOuterGrantees(t *testing.T) {
 	}
 	root := t.TempDir()
 	repoDir := filepath.Join(root, "repo")
-	outer, e := drivesync.Attach(bg, a, repo.ID, repoKey, repoDir, drivesync.Options{Manual: true, Ignore: []string{"vault/"}})
+	outer, e := drivesync.Attach(bg, a, repo.ID, repoKey, repoDir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true, Ignore: []string{"vault/"}})
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer outer.Close()
-	inner, e := drivesync.Attach(bg, a, vault.ID, vaultKey, filepath.Join(repoDir, "vault"), drivesync.Options{Manual: true})
+	inner, e := drivesync.Attach(bg, a, vault.ID, vaultKey, filepath.Join(repoDir, "vault"), drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 	if e != nil {
 		return // Nested attachments must be refused before creating private state.
 	}
@@ -72,7 +72,7 @@ func TestDefaultStateDirLeaksNestedFolderToOuterGrantees(t *testing.T) {
 	}
 	// Bob has no grant on vault. He only reads repo.
 	bobDir := filepath.Join(t.TempDir(), "bob")
-	br, e := drivesync.Attach(bg, s.Client(bob), repo.ID, repoKey, bobDir, drivesync.Options{Manual: true})
+	br, e := drivesync.Attach(bg, s.Client(bob), repo.ID, repoKey, bobDir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 	if e != nil {
 		t.Fatal(e)
 	}

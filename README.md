@@ -51,7 +51,10 @@ Names are unique per primary owner. `Grant`, `Revoke`, `SetLimits`, `ListFolders
 `Status()` reports actionable local state; `Close()` stops the replica. The
 context passed to `Attach` bounds setup only; the replica lives until `Close`.
 `Retry()` retries rejected/quarantined transfers and acknowledges an intentional
-mass removal for the next sync. Root identity failures cannot be overridden.
+mass removal; the acknowledgement lasts until the scan guard passes. For a changed
+root, Retry starts fresh adoption with an empty index. Existing local writes remain
+local; differing authenticated remote contents survive as conflict copies. No
+deletes can be derived from the discarded index. A symlinked root cannot be rebound.
 
 Default state lives under `os.UserCacheDir()/drivesync/<folder>/<root-hash>`,
 with private permissions. Explicit `Options.StateDir` must be dedicated to this
@@ -66,9 +69,12 @@ without conflict copies. Symlinks, unsupported entries and unreadable files
 appear in status errors and protect their subtrees from deletion detection.
 
 The root contains a random `.drivesync-root` marker; saved state also binds its
-device/inode. Missing or replaced roots pause sync, preventing an unmounted disk
-from deleting peer files. Do not remove or copy this marker to relocate a replica;
-attach a new directory with new dedicated state. If at least five tracked entries
+folder, token and inode. Device numbers can change across remounts. Missing or
+replaced roots pause sync, preventing an unmounted disk from deleting peer files.
+Inspect the disk before using Retry to adopt a restored root. A lifetime marker
+flock prevents concurrent replicas on one root; attachment admission locks also
+prevent concurrent nested attachments. Foreign root/state markers and nested
+mount points are skipped and reported, including attachments moved into the tree. If at least five tracked entries
 exist and 80% disappear without matching moves, deletes pause with a status error.
 Inspect the disk before calling `Retry()` to acknowledge a deliberate removal.
 
@@ -132,9 +138,17 @@ Renames commit their create/delete pairs atomically; if full, they remain local
 and pending. Remote directory deletes preserve user-ignored contents, including
 `.git`; the directory becomes untracked when no tracked children remain. Only
 known junk (`.DS_Store`, `Thumbs.db`) is automatically removed. Tracked children
-keep the delete pending. `.drivesyncignore` accepts globs,
-comments and directory patterns, with case-folded NFC matching. Defaults exclude
-Finder/editor temporary files and staging files. Unignored rows are fetched later.
+keep the delete pending. Remote tombstones for ignored files update the index
+without touching local contents or making conflict copies. `.drivesyncignore`
+accepts globs, root-anchored `/` patterns, `**`, comments and directory patterns,
+with case-folded NFC matching. Negation and escape rules are unsupported and
+reported. Defaults exclude Finder/editor temporary files, `.git/**/*.lock` and
+staging files. Ignored rows are revisited only when rules change. Unsupported
+portable names are retained locally and reported as rejected. Only the owner
+execute bit syncs; local group/other permission bits remain local. Renames still
+need uploads because ciphertext binds the path; peers move verified matching
+files without downloading their bytes again. Tombstones retain authenticated
+metadata until compaction, allowing fresh state to recognize deleted contents.
 
 Byte budgets charge sealed bytes, metadata and 256 bytes per retained row.
 `MaxFileBytes` measures sealed content, so allow encryption overhead. `MaxFiles`

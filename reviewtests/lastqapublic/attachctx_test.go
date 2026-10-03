@@ -22,7 +22,7 @@ func TestAttachContextSilentlyStopsReplica(t *testing.T) {
 	}
 	dir := filepath.Join(t.TempDir(), "w")
 	setup, cancel := context.WithTimeout(bg, 10*time.Second)
-	r, e := drivesync.Attach(setup, a, f.ID, key, dir, drivesync.Options{Debounce: 10 * time.Millisecond, RescanInterval: 50 * time.Millisecond})
+	r, e := drivesync.Attach(setup, a, f.ID, key, dir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Debounce: 10 * time.Millisecond, RescanInterval: 50 * time.Millisecond})
 	cancel() // setup finished
 	if e != nil {
 		t.Fatal(e)

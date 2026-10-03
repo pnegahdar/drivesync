@@ -37,7 +37,7 @@ func TestDirectoryBlobStoreLeaksPerFolderDirectories(t *testing.T) {
 			t.Fatal(e)
 		}
 		dir := filepath.Join(t.TempDir(), "w")
-		r, e := drivesync.Attach(bg, a, f.ID, key, dir, drivesync.Options{Manual: true})
+		r, e := drivesync.Attach(bg, a, f.ID, key, dir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true})
 		if e != nil {
 			t.Fatal(e)
 		}

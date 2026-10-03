@@ -122,7 +122,7 @@ func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r)
 func attach(t testing.TB, c ds.Client, f ds.Folder, k ds.FolderKey, name string) (*ds.Replica, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), name)
-	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{Name: name, Manual: true, RescanInterval: time.Hour})
+	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{StateDir: filepath.Join(t.TempDir(), "state"), Name: name, Manual: true, RescanInterval: time.Hour})
 	if e != nil {
 		t.Fatal(e)
 	}

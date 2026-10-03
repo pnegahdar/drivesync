@@ -19,7 +19,7 @@ const stateMarker = ".drivesync-state"
 
 type rootIdentity struct {
 	Folder, Token string
-	Device, Inode uint64
+	Inode         uint64
 }
 
 func identifyRoot(dir string) (rootIdentity, error) {
@@ -39,13 +39,13 @@ func identifyRoot(dir string) (rootIdentity, error) {
 	if e = json.Unmarshal(b, &id); e != nil || id.Token == "" {
 		return id, ErrInvalid
 	}
-	info, e = os.Stat(dir)
-	if e != nil {
-		return id, e
+	info, e = os.Lstat(dir)
+	if e != nil || !info.IsDir() {
+		return id, fmt.Errorf("root is not a real directory: %w", ErrInvalid)
 	}
 	v := reflect.Indirect(reflect.ValueOf(info.Sys()))
 	if v.IsValid() && v.Kind() == reflect.Struct {
-		for name, dst := range map[string]*uint64{"Dev": &id.Device, "Ino": &id.Inode} {
+		for name, dst := range map[string]*uint64{"Ino": &id.Inode} {
 			field := v.FieldByName(name)
 			if field.IsValid() && field.CanUint() {
 				*dst = field.Uint()
@@ -69,14 +69,27 @@ func checkAttachments(ctx context.Context, dir, folder string) error {
 			break
 		}
 	}
+	rootInfo, e := os.Lstat(dir)
+	if e != nil {
+		return e
+	}
 	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, e error) error {
 		if ce := ctx.Err(); ce != nil {
 			return ce
 		}
 		if e != nil {
-			return e
+			if p == dir {
+				return e
+			}
+			return filepath.SkipDir
 		}
-		if d.Name() != rootMarker {
+		if d.IsDir() && p != dir {
+			info, err := d.Info()
+			if err != nil || device(info) != device(rootInfo) {
+				return filepath.SkipDir
+			}
+		}
+		if d.Name() != rootMarker && d.Name() != stateMarker {
 			return nil
 		}
 		if filepath.Dir(p) != dir {
@@ -227,7 +240,9 @@ func (r *Replica) bindRoot() error {
 
 func (r *Replica) validRoot() error {
 	id, e := identifyRoot(r.dir)
-	if e != nil || id != r.identity {
+	info, le := os.Lstat(r.dir)
+	held, he := r.root.Stat(".")
+	if e != nil || le != nil || he != nil || !info.IsDir() || !os.SameFile(info, held) || id != r.identity {
 		return fmt.Errorf("attachment root identity missing or changed; sync paused")
 	}
 	return nil
@@ -260,5 +275,131 @@ func (r *Replica) deleteSafety(local map[string]LocalFile) error {
 	if !r.allowMassDelete && tracked >= 5 && missing*5 >= tracked*4 {
 		return fmt.Errorf("%d of %d tracked entries disappeared; deletes paused (Retry acknowledges intentional removal)", missing, tracked)
 	}
+	return nil
+}
+
+// Device numbers are ephemeral across remounts. They bound each traversal, but
+// are deliberately not part of the persistent root identity.
+func device(info os.FileInfo) uint64 {
+	v := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if v.IsValid() && v.Kind() == reflect.Struct {
+		f := v.FieldByName("Dev")
+		if f.CanUint() {
+			return f.Uint()
+		}
+		if f.CanInt() {
+			return uint64(f.Int())
+		}
+	}
+	return 0
+}
+func (r *Replica) directoryBoundary(p string, info os.FileInfo) error {
+	root, e := r.root.Stat(".")
+	if e != nil {
+		return e
+	}
+	if device(root) != device(info) {
+		return fmt.Errorf("mount boundary: %s", p)
+	}
+	for _, name := range []string{rootMarker, stateMarker} {
+		if _, e := r.root.Lstat(pathJoin(p, name)); e == nil {
+			return fmt.Errorf("foreign drivesync marker: %s", p)
+		} else if !errors.Is(e, os.ErrNotExist) {
+			return e
+		}
+	}
+	return nil
+}
+func pathJoin(p, name string) string { return filepath.ToSlash(filepath.Join(p, name)) }
+
+// Acknowledging a changed root starts fresh adoption. No entry from the old
+// index can contribute a delete, even when the restored tree is empty.
+func (r *Replica) rebindRoot() error {
+	info, e := os.Lstat(r.dir)
+	if e != nil || !info.IsDir() {
+		return fmt.Errorf("root must be a real directory")
+	}
+	release, e := attachmentAdmission(r.dir)
+	if e != nil {
+		return e
+	}
+	defer release()
+	if e = checkAttachments(context.Background(), r.dir, r.folder); e != nil {
+		return e
+	}
+	root, e := os.OpenRoot(r.dir)
+	if e != nil {
+		return e
+	}
+	defer func() {
+		if root != nil {
+			root.Close()
+		}
+	}()
+	marker := filepath.Join(r.dir, rootMarker)
+	if _, e = os.Lstat(marker); errors.Is(e, os.ErrNotExist) {
+		b, _ := json.Marshal(rootIdentity{Folder: r.folder, Token: randomID()})
+		if e = writeMarker(marker, b); e != nil {
+			return e
+		}
+	}
+	id, e := identifyRoot(r.dir)
+	if e != nil || id.Folder != r.folder {
+		return ErrInvalid
+	}
+	oldMarker, _ := r.rootLock.Stat()
+	newMarker, e := os.Lstat(marker)
+	if e != nil {
+		return e
+	}
+	var lock *os.File
+	if oldMarker == nil || !os.SameFile(oldMarker, newMarker) {
+		lock, e = lockState(marker)
+		if e != nil {
+			return e
+		}
+		defer func() {
+			if lock != nil {
+				lock.Close()
+			}
+		}()
+	}
+	tx, e := r.db.Begin()
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"entries", "pending", "tombstones"} {
+		if _, e = tx.Exec("DELETE FROM " + table); e != nil {
+			return e
+		}
+	}
+	b, _ := json.Marshal(id)
+	if _, e = tx.Exec("INSERT OR REPLACE INTO config(key,value) VALUES('root',?),('version','0')", string(b)); e != nil {
+		return e
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	r.root.Close()
+	r.root = root
+	root = nil
+	if lock != nil {
+		r.rootLock.Close()
+		r.rootLock = lock
+		lock = nil
+	}
+	r.identity = id
+	r.version = 0
+	r.index = map[string]IndexEntry{}
+	r.byID = map[string]string{}
+	r.byLocal = map[string]string{}
+	r.byFold = map[string]string{}
+	r.tombstones = map[string]uint64{}
+	r.missingDeferred = map[string]uint64{}
+	r.quarantine = map[string]Row{}
+	r.retryRows = map[string]Row{}
+	r.ignoredRows = map[string]Row{}
+	r.adoption = true
 	return nil
 }

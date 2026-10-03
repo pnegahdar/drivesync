@@ -29,8 +29,15 @@ Security takes priority over convenience:
   Default state belongs in the per-user cache, in a dedicated folder/root directory;
   refuse unrelated nonempty state, nested/overlapping attachments and state aliases
   into attachments. Reserve `.drivesync*` names. Bind state to a random root marker
-  and device/inode; never propagate deletes from a changed root. Pause suspicious
-  mass removals until explicit Retry, which cannot override root identity failures.
+  and inode; device numbers only bound a traversal. Never propagate deletes from
+  a changed root. Retry rebinds by dropping the old index and adopting files by
+  authenticated hashes, without old-index deletes. Refuse symlinked roots. Hold
+  a lifetime root-marker flock and serialize overlapping admission. Pause mass
+  removals until Retry and keep its acknowledgement until the guard passes.
+  Block foreign root/state markers and cross-device directories in attach/scan.
+  Pull then scan once through os.Root.FS; root walk errors abort. All filesystem
+  errors except ENOENT mean potentially present; unsupported entries block their
+  entire subtrees. Never act on remote deletes of ignored contents.
 - Preserve losing writes in conflict copies before replacing them. CAS batches
   are atomic. Keep tombstone versions so deleting and recreating a path works.
 - Reserve quota atomically, including concurrent folder and owner usage. Never
@@ -150,3 +157,16 @@ Public API rules:
   root fuzz/benchmark adapters so the documented commands exercise real code.
   Cross-build internal/engine's tests as well as the public package. Real native
   watcher integration is TestWatcherPropagation in internal/engine.
+
+Replica QA rules:
+
+- Hash and stream exactly the statted size; growing tails wait for the next sync.
+  Reject ambiguous local mappings and unsupported names with actionable status.
+- Sync only owner-execute, preserve local group/other bits, persist observed mode
+  after chmod/fsync. Defer updates into missing tracked files for one sync.
+- Keep sealed tombstone metadata until compaction. Revisit ignored rows only on
+  rule changes; update only touched pending records. Batch deletes up to 256.
+  Peers move authenticated matching files; path-bound ciphertext still uploads.
+- Every test uses temporary state. Default-state tests sandbox HOME/cache vars.
+  CI runs race, pure-Go and fuzz on both macOS and Linux, including native
+  FSEvents/inotify propagation (never count Manual mode as watcher coverage).

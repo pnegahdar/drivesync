@@ -367,7 +367,7 @@ func TestLimitsBoundaries(t *testing.T) {
 					t.Fatal(e)
 				}
 				if which == "bytes" {
-					if e = c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: RowCost + RowCost + SealedSize(1)}); e != nil {
+					if e = c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: RowCost + int64(len(row.Metadata)) + RowCost + SealedSize(1)}); e != nil {
 						t.Fatal(e)
 					}
 				}
@@ -461,8 +461,8 @@ func TestOwnerQuotaAndLowering(t *testing.T) {
 	if e := s.CollectGarbage(ctx); e != nil {
 		t.Fatal(e)
 	}
-	// The retained tombstone still costs a row, so restore enough quota.
-	max.Store(2*RowCost + 1)
+	// A collected tombstone still charges its row and authenticated metadata.
+	max.Store(2*RowCost + int64(len(row.Metadata)) + 1)
 	if _, e := c.Reserve(ctx, g.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e != nil {
 		t.Fatal(e)
 	}

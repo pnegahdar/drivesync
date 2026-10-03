@@ -60,7 +60,7 @@ func TestCreationChallengeCannotSelectOrStealFolderID(t *testing.T) {
 	}
 }
 
-func TestMassDeleteNeedsAcknowledgmentAndCannotOverrideRootIdentity(t *testing.T) {
+func TestMassDeleteAcknowledgmentAndFreshRootAdoption(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
 	f, key := folderFor(t, c, Limits{})
@@ -104,9 +104,12 @@ func TestMassDeleteNeedsAcknowledgmentAndCannotOverrideRootIdentity(t *testing.T
 	if e = os.WriteFile(filepath.Join(r.dir, rootMarker), marker, 0600); e != nil {
 		t.Fatal(e)
 	}
-	r.RetryRejected()
 	if e = r.Sync(context.Background()); e == nil {
-		t.Fatal("copied marker bypassed inode binding")
+		t.Fatal("changed inode was not paused")
+	}
+	r.RetryRejected()
+	if e = r.Sync(context.Background()); e != nil {
+		t.Fatal("fresh adoption failed", e)
 	}
 }
 

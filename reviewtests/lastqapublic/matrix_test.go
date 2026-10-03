@@ -86,7 +86,7 @@ func TestPublicAccessMatrixBothTransports(t *testing.T) {
 					}
 				}
 				dir := filepath.Join(t.TempDir(), "r")
-				r, ae := drivesync.Attach(bg, c, f.ID, key, dir, drivesync.Options{Manual: true, Name: "r"})
+				r, ae := drivesync.Attach(bg, c, f.ID, key, dir, drivesync.Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true, Name: "r"})
 				if granted != (ae == nil) || (!granted && !errors.Is(ae, drivesync.ErrDenied)) {
 					t.Errorf("%v Attach: %v", p, ae)
 				}

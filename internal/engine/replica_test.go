@@ -21,7 +21,7 @@ import (
 func replicaFor(t testing.TB, c Client, f Folder, k FolderKey, name string, manual bool) *Replica {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "files")
-	r, e := Attach(context.Background(), c, f.ID, k, dir, Options{Name: name, Manual: manual, RescanInterval: time.Hour})
+	r, e := Attach(context.Background(), c, f.ID, k, dir, Options{StateDir: filepath.Join(t.TempDir(), "state"), Name: name, Manual: manual, RescanInterval: time.Hour})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -117,7 +117,7 @@ func TestWrongKeySymlinksAndIgnore(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
 	f, k := folderFor(t, c, Limits{})
-	if _, e := Attach(context.Background(), c, f.ID, NewFolderKey(), filepath.Join(t.TempDir(), "bad"), Options{Manual: true}); e != ErrKey {
+	if _, e := Attach(context.Background(), c, f.ID, NewFolderKey(), filepath.Join(t.TempDir(), "bad"), Options{StateDir: filepath.Join(t.TempDir(), "state"), Manual: true}); e != ErrKey {
 		t.Fatal(e)
 	}
 	r := replicaFor(t, c, f, k, "r", true)

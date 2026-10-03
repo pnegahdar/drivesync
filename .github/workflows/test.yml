@@ -1,0 +1,29 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Timing probes compete inside their own server, not with other packages.
+      GOFLAGS: -p=1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./... -count=1 -timeout=900s
+      - run: CGO_ENABLED=0 go test ./... -count=1 -timeout=900s
+      - name: Native watcher (FSEvents / inotify)
+        run: go test -race ./internal/engine -run '^TestWatcherPropagation$' -count=1 -v
+      - name: Fuzz
+        run: |
+          for target in FuzzNormalizePath FuzzWireDecode FuzzOpenContent; do
+            go test -run '^$' -fuzz="^${target}$" -fuzztime=3s -parallel=2 .
+          done

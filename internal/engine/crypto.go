@@ -152,7 +152,7 @@ func OpenMetadata(k FolderKey, folder string, row Row) (FileMetadata, error) {
 		return m, ErrIntegrity
 	}
 	id, e := PathID(k, folder, m.Path)
-	if e != nil || id != row.PathID || m.BlobID != row.BlobID || m.Size < 0 || m.Mode & ^uint32(0777) != 0 {
+	if e != nil || id != row.PathID || (m.BlobID != row.BlobID && !(row.Deleted && row.BlobID == "")) || m.Size < 0 || m.Mode & ^uint32(0777) != 0 {
 		return m, ErrIntegrity
 	}
 	return m, nil
