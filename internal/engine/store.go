@@ -90,7 +90,7 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		`CREATE INDEX IF NOT EXISTS folders_owner ON folders(owner)`,
 		`CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`,
 		`CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner,json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`,
 		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder,id)`,
@@ -104,6 +104,12 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 			db.Close()
 			return nil, e
 		}
+	}
+	// Databases created before size was a column still open. Fresh databases
+	// already have it, so the duplicate-column error is expected.
+	if _, e = db.Exec(`ALTER TABLE garbage ADD COLUMN size INTEGER NOT NULL DEFAULT 0`); e != nil && !strings.Contains(strings.ToLower(e.Error()), "duplicate column") {
+		db.Close()
+		return nil, e
 	}
 	hubName := name
 	var seq int
@@ -481,6 +487,12 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			prefix = "INSERT INTO folders(id,owner,data) VALUES "
 			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
 		}
+		width := 3
+		if table == "garbage" {
+			prefix = "INSERT INTO garbage(id,folder,size,data) VALUES "
+			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder,size=excluded.size"
+			width = 4
+		}
 		updated, created := []any{}, []any{}
 		for id, b := range next[table] {
 			if bytes.Equal(b, old[table][id]) {
@@ -495,7 +507,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			case "tickets":
 				args = []any{id, m.Tickets[id].FolderID, b}
 			case "garbage":
-				args = []any{id, m.Garbage[id].FolderID, b}
+				args = []any{id, m.Garbage[id].FolderID, m.Garbage[id].Size, b}
 			}
 			if table == "folders" && old[table][id] == nil {
 				created = append(created, args...)
@@ -503,43 +515,50 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 				updated = append(updated, args...)
 			}
 		}
-		if e = writeValues(ctx, tx, prefix, suffix, 3, updated); e != nil {
+		if e = writeValues(ctx, tx, prefix, suffix, width, updated); e != nil {
 			return e
 		}
-		if e = writeValues(ctx, tx, prefix, "", 3, created); e != nil {
+		if e = writeValues(ctx, tx, prefix, "", width, created); e != nil {
 			if strings.Contains(e.Error(), "UNIQUE constraint failed") {
 				return ErrConflict
 			}
 			return e
 		}
-		var remove *sql.Stmt
-		for id := range old[table] {
-			if _, ok := next[table][id]; ok {
-				continue
-			}
-			q := "DELETE FROM " + table + " WHERE id=?"
-			args := []any{id}
-			if table == "files" {
-				q = "DELETE FROM files WHERE folder=? AND path=?"
-				args = []any{id[:32], id[33:]}
-			}
-			if table == "grants" {
-				q = "DELETE FROM grants WHERE folder=? AND principal=?"
-				args = []any{id[:32], id[33:]}
-			}
-			if remove == nil {
-				remove, e = tx.PrepareContext(ctx, q)
-				if e != nil {
+		if table == "files" || table == "grants" {
+			var remove *sql.Stmt
+			for id := range old[table] {
+				if _, ok := next[table][id]; ok {
+					continue
+				}
+				q := "DELETE FROM files WHERE folder=? AND path=?"
+				args := []any{id[:32], id[33:]}
+				if table == "grants" {
+					q = "DELETE FROM grants WHERE folder=? AND principal=?"
+				}
+				if remove == nil {
+					remove, e = tx.PrepareContext(ctx, q)
+					if e != nil {
+						return e
+					}
+				}
+				if _, e = remove.ExecContext(ctx, args...); e != nil {
+					remove.Close()
 					return e
 				}
 			}
-			if _, e = remove.ExecContext(ctx, args...); e != nil {
+			if remove != nil {
 				remove.Close()
-				return e
+			}
+			continue
+		}
+		gone := make([]any, 0)
+		for id := range old[table] {
+			if _, ok := next[table][id]; !ok {
+				gone = append(gone, id)
 			}
 		}
-		if remove != nil {
-			remove.Close()
+		if e = execIn(ctx, tx, "DELETE FROM "+table+" WHERE id IN (", gone); e != nil {
+			return e
 		}
 	}
 	if e = tx.Commit(); e != nil {
@@ -935,6 +954,122 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 		return Delta{}, e
 	}
 	return out, nil
+}
+
+// deleteGarbageBatch removes one batch of garbage and its cached usage.
+// It does not load the folder's other tickets or garbage, and the caller
+// commits this transaction before the next batch so the writer is released.
+func (s *SQLiteMetaStore) deleteGarbageBatch(ctx context.Context, folder string, ids []string, live func(string) bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	if _, e = tx.ExecContext(ctx, "UPDATE folders SET id=id WHERE 0"); e != nil {
+		return e
+	}
+	kept := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if live == nil || !live(id) {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	var folderData []byte
+	if e = tx.QueryRowContext(ctx, "SELECT data FROM folders WHERE id=?", folder).Scan(&folderData); e != nil {
+		return e
+	}
+	var f FolderRecord
+	if e = json.Unmarshal(folderData, &f); e != nil {
+		return e
+	}
+	var removedBytes, removedRows int64
+	for start := 0; start < len(kept); start += 256 {
+		end := min(start+256, len(kept))
+		args := make([]any, 0, 1+end-start)
+		args = append(args, folder)
+		q := "DELETE FROM garbage WHERE folder=? AND id IN ("
+		for _, id := range kept[start:end] {
+			q += "?,"
+			args = append(args, id)
+		}
+		q = strings.TrimSuffix(q, ",") + ") RETURNING size"
+		rows, e := tx.QueryContext(ctx, q, args...)
+		if e != nil {
+			return e
+		}
+		for rows.Next() {
+			var size int64
+			if e = rows.Scan(&size); e != nil {
+				rows.Close()
+				return e
+			}
+			removedRows++
+			removedBytes = sat(removedBytes, size)
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return e
+		}
+	}
+	if removedRows == 0 {
+		return tx.Commit()
+	}
+	f.TransferUsage.Bytes = max(0, f.TransferUsage.Bytes-removedBytes)
+	f.TransferUsage.GarbageRows = max(0, f.TransferUsage.GarbageRows-removedRows)
+	body, e := json.Marshal(f)
+	if e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(ctx, "UPDATE folders SET data=? WHERE id=?", body, folder); e != nil {
+		return e
+	}
+	if !f.Allocated {
+		key := principalKey(f.Folder.Owner)
+		var acctData []byte
+		var acct Account
+		e = tx.QueryRowContext(ctx, "SELECT data FROM accounts WHERE id=?", key).Scan(&acctData)
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return e
+		}
+		if len(acctData) > 0 {
+			if e = json.Unmarshal(acctData, &acct); e != nil {
+				return e
+			}
+		}
+		acct.Bytes = max(0, acct.Bytes-removedBytes)
+		acct.Rows = max(0, acct.Rows-removedRows)
+		ab, e := json.Marshal(acct)
+		if e != nil {
+			return e
+		}
+		if _, e = tx.ExecContext(ctx, "INSERT INTO accounts(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", key, ab); e != nil {
+			return e
+		}
+	}
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	s.wakes.notify(folder)
+	return nil
+}
+
+func execIn(ctx context.Context, tx *sql.Tx, prefix string, args []any) error {
+	for len(args) > 0 {
+		n := min(len(args), 256)
+		q := prefix + strings.TrimSuffix(strings.Repeat("?,", n), ",") + ")"
+		if _, e := tx.ExecContext(ctx, q, args[:n]...); e != nil {
+			return e
+		}
+		args = args[n:]
+	}
+	return nil
 }
 
 // Bounded parameterized batches preserve the transaction boundary and avoid

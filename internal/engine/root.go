@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 
 	"github.com/zeebo/blake3"
 )
@@ -281,6 +282,15 @@ func (r *Replica) deleteSafety(local map[string]LocalFile) error {
 // Device numbers are ephemeral across remounts. They bound each traversal, but
 // are deliberately not part of the persistent root identity.
 func device(info os.FileInfo) uint64 {
+	if info == nil || info.Sys() == nil {
+		return 0
+	}
+	switch s := info.Sys().(type) {
+	case *syscall.Stat_t:
+		return uint64(s.Dev)
+	case syscall.Stat_t:
+		return uint64(s.Dev)
+	}
 	v := reflect.Indirect(reflect.ValueOf(info.Sys()))
 	if v.IsValid() && v.Kind() == reflect.Struct {
 		f := v.FieldByName("Dev")
@@ -293,22 +303,58 @@ func device(info os.FileInfo) uint64 {
 	}
 	return 0
 }
+
+// dirBounds is one traversal's root device and the directories already checked
+// for a mount crossing or a foreign drivesync marker.
+type dirBounds struct {
+	dev  uint64
+	seen map[string]error
+}
+
 func (r *Replica) directoryBoundary(p string, info os.FileInfo) error {
-	root, e := r.root.Stat(".")
-	if e != nil {
-		return e
-	}
-	if device(root) != device(info) {
+	if info == nil {
 		return fmt.Errorf("mount boundary: %s", p)
 	}
-	for _, name := range []string{rootMarker, stateMarker} {
-		if _, e := r.root.Lstat(pathJoin(p, name)); e == nil {
-			return fmt.Errorf("foreign drivesync marker: %s", p)
-		} else if !errors.Is(e, os.ErrNotExist) {
+	rootDev := uint64(0)
+	cached := false
+	if r.scanBounds != nil {
+		rootDev = r.scanBounds.dev
+		cached = true
+	} else {
+		root, e := r.root.Stat(".")
+		if e != nil {
+			return e
+		}
+		rootDev = device(root)
+	}
+	// Compare the device already on this stat. Do not stat the root again.
+	if device(info) != rootDev {
+		return fmt.Errorf("mount boundary: %s", p)
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	if cached {
+		if e, ok := r.scanBounds.seen[p]; ok {
 			return e
 		}
 	}
-	return nil
+	var e error
+	for _, name := range []string{rootMarker, stateMarker} {
+		_, le := r.root.Lstat(pathJoin(p, name))
+		if le == nil {
+			e = fmt.Errorf("foreign drivesync marker: %s", p)
+			break
+		}
+		if !errors.Is(le, os.ErrNotExist) {
+			e = le
+			break
+		}
+	}
+	if cached {
+		r.scanBounds.seen[p] = e
+	}
+	return e
 }
 func pathJoin(p, name string) string { return filepath.ToSlash(filepath.Join(p, name)) }
 

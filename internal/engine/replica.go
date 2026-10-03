@@ -100,6 +100,7 @@ type Replica struct {
 	ignoredRows       map[string]Row
 	retryRows         map[string]Row
 	blockedLocal      map[string]bool
+	scanBounds        *dirBounds
 	rejected          map[string]Rejection
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -594,6 +595,14 @@ func (r *Replica) remotePath(local string) string {
 func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 	out := map[string]LocalFile{}
 	r.blockedLocal = map[string]bool{}
+	rootInfo, e := r.root.Stat(".")
+	if e != nil {
+		return nil, e
+	}
+	// One root device for this walk. Marker and mount checks run once per
+	// directory; files reuse that result instead of stating the root again.
+	r.scanBounds = &dirBounds{dev: device(rootInfo), seen: map[string]error{}}
+	defer func() { r.scanBounds = nil }()
 	patterns := r.patterns()
 	skipped := []string{}
 	for _, rule := range patterns {
@@ -603,7 +612,7 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 			skipped = append(skipped, "unsupported ignore rule: "+raw)
 		}
 	}
-	e := fs.WalkDir(r.root.FS(), ".", func(local string, d fs.DirEntry, e error) error {
+	e = fs.WalkDir(r.root.FS(), ".", func(local string, d fs.DirEntry, e error) error {
 		if e != nil {
 			if local == "." {
 				return e

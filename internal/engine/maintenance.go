@@ -97,15 +97,10 @@ func (s *Server) RunGC(ctx context.Context, interval time.Duration) error {
 	}
 }
 
-const maintenanceBatch = 128
-
-func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbage []string) context.Context {
-	return context.WithValue(ctx, scopeKey{}, Scope{Folder: folder, Paths: paths, Tickets: tickets, Garbage: garbage})
-}
-
-func (s *Server) collect(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+func (s *Server) surveyCollect(ctx context.Context) (map[string]Garbage, map[string][]Ticket, map[string]bool, error) {
+	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+		return s.surveyCollectSQL(ctx, db)
+	}
 	pending := map[string]Garbage{}
 	expired := map[string][]Ticket{}
 	deleted := map[string]bool{}
@@ -127,6 +122,102 @@ func (s *Server) collect(ctx context.Context) error {
 		}
 		return nil
 	})
+	return pending, expired, deleted, e
+}
+
+func (s *Server) surveyCollectSQL(ctx context.Context, db *SQLiteMetaStore) (map[string]Garbage, map[string][]Ticket, map[string]bool, error) {
+	folders := map[string]FolderRecord{}
+	rows, e := db.reads.QueryContext(ctx, "SELECT id, data FROM folders")
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	for rows.Next() {
+		var id string
+		var data []byte
+		var f FolderRecord
+		if e = rows.Scan(&id, &data); e == nil {
+			e = json.Unmarshal(data, &f)
+		}
+		if e != nil {
+			rows.Close()
+			return nil, nil, nil, e
+		}
+		folders[id] = f
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return nil, nil, nil, e
+	}
+	rows.Close()
+	deleted := map[string]bool{}
+	for id, f := range folders {
+		if f.Deleted {
+			deleted[id] = true
+		}
+	}
+	expired := map[string][]Ticket{}
+	rows, e = db.reads.QueryContext(ctx, "SELECT data FROM tickets")
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	for rows.Next() {
+		var data []byte
+		var t Ticket
+		if e = rows.Scan(&data); e == nil {
+			e = json.Unmarshal(data, &t)
+		}
+		if e != nil {
+			rows.Close()
+			return nil, nil, nil, e
+		}
+		if deleted[t.FolderID] || t.AuthEpoch != folders[t.FolderID].AuthEpoch || !t.Expires.After(s.now()) || (t.Writing && !s.wakes.live(t.FolderID+"/"+t.BlobID)) {
+			expired[t.FolderID] = append(expired[t.FolderID], t)
+		}
+	}
+	if e = rows.Err(); e != nil {
+		rows.Close()
+		return nil, nil, nil, e
+	}
+	rows.Close()
+	pending := map[string]Garbage{}
+	rows, e = db.reads.QueryContext(ctx, "SELECT id, data FROM garbage")
+	if e != nil {
+		return nil, nil, nil, e
+	}
+	for rows.Next() {
+		var key string
+		var data []byte
+		var g Garbage
+		if e = rows.Scan(&key, &data); e == nil {
+			e = json.Unmarshal(data, &g)
+		}
+		if e != nil {
+			rows.Close()
+			return nil, nil, nil, e
+		}
+		if !g.Writing || !s.wakes.live(key) {
+			pending[key] = g
+		}
+	}
+	e = rows.Err()
+	rows.Close()
+	return pending, expired, deleted, e
+}
+
+const maintenanceBatch = 128
+
+// Each garbage batch is its own transaction: the writer is released between
+// batches, and the delete is one statement rather than one round trip per blob.
+const garbageBatch = 64
+
+func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbage []string) context.Context {
+	return context.WithValue(ctx, scopeKey{}, Scope{Folder: folder, Paths: paths, Tickets: tickets, Garbage: garbage})
+}
+
+func (s *Server) collect(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	pending, expired, deleted, e := s.surveyCollect(ctx)
 	if e != nil {
 		return e
 	}
@@ -207,17 +298,25 @@ func (s *Server) collect(ctx context.Context) error {
 	var errs []error
 	for folder, garbage := range groups {
 		for len(garbage) > 0 {
-			batch := garbage[:min(len(garbage), maintenanceBatch)]
+			if e := ctx.Err(); e != nil {
+				return errors.Join(append(errs, e)...)
+			}
+			batch := garbage[:min(len(garbage), garbageBatch)]
 			garbage = garbage[len(batch):]
 			collected := map[string]bool{}
 			ids := []string{}
+			// Blob deletion stays outside the metadata writer. The collect
+			// budget bounds the pass; the writer lock is taken only below.
 			for _, g := range batch {
+				if e := ctx.Err(); e != nil {
+					errs = append(errs, e)
+					break
+				}
 				key := folder + "/" + g.BlobID
 				if s.wakes.live(key) {
 					continue
 				}
-				_, de := bounded(ctx, func(c context.Context) (struct{}, error) { return struct{}{}, s.Blobs.Delete(c, folder, g.BlobID) })
-				if de != nil && !errors.Is(de, os.ErrNotExist) {
+				if de := s.Blobs.Delete(ctx, folder, g.BlobID); de != nil && !errors.Is(de, os.ErrNotExist) {
 					errs = append(errs, de)
 					continue
 				}
@@ -227,14 +326,18 @@ func (s *Server) collect(ctx context.Context) error {
 			if len(ids) == 0 {
 				continue
 			}
-			e = s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, ids), func(m *Metadata) error {
-				for key := range collected {
-					if !s.wakes.live(key) {
-						delete(m.Garbage, key)
+			if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+				e = db.deleteGarbageBatch(ctx, folder, ids, s.wakes.live)
+			} else {
+				e = s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, ids), func(m *Metadata) error {
+					for key := range collected {
+						if !s.wakes.live(key) {
+							delete(m.Garbage, key)
+						}
 					}
-				}
-				return nil
-			})
+					return nil
+				})
+			}
 			if e != nil {
 				return errors.Join(append(errs, e)...)
 			}
