@@ -188,9 +188,10 @@ const maintenanceBatch = 128
 
 // Each garbage batch is its own transaction: the writer is released between
 // batches, and the delete is one statement rather than one round trip per blob.
-// SQLite pages a larger batch so a backlog costs few commits on a slow disk.
+// SQLite pages 256 rows. A page of 512 held the writer past the ceiling on a
+// slow race-detector runner; 256 still clears a 16k backlog inside the pass.
 const garbageBatch = 64
-const garbagePage = 512
+const garbagePage = 256
 
 func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbage []string) context.Context {
 	return context.WithValue(ctx, scopeKey{}, Scope{Folder: folder, Paths: paths, Tickets: tickets, Garbage: garbage})
