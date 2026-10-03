@@ -142,8 +142,9 @@ keep the delete pending. Remote tombstones for ignored files update the index
 without touching local contents or making conflict copies. `.drivesyncignore`
 accepts globs, root-anchored `/` patterns, `**`, comments and directory patterns,
 with case-folded NFC matching. Negation and escape rules are unsupported and
-reported. Defaults exclude Finder/editor temporary files, `.git/**/*.lock` and
-staging files. Ignored rows are revisited only when rules change. Unsupported
+reported. Defaults exclude Finder/editor temporary files, the whole `.git/`
+directory, and staging files. Repositories sync through git, not through a
+drive: copying `.git` turns concurrent commits into conflict files. Ignored rows are revisited only when rules change. Unsupported
 portable names are retained locally and reported as rejected. Only the owner
 execute bit syncs; local group/other permission bits remain local. Renames still
 need uploads because ciphertext binds the path; peers move verified matching

@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +88,9 @@ type Replica struct {
 	missingDeferred   map[string]uint64
 	ignoreFingerprint string
 	ignoredChanged    bool
+	ruleSnap          []string
+	baselineFiles     int64
+	baselineBytes     int64
 	adoption          bool
 	index             map[string]IndexEntry
 	byID              map[string]string
@@ -187,6 +191,7 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 			return nil, e
 		}
 	}
+	tightenState(o.StateDir)
 	binding := id + "/" + dir
 	var old string
 	e = db.QueryRow("SELECT value FROM config WHERE key='binding'").Scan(&old)
@@ -298,6 +303,13 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	}
 	_ = db.QueryRow("SELECT value FROM config WHERE key='version'").Scan(&r.version)
 	_ = db.QueryRow("SELECT value FROM config WHERE key='ignore'").Scan(&r.ignoreFingerprint)
+	var adoption, baseFiles, baseBytes string
+	_ = db.QueryRow("SELECT value FROM config WHERE key='adoption'").Scan(&adoption)
+	_ = db.QueryRow("SELECT value FROM config WHERE key='baseline-files'").Scan(&baseFiles)
+	_ = db.QueryRow("SELECT value FROM config WHERE key='baseline-bytes'").Scan(&baseBytes)
+	r.adoption = adoption == "1"
+	r.baselineFiles, _ = strconv.ParseInt(baseFiles, 10, 64)
+	r.baselineBytes, _ = strconv.ParseInt(baseBytes, 10, 64)
 	pendingRows, pe := db.Query("SELECT id,data FROM pending")
 	if pe != nil {
 		cancel()
@@ -534,6 +546,9 @@ func (r *Replica) forget(p string) error {
 	}
 	return e
 }
+func pathIgnored(p string, dir bool, patterns []string) bool {
+	return (&Replica{}).ignore(p, dir, patterns)
+}
 func (r *Replica) ignore(p string, dir bool, patterns []string) bool {
 	if r.ignoreOne(p, dir, patterns) {
 		return true
@@ -551,7 +566,8 @@ func (r *Replica) ignoreOne(p string, dir bool, patterns []string) bool {
 	if base == ".ds_store" || base == ".drivesyncignore" || strings.HasPrefix(base, ".drivesync") || strings.HasPrefix(base, ".~") || strings.HasPrefix(base, "~$") || strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") || strings.HasSuffix(base, ".tmp") {
 		return true
 	}
-	if strings.Contains("/"+p, "/.git/") && strings.HasSuffix(base, ".lock") {
+	// Repositories move through git. A drive copy of .git breaks concurrent commits.
+	if strings.Contains("/"+p+"/", "/.git/") {
 		return true
 	}
 	for _, raw := range patterns {
@@ -649,7 +665,7 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 		p := r.remotePath(local)
 		if _, err := NormalizePath(p); err != nil {
 			r.blockLocal(local)
-			r.reject(local, "", fmt.Errorf("name is not portable; remove reserved characters/names or shorten components (255 bytes): %w", err))
+			r.reject(local, r.hashUnportable(local), fmt.Errorf("name is not portable; remove reserved characters/names or shorten components (255 bytes): %w", err))
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -755,7 +771,7 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 	return v, nil
 }
 func sameFile(v LocalFile, i IndexEntry) bool {
-	return v.Hash == i.Hash && v.Directory == i.Directory && v.Mode&0100 == i.Mode&0100
+	return !i.Deleted && v.Hash == i.Hash && v.Directory == i.Directory && v.Mode&0100 == i.Mode&0100
 }
 func (r *Replica) Sync(ctx context.Context) error {
 	r.syncMu.Lock()
@@ -778,12 +794,27 @@ func (r *Replica) Sync(ctx context.Context) error {
 		e = pe
 		r.addError(pe)
 	}
+	tightenState(r.opts.StateDir)
 	return e
 }
 func (r *Replica) sync(ctx context.Context) error {
 	if e := r.validRoot(); e != nil {
-		return e
+		if r.reopenSameRoot() != nil {
+			return e
+		}
+		if e = r.validRoot(); e != nil {
+			return e
+		}
 	}
+	rules, re := r.readRules()
+	if re != nil {
+		return re
+	}
+	if rules == nil {
+		rules = []string{}
+	}
+	r.ruleSnap = rules
+	defer func() { r.ruleSnap = nil }()
 	folder, e := r.client.GetFolder(ctx, r.folder)
 	if e != nil {
 		return e
@@ -834,7 +865,9 @@ func (r *Replica) sync(ctx context.Context) error {
 		presentLocal[v.Local] = true
 	}
 	for old, i := range r.index {
-		if deleteErr != nil || i.Deleted || i.Awaiting || r.localBlocked(old) || presentLocal[i.Local] {
+		oldPID, _ := PathID(r.key, r.folder, old)
+		_, remotePending := r.retryRows[oldPID]
+		if deleteErr != nil || i.Deleted || i.Awaiting || remotePending || r.localBlocked(old) || presentLocal[i.Local] || r.ignore(i.Local, i.Directory, r.patterns()) {
 			continue
 		}
 		hashes[i.Hash] = append(hashes[i.Hash], old)
@@ -1185,7 +1218,7 @@ func (r *Replica) sync(ctx context.Context) error {
 	deleted := []string{}
 	for p, v := range r.index {
 		if _, ok := local[p]; !ok && !v.Deleted && !v.Awaiting && !heldDeletes[p] && !r.localBlocked(p) && deleteErr == nil {
-			if !writable || r.ignore(v.Local, v.Directory, r.patterns()) {
+			if !writable || r.ignore(v.Local, v.Directory, r.patterns()) || r.rejectedSameHash(v.Hash) {
 				continue
 			}
 			deleted = append(deleted, p)
@@ -1252,9 +1285,22 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 	}
 	record(r.pull(ctx, local))
+	if deleteErr == nil && r.allowMassDelete {
+		files, bytes := r.presentContent(local)
+		r.baselineFiles = int64(files)
+		r.baselineBytes = bytes
+		if e := r.storeBaseline(); e != nil {
+			return e
+		}
+	}
 	if firstError == nil {
 		if deleteErr == nil {
 			r.allowMassDelete = false
+		}
+		if r.adoption {
+			if _, e := r.db.Exec("DELETE FROM config WHERE key='adoption'"); e != nil {
+				return e
+			}
 		}
 		r.adoption = false
 	}
@@ -1405,11 +1451,15 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 			continue
 		}
 		if e = r.apply(ctx, row); e != nil {
+			if errors.Is(e, errDirectoryPending) {
+				r.retryRows[row.PathID] = row
+				continue
+			}
 			if errors.Is(e, ErrIntegrity) {
 				r.quarantine[row.PathID] = row
 			} else {
 				r.retryRows[row.PathID] = row
-				if isTransferError(e) {
+				if isTransferError(e) || errors.Is(e, errAfterDownload) {
 					r.retryAt[row.PathID] = time.Now().Add(r.opts.RetryInterval)
 				}
 			}
@@ -1537,7 +1587,7 @@ func (r *Replica) preserve(local string) (string, error) {
 	if _, e := NormalizePath(name); e != nil {
 		return "", e
 	}
-	if e := r.root.Rename(local, name); e != nil {
+	if e := renameIfAbsent(r.root, local, name); e != nil {
 		return "", e
 	}
 	if e := r.syncParent(name); e != nil {
@@ -1608,7 +1658,18 @@ func (r *Replica) localPath(p, pid string) string {
 	return candidate
 }
 
-func (r *Replica) apply(ctx context.Context, row Row) error {
+var errAfterDownload = errors.New("local failure after download")
+
+// A directory tombstone waits while tracked children are still live.
+var errDirectoryPending = errors.New("directory delete waits for tracked children")
+
+func (r *Replica) apply(ctx context.Context, row Row) (err error) {
+	downloaded := false
+	defer func() {
+		if err != nil && downloaded && !errors.Is(err, ErrIntegrity) && !errors.Is(err, errLocalObstacle) && !isTransferError(err) {
+			err = fmt.Errorf("%w: %w", errAfterDownload, err)
+		}
+	}()
 	p, known := r.byID[row.PathID]
 	i := r.index[p]
 	if row.Deleted {
@@ -1621,7 +1682,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			p = m.Path
 			i = IndexEntry{Path: p, Local: p, Hash: m.Hash, Directory: m.Directory, Mode: m.Mode}
 			v, err := r.inspect(p, p)
-			if err == nil && v.Hash != m.Hash {
+			if err == nil && (v.Hash != m.Hash || r.adoption) {
 				i.Deleted = true
 				i.Version = row.Version
 				return r.save(i)
@@ -1670,7 +1731,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 				if e = r.root.Remove(i.Local); e != nil {
 					for child, entry := range r.index {
 						if child != p && strings.HasPrefix(entry.Local, i.Local+"/") && !entry.Deleted {
-							return e
+							return errDirectoryPending
 						}
 					}
 					// User-ignored contents survive. The directory becomes untracked.
@@ -1813,6 +1874,9 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	if e = r.safe(local); e != nil {
 		return e
 	}
+	if _, ve := r.inspect(p, local); ve != nil && !errors.Is(ve, os.ErrNotExist) {
+		return ve
+	}
 	temp := path.Join(path.Dir(local), ".drivesync-tmp-"+randomID())
 	f, e := r.root.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if e != nil {
@@ -1827,6 +1891,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	h := blake3.New()
 	counter := &countWriter{Writer: io.MultiWriter(f, h)}
 	received := &countReader{Reader: stream}
+	downloaded = true
 	e = OpenContent(counter, received, r.key, r.folder, row.BlobID, row.PathID)
 	stream.Close()
 	e = storedContentError(e, received.n, row.SealedSize)
@@ -1847,12 +1912,15 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 		return e
 	}
 	// Inspect immediately before publishing: edits during download are preserved too.
+	// A no-overwrite rename is used when the destination should be absent. Replacing
+	// the indexed bytes is the one path where the destination is expected to exist.
 	v, ve := r.inspect(p, local)
+	replaceExisting := false
 	if ve == nil {
 		dirty := (!known || !sameFile(v, i)) && (v.Directory || v.Hash != m.Hash || v.Size != m.Size)
 		if dirty && !v.Directory && r.adoption {
 			conflict := variantPath(local, " (conflict from authority "+randomID()+")")
-			if e = r.root.Rename(temp, conflict); e != nil {
+			if e = renameIfAbsent(r.root, temp, conflict); e != nil {
 				return e
 			}
 			if e = r.syncParent(conflict); e != nil {
@@ -1867,6 +1935,8 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			if _, e = r.preserve(local); e != nil {
 				return e
 			}
+		} else {
+			replaceExisting = true
 		}
 	} else if !errors.Is(ve, os.ErrNotExist) {
 		return ve
@@ -1874,7 +1944,11 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	if e = r.safe(local); e != nil {
 		return e
 	}
-	if e = r.root.Rename(temp, local); e != nil {
+	if replaceExisting {
+		if e = r.root.Rename(temp, local); e != nil {
+			return e
+		}
+	} else if e = renameIfAbsent(r.root, temp, local); e != nil {
 		return e
 	}
 	if e = r.syncParent(local); e != nil {
@@ -1896,20 +1970,112 @@ func (w *countWriter) Write(p []byte) (int, error) {
 
 func mustReadDir(p string) []os.DirEntry { entries, _ := os.ReadDir(p); return entries }
 func (r *Replica) patterns() []string {
+	if r.ruleSnap != nil {
+		return r.ruleSnap
+	}
+	rules, e := r.readRules()
+	if e != nil {
+		return append([]string(nil), r.opts.Ignore...)
+	}
+	return rules
+}
+
+// readRules loads ignore rules once. The caller of Sync keeps the result for
+// the whole pass, so an editor replacing .drivesyncignore cannot open a window
+// with no rules. A file that exists but is not a readable regular file pauses.
+func (r *Replica) readRules() ([]string, error) {
 	patterns := append([]string(nil), r.opts.Ignore...)
-	if info, e := r.root.Lstat(".drivesyncignore"); e == nil && info.Mode().IsRegular() {
-		if f, e := openLocal(r.root, ".drivesyncignore"); e == nil {
-			b, _ := io.ReadAll(io.LimitReader(f, 64*1024))
-			f.Close()
-			patterns = append(patterns, strings.Split(string(b), "\n")...)
+	info, e := r.root.Lstat(".drivesyncignore")
+	if e == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		f, oe := openLocal(r.root, ".drivesyncignore")
+		if oe != nil {
+			return nil, fmt.Errorf(".drivesyncignore unreadable; sync paused: %w", oe)
 		}
+		b, re := io.ReadAll(io.LimitReader(f, 64*1024))
+		f.Close()
+		if re != nil {
+			return nil, fmt.Errorf(".drivesyncignore unreadable; sync paused: %w", re)
+		}
+		patterns = append(patterns, strings.Split(string(b), "\n")...)
+	} else if !errors.Is(e, os.ErrNotExist) {
+		return nil, fmt.Errorf(".drivesyncignore must be a readable regular file; sync paused")
 	}
 	fingerprint := fmt.Sprintf("%x", blake3.Sum256([]byte(strings.Join(patterns, "\n"))))
 	if fingerprint != r.ignoreFingerprint {
 		r.ignoredChanged = true
 		r.ignoreFingerprint = fingerprint
 	}
-	return patterns
+	return patterns, nil
+}
+
+func (r *Replica) presentContent(local map[string]LocalFile) (int, int64) {
+	files := 0
+	var bytes int64
+	patterns := r.patterns()
+	for p, entry := range r.index {
+		if entry.Deleted || entry.Directory || r.localBlocked(p) || r.ignore(entry.Local, entry.Directory, patterns) {
+			continue
+		}
+		v, ok := local[p]
+		if !ok || v.Directory {
+			continue
+		}
+		files++
+		bytes += v.Size
+	}
+	return files, bytes
+}
+
+func (r *Replica) storeBaseline() error {
+	_, e := r.db.Exec(`INSERT INTO config(key,value) VALUES('baseline-files',?),('baseline-bytes',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatInt(r.baselineFiles, 10), strconv.FormatInt(r.baselineBytes, 10))
+	return e
+}
+
+func (r *Replica) rejectedSameHash(hash string) bool {
+	if hash == "" || hash == "directory" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, rej := range r.rejected {
+		if rej.Hash == hash {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Replica) hashUnportable(local string) string {
+	f, e := openLocal(r.root, local)
+	if e != nil {
+		f, e = os.Open(filepath.Join(r.dir, filepath.FromSlash(local)))
+		if e != nil {
+			return ""
+		}
+	}
+	defer f.Close()
+	info, e := f.Stat()
+	if e != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	h := blake3.New()
+	if _, e = io.Copy(h, f); e != nil {
+		return ""
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func tightenState(dir string) {
+	entries, e := os.ReadDir(dir)
+	if e != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		_ = os.Chmod(filepath.Join(dir, entry.Name()), 0600)
+	}
 }
 
 func variantPath(p, suffix string) string {
@@ -2112,8 +2278,10 @@ func (r *Replica) moveRemote(row Row, m FileMetadata, old IndexEntry) error {
 	if e = durableMkdirAll(r.root, path.Dir(local)); e != nil {
 		return e
 	}
-	if e = r.root.Rename(old.Local, local); e != nil {
-		return e
+	if local != old.Local {
+		if e = renameIfAbsent(r.root, old.Local, local); e != nil {
+			return e
+		}
 	}
 	if e = r.chmod(local, m.Mode, false); e != nil {
 		return e

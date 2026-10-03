@@ -246,35 +246,160 @@ func (r *Replica) validRoot() error {
 	if e != nil || le != nil || he != nil || !info.IsDir() || !os.SameFile(info, held) || id != r.identity {
 		return fmt.Errorf("attachment root identity missing or changed; sync paused")
 	}
+	if r.rootLock != nil {
+		marker := filepath.Join(r.dir, rootMarker)
+		m, me := os.Lstat(marker)
+		l, se := r.rootLock.Stat()
+		if me != nil || se != nil || !os.SameFile(m, l) {
+			lock, le := lockExisting(marker)
+			if le != nil {
+				return fmt.Errorf("root marker replaced and held elsewhere; sync paused")
+			}
+			r.rootLock.Close()
+			r.rootLock = lock
+		}
+	}
 	return nil
 }
+
+func lockExisting(name string) (*os.File, error) {
+	before, e := os.Lstat(name)
+	if e != nil || !before.Mode().IsRegular() {
+		return nil, ErrInvalid
+	}
+	f, e := os.OpenFile(name, os.O_RDWR, 0)
+	if e != nil {
+		return nil, e
+	}
+	if e = flockExclusive(f); e != nil {
+		f.Close()
+		return nil, e
+	}
+	after, e := f.Stat()
+	if e != nil || !os.SameFile(before, after) {
+		f.Close()
+		return nil, ErrInvalid
+	}
+	return f, nil
+}
+
+// reopenSameRoot attaches the held replica to a root whose marker matches the
+// saved identity. A volume that mounts after startup keeps its index.
+func (r *Replica) reopenSameRoot() error {
+	id, e := identifyRoot(r.dir)
+	if e != nil || id != r.identity {
+		return ErrInvalid
+	}
+	root, e := os.OpenRoot(r.dir)
+	if e != nil {
+		return e
+	}
+	info, le := os.Lstat(r.dir)
+	held, he := root.Stat(".")
+	if le != nil || he != nil || !info.IsDir() || !os.SameFile(info, held) {
+		root.Close()
+		return ErrInvalid
+	}
+	lock, e := lockExisting(filepath.Join(r.dir, rootMarker))
+	if e != nil {
+		root.Close()
+		return e
+	}
+	r.root.Close()
+	r.root = root
+	if r.rootLock != nil {
+		r.rootLock.Close()
+	}
+	r.rootLock = lock
+	return nil
+}
+
+func inodeOf(info os.FileInfo) uint64 {
+	if info == nil || info.Sys() == nil {
+		return 0
+	}
+	v := reflect.Indirect(reflect.ValueOf(info.Sys()))
+	if v.IsValid() && v.Kind() == reflect.Struct {
+		if f := v.FieldByName("Ino"); f.IsValid() && f.CanUint() {
+			return f.Uint()
+		}
+		if f := v.FieldByName("Ino"); f.IsValid() && f.CanInt() {
+			return uint64(f.Int())
+		}
+	}
+	return 0
+}
+
 func (r *Replica) deleteSafety(local map[string]LocalFile) error {
 	if e := r.validRoot(); e != nil {
 		return e
 	}
-	tracked, missing := 0, 0
-	moved := map[string]int{}
+	tracked, missing, present := 0, 0, 0
+	var presentBytes int64
+	// A rename is still present. Keep each unmatched local size so a move of
+	// the tree is not counted as a byte wipe.
+	moved := map[string][]int64{}
+	patterns := r.patterns()
 	for p, v := range local {
+		if v.Directory {
+			continue
+		}
 		if old, known := r.index[p]; !known || old.Deleted {
-			moved[v.Hash]++
+			moved[v.Hash] = append(moved[v.Hash], v.Size)
 		}
 	}
-	patterns := r.patterns()
 	for p, entry := range r.index {
-		if entry.Deleted || r.localBlocked(p) || r.ignore(entry.Local, entry.Directory, patterns) {
+		if entry.Deleted || entry.Directory || r.localBlocked(p) || r.ignore(entry.Local, entry.Directory, patterns) {
 			continue
 		}
 		tracked++
-		if _, ok := local[p]; !ok {
-			if moved[entry.Hash] > 0 {
-				moved[entry.Hash]--
-			} else {
-				missing++
-			}
+		if v, ok := local[p]; ok && !v.Directory {
+			present++
+			presentBytes += v.Size
+			continue
+		}
+		if sizes := moved[entry.Hash]; len(sizes) > 0 {
+			present++
+			presentBytes += sizes[len(sizes)-1]
+			moved[entry.Hash] = sizes[:len(sizes)-1]
+			continue
+		}
+		missing++
+	}
+	refFiles := r.baselineFiles
+	if int64(tracked) > refFiles {
+		refFiles = int64(tracked)
+	}
+	gone := missing
+	if refFiles > int64(present) {
+		fromBase := int(refFiles) - present
+		if fromBase > gone {
+			gone = fromBase
 		}
 	}
-	if !r.allowMassDelete && tracked >= 5 && missing*5 >= tracked*4 {
-		return fmt.Errorf("%d of %d tracked entries disappeared; deletes paused (Retry acknowledges intentional removal)", missing, tracked)
+	refBytes := r.baselineBytes
+	if presentBytes > refBytes && missing == 0 {
+		refBytes = presentBytes
+	}
+	goneBytes := int64(0)
+	if refBytes > presentBytes {
+		goneBytes = refBytes - presentBytes
+	}
+	fileWipe := refFiles >= 5 && int64(gone)*5 >= refFiles*4
+	byteWipe := refFiles >= 5 && refBytes > 0 && goneBytes*5 >= refBytes*4
+	if !fileWipe && !byteWipe {
+		r.allowMassDelete = false
+		if int64(present) >= r.baselineFiles {
+			r.baselineFiles = int64(present)
+			r.baselineBytes = presentBytes
+			if e := r.storeBaseline(); e != nil {
+				return e
+			}
+		}
+		return nil
+	}
+	if !r.allowMassDelete {
+		return fmt.Errorf("%d of %d tracked files disappeared; deletes paused (Retry acknowledges intentional removal)", gone, refFiles)
 	}
 	return nil
 }
@@ -383,6 +508,13 @@ func (r *Replica) rebindRoot() error {
 		}
 	}()
 	marker := filepath.Join(r.dir, rootMarker)
+	if current, ie := identifyRoot(r.dir); ie == nil {
+		if current.Token != r.identity.Token && current.Inode != r.identity.Inode {
+			return fmt.Errorf("root is neither the attached directory nor a copy of it; attach with fresh state to adopt it: %w", ErrInvalid)
+		}
+	} else if inodeOf(info) != r.identity.Inode {
+		return fmt.Errorf("root is neither the attached directory nor a copy of it; attach with fresh state to adopt it: %w", ErrInvalid)
+	}
 	if _, e = os.Lstat(marker); errors.Is(e, os.ErrNotExist) {
 		b, _ := json.Marshal(rootIdentity{Folder: r.folder, Token: randomID()})
 		if e = writeMarker(marker, b); e != nil {
@@ -421,7 +553,7 @@ func (r *Replica) rebindRoot() error {
 		}
 	}
 	b, _ := json.Marshal(id)
-	if _, e = tx.Exec("INSERT OR REPLACE INTO config(key,value) VALUES('root',?),('version','0')", string(b)); e != nil {
+	if _, e = tx.Exec("INSERT OR REPLACE INTO config(key,value) VALUES('root',?),('version','0'),('adoption','1'),('baseline-files','0'),('baseline-bytes','0')", string(b)); e != nil {
 		return e
 	}
 	if e = tx.Commit(); e != nil {
@@ -437,6 +569,8 @@ func (r *Replica) rebindRoot() error {
 	}
 	r.identity = id
 	r.version = 0
+	r.baselineFiles = 0
+	r.baselineBytes = 0
 	r.index = map[string]IndexEntry{}
 	r.byID = map[string]string{}
 	r.byLocal = map[string]string{}

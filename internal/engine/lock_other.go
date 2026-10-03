@@ -16,3 +16,5 @@ func openLocal(root *os.Root, p string) (*os.File, error) { return root.Open(p) 
 func attachmentAdmission(dir string) (func(), error) {
 	return nil, errors.New("replica locking requires Linux or macOS")
 }
+
+func flockExclusive(f *os.File) error { return nil }

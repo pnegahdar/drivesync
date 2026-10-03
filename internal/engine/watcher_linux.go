@@ -4,9 +4,12 @@ package engine
 
 import (
 	"context"
-	"github.com/fsnotify/fsnotify"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 func watchDirectory(ctx context.Context, dir string, wake chan<- struct{}) (func(), string, error) {
@@ -15,10 +18,36 @@ func watchDirectory(ctx context.Context, dir string, wake chan<- struct{}) (func
 		return nil, "polling", e
 	}
 	add := func(p string) {
+		rootInfo, se := os.Lstat(dir)
+		if se != nil {
+			return
+		}
+		patterns := watchPatterns(dir)
 		_ = filepath.WalkDir(p, func(p string, d fs.DirEntry, e error) error {
-			if e == nil && d.IsDir() {
-				_ = w.Add(p)
+			if e != nil || !d.IsDir() {
+				return nil
 			}
+			info, ie := d.Info()
+			if ie != nil {
+				return nil
+			}
+			if device(info) != device(rootInfo) {
+				return fs.SkipDir
+			}
+			rel, _ := filepath.Rel(dir, p)
+			rel = filepath.ToSlash(rel)
+			if rel != "." {
+				if pathIgnored(rel, true, patterns) {
+					return fs.SkipDir
+				}
+				if _, e := os.Lstat(filepath.Join(p, rootMarker)); e == nil {
+					return fs.SkipDir
+				}
+				if _, e := os.Lstat(filepath.Join(p, stateMarker)); e == nil {
+					return fs.SkipDir
+				}
+			}
+			_ = w.Add(p)
 			return nil
 		})
 	}
@@ -51,4 +80,12 @@ func watchDirectory(ctx context.Context, dir string, wake chan<- struct{}) (func
 		}
 	}()
 	return func() { _ = w.Close() }, "inotify", nil
+}
+
+func watchPatterns(dir string) []string {
+	b, e := os.ReadFile(filepath.Join(dir, ".drivesyncignore"))
+	if e != nil {
+		return nil
+	}
+	return strings.Split(string(b), "\n")
 }
