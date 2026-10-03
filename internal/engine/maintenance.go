@@ -179,7 +179,7 @@ func (s *Server) surveyCollectSQL(ctx context.Context, db *SQLiteMetaStore) (map
 		return nil, nil, nil, e
 	}
 	rows.Close()
-	// Garbage is paged by primary key during deletion. Unmarshalling the whole
+	// Garbage is paged by primary key during deletion. Decoding the whole
 	// backlog here used up the collect budget before a row was removed.
 	return map[string]Garbage{}, expired, deleted, nil
 }
