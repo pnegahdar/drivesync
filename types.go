@@ -15,7 +15,7 @@ import (
 type Principal struct{ Tenant, Subject string }
 
 func (p Principal) valid() bool {
-	return p.Tenant != "" && p.Subject != "" && utf8.ValidString(p.Tenant) && utf8.ValidString(p.Subject)
+	return p.Tenant != "" && p.Subject != "" && len(p.Tenant) <= 256 && len(p.Subject) <= 256 && utf8.ValidString(p.Tenant) && utf8.ValidString(p.Subject)
 }
 
 type Role string
@@ -28,6 +28,9 @@ const (
 
 var (
 	ErrDenied    = errors.New("not found or access denied")
+	ErrBusy      = errors.New("path has an active upload")
+	ErrExpired   = errors.New("upload reservation expired")
+	ErrQuota     = errors.New("owner quota limit")
 	ErrConflict  = errors.New("version conflict")
 	ErrInvalid   = errors.New("invalid request")
 	ErrKey       = errors.New("incorrect folder key")
@@ -40,11 +43,11 @@ type LimitError struct {
 }
 
 func (e *LimitError) Error() string {
-	return fmt.Sprintf("%s limit: %d requested, %d available", e.Limit, e.Requested, e.Maximum)
+	return fmt.Sprintf("%s limit: %d requested, %d limit", e.Limit, e.Requested, e.Maximum)
 }
 
-type Limits struct{ MaxFileBytes, MaxTotalBytes, MaxFiles int64 }
-type Quota struct{ MaxTotalBytes, MaxFolders, MaxFileBytes int64 }
+type Limits struct{ MaxFileBytes, MaxTotalBytes, MaxFiles, MaxRows int64 }
+type Quota struct{ MaxTotalBytes, MaxFolders, MaxFileBytes, MaxFiles int64 }
 
 // Zero limits mean unlimited; negative values are invalid. Bytes are sealed bytes.
 type QuotaPolicy interface {
@@ -54,7 +57,7 @@ type QuotaFunc func(context.Context, Principal) (Quota, error)
 
 func (f QuotaFunc) Quota(c context.Context, p Principal) (Quota, error) { return f(c, p) }
 
-type Usage struct{ Bytes, Files, Reserved, ReservedFiles int64 }
+type Usage struct{ Bytes, Files, Rows, Reserved, ReservedFiles, ReservedRows, GarbageRows int64 }
 type FolderSpec struct {
 	Name, Description string
 	Limits            Limits
@@ -78,17 +81,23 @@ type Row struct {
 	Deleted                  bool
 }
 type UploadRequest struct {
-	PathID      string
-	BaseVersion uint64
-	SealedSize  int64
+	PathID        string
+	BaseVersion   uint64
+	SealedSize    int64
+	MetadataBytes int64
+	// Deletes are CAS-bound rename credits, committed atomically with this upload.
+	Deletes []Mutation
 }
 type Ticket struct {
 	ID, FolderID, BlobID, PathID             string
 	Principal                                Principal
 	BaseVersion                              uint64
 	SealedSize, ReservedBytes, ReservedFiles int64
+	ReservedRows                             int64
 	Expires                                  time.Time
 	Uploaded                                 bool
+	Writing                                  bool
+	Deletes                                  []Mutation
 }
 type Mutation struct {
 	PathID      string
@@ -98,9 +107,21 @@ type Mutation struct {
 	Deleted     bool
 }
 type Delta struct {
+	Next    string `json:",omitempty"`
 	Version uint64
 	Rows    []Row
 }
+
+// ConflictError identifies only the paths whose bases are stale.
+type ConflictError struct{ Paths []string }
+
+func (e *ConflictError) Error() string { return ErrConflict.Error() }
+func (e *ConflictError) Unwrap() error { return ErrConflict }
+
+const RowCost int64 = 256
+const MaxRequestBytes int64 = 1 << 50
+const MaxGrants = 256
+
 type Event struct {
 	Version uint64
 	Err     error
@@ -134,7 +155,7 @@ func randomID() string {
 func validID(s string) bool     { b, e := hex.DecodeString(s); return e == nil && len(b) == 16 }
 func validPathID(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
 func validLimits(l Limits) bool {
-	return l.MaxFileBytes >= 0 && l.MaxTotalBytes >= 0 && l.MaxFiles >= 0
+	return l.MaxFileBytes >= 0 && l.MaxTotalBytes >= 0 && l.MaxFiles >= 0 && l.MaxRows >= 0
 }
 func minimum(a, b int64) int64 {
 	if a == 0 {

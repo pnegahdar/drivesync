@@ -54,7 +54,7 @@ func TestConcurrentAuthorities(t *testing.T) {
 	}
 	defer b.Close()
 	sa, sb := NewServer(a, NewMemoryBlobStore()), NewServer(b, NewMemoryBlobStore())
-	f, _ := folderFor(t, sa.Client(owner), Limits{MaxTotalBytes: 7})
+	f, _ := folderFor(t, sa.Client(owner), Limits{MaxTotalBytes: 7 * (RowCost + 1)})
 	var accepted atomic.Int32
 	var wg sync.WaitGroup
 	for i := 0; i < 40; i++ {
@@ -147,7 +147,7 @@ func TestStoredSizeRecheckedAndBatchAtomicity(t *testing.T) {
 	f, k := folderFor(t, c, Limits{})
 	ctx := context.Background()
 	pid, _ := PathID(k, f.ID, "new")
-	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -165,7 +165,7 @@ func TestStoredSizeRecheckedAndBatchAtomicity(t *testing.T) {
 	_ = c.CancelUpload(ctx, f.ID, ticket.ID)
 	a := put(t, c, f, k, "a", 0, []byte("a"))
 	bb := put(t, c, f, k, "b", 0, []byte("b"))
-	if _, e = c.Commit(ctx, f.ID, []Mutation{{PathID: a.PathID, BaseVersion: a.Version, Deleted: true}, {PathID: bb.PathID, BaseVersion: 0, Deleted: true}}); e != ErrConflict {
+	if _, e = c.Commit(ctx, f.ID, []Mutation{{PathID: a.PathID, BaseVersion: a.Version, Deleted: true}, {PathID: bb.PathID, BaseVersion: 0, Deleted: true}}); !errors.Is(e, ErrConflict) {
 		t.Fatal(e)
 	}
 	delta, _ := c.Changes(ctx, f.ID, 0)
@@ -185,21 +185,21 @@ func TestExactReservationBoundaries(t *testing.T) {
 			case "file":
 				l.MaxFileBytes = 10
 			case "folder bytes":
-				l.MaxTotalBytes = 10
+				l.MaxTotalBytes = RowCost + 10
 			case "owner bytes":
-				s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) { return Quota{MaxTotalBytes: 10}, nil })
+				s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) { return Quota{MaxTotalBytes: RowCost + 10}, nil })
 			}
 			f, k := folderFor(t, c, l)
 			pid, _ := PathID(k, f.ID, "x")
 			ctx := context.Background()
-			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 10})
+			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 10})
 			if e != nil {
 				t.Fatal("exact limit", e)
 			}
 			if e = c.CancelUpload(ctx, f.ID, ticket.ID); e != nil {
 				t.Fatal(e)
 			}
-			if _, e = c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 11}); e == nil {
+			if _, e = c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 11}); e == nil {
 				t.Fatal("limit+1 accepted")
 			}
 		})
@@ -213,7 +213,7 @@ func TestOutstandingTicketsAfterDeletionAndDowngrade(t *testing.T) {
 	ctx := context.Background()
 	_ = c.Grant(ctx, f.ID, p, Writer)
 	pid, _ := PathID(k, f.ID, "pending")
-	ticket, e := s.Client(p).Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+	ticket, e := s.Client(p).Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -226,7 +226,7 @@ func TestOutstandingTicketsAfterDeletionAndDowngrade(t *testing.T) {
 		t.Fatal(f.Usage)
 	}
 	_ = c.Grant(ctx, f.ID, p, Writer)
-	ticket, e = s.Client(p).Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+	ticket, e = s.Client(p).Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -252,15 +252,15 @@ func TestCommitExcludesExpiredReservations(t *testing.T) {
 	s.Now = func() time.Time { return clock }
 	s.ReservationTTL = time.Minute
 	var maximum atomic.Int64
-	maximum.Store(100)
+	maximum.Store(10000)
 	s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) { return Quota{MaxTotalBytes: maximum.Load()}, nil })
 	oldPID, _ := PathID(k, f.ID, "old")
-	if _, e := c.Reserve(ctx, f.ID, UploadRequest{oldPID, 0, 1}); e != nil {
+	if _, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: oldPID, BaseVersion: 0, SealedSize: 1}); e != nil {
 		t.Fatal(e)
 	}
 	clock = clock.Add(30 * time.Second)
 	pid, _ := PathID(k, f.ID, "new")
-	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -268,7 +268,7 @@ func TestCommitExcludesExpiredReservations(t *testing.T) {
 		t.Fatal(e)
 	}
 	clock = clock.Add(31 * time.Second)
-	maximum.Store(1)
+	maximum.Store(RowCost + 1 + int64(len(metaForReservationTest(k, f.ID, pid, ticket.BlobID))))
 	meta, e := SealMetadata(k, f.ID, pid, FileMetadata{Path: "new", BlobID: ticket.BlobID, Mode: 0600})
 	if e != nil {
 		t.Fatal(e)
@@ -276,4 +276,9 @@ func TestCommitExcludesExpiredReservations(t *testing.T) {
 	if _, e = c.Commit(ctx, f.ID, []Mutation{{PathID: pid, TicketID: ticket.ID, Metadata: meta}}); e != nil {
 		t.Fatal("expired reservation blocked commit", e)
 	}
+}
+
+func metaForReservationTest(k FolderKey, f, p, b string) []byte {
+	v, _ := SealMetadata(k, f, p, FileMetadata{Path: "new", BlobID: b, Mode: 0600})
+	return v
 }

@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Authenticator func(*http.Request) (Principal, error)
@@ -23,9 +25,12 @@ type wireRequest struct {
 	Upload                   UploadRequest
 	Mutations                []Mutation
 	After                    uint64
+	Page                     string
+	Until                    uint64
 }
 type wireError struct {
 	Code  string
+	Paths []string    `json:",omitempty"`
 	Limit *LimitError `json:",omitempty"`
 }
 type wireResponse struct {
@@ -43,10 +48,20 @@ func encodeError(e error) *wireError {
 	}
 	var l *LimitError
 	if errors.As(e, &l) {
-		return &wireError{"limit", l}
+		return &wireError{Code: "limit", Limit: l}
+	}
+	var conflict *ConflictError
+	if errors.As(e, &conflict) {
+		return &wireError{Code: "conflict", Paths: conflict.Paths}
 	}
 	code := "internal"
 	switch {
+	case errors.Is(e, ErrQuota):
+		code = "quota"
+	case errors.Is(e, ErrBusy):
+		code = "busy"
+	case errors.Is(e, ErrExpired):
+		code = "expired"
 	case errors.Is(e, ErrDenied):
 		code = "denied"
 	case errors.Is(e, ErrConflict):
@@ -71,8 +86,14 @@ func decodeError(e *wireError) error {
 	switch e.Code {
 	case "denied":
 		return ErrDenied
+	case "quota":
+		return ErrQuota
+	case "busy":
+		return ErrBusy
+	case "expired":
+		return ErrExpired
 	case "conflict":
-		return ErrConflict
+		return &ConflictError{Paths: e.Paths}
 	case "invalid":
 		return ErrInvalid
 	case "integrity":
@@ -93,6 +114,9 @@ func decodeError(e *wireError) error {
 func decodeWire(r io.Reader, v any) error {
 	b, e := io.ReadAll(io.LimitReader(r, (1<<20)+1))
 	if e != nil || len(b) > 1<<20 {
+		return ErrInvalid
+	}
+	if !validJSONString(b) {
 		return ErrInvalid
 	}
 	return decodeJSON(bytes.NewReader(b), v)
@@ -161,7 +185,7 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 			case "commit":
 				out.Delta, e = c.Commit(r.Context(), req.Folder, req.Mutations)
 			case "changes":
-				out.Delta, e = c.Changes(r.Context(), req.Folder, req.After)
+				out.Delta, e = s.ChangesPage(r.Context(), p, req.Folder, req.After, req.Until, req.Page)
 			case "wait":
 				ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 				out.Version, e = c.Wait(ctx, req.Folder, req.After)
@@ -301,8 +325,66 @@ func (c *HTTPClient) Commit(x context.Context, id string, m []Mutation) (Delta, 
 	return v.Delta, e
 }
 func (c *HTTPClient) Changes(x context.Context, id string, v uint64) (Delta, error) {
-	r, e := c.rpc(x, wireRequest{Op: "changes", Folder: id, After: v})
-	return r.Delta, e
+	var out Delta
+	page := ""
+	until := uint64(0)
+	for {
+		r, e := c.rpc(x, wireRequest{Op: "changes", Folder: id, After: v, Until: until, Page: page})
+		if e != nil {
+			return Delta{}, e
+		}
+		out.Rows = append(out.Rows, r.Delta.Rows...)
+		out.Version = r.Delta.Version
+		until = out.Version
+		if r.Delta.Next == "" {
+			return out, nil
+		}
+		if r.Delta.Next == page {
+			return Delta{}, ErrInvalid
+		}
+		page = r.Delta.Next
+	}
+}
+
+// Validate the raw JSON before encoding/json can replace malformed UTF-8 or
+// unpaired UTF-16 escapes with U+FFFD and accidentally alias an identity.
+func validJSONString(b []byte) bool {
+	if !utf8.Valid(b) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(b) {
+			return false
+		}
+		if b[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(b) {
+			return false
+		}
+		u, e := strconv.ParseUint(string(b[i+1:i+5]), 16, 16)
+		if e != nil {
+			return false
+		}
+		i += 4
+		if u >= 0xd800 && u <= 0xdbff {
+			if i+6 >= len(b) || b[i+1] != '\\' || b[i+2] != 'u' {
+				return false
+			}
+			v, e := strconv.ParseUint(string(b[i+3:i+7]), 16, 16)
+			if e != nil || v < 0xdc00 || v > 0xdfff {
+				return false
+			}
+			i += 6
+		} else if u >= 0xdc00 && u <= 0xdfff {
+			return false
+		}
+	}
+	return true
 }
 func (c *HTTPClient) Wait(x context.Context, id string, v uint64) (uint64, error) {
 	r, e := c.rpc(x, wireRequest{Op: "wait", Folder: id, After: v})

@@ -11,6 +11,7 @@ Security takes priority over convenience:
   an independent boundary. Denied and nonexistent must remain indistinguishable.
 - Principals are opaque nonempty UTF-8 tenant/subject pairs; never authorize by
   subject alone. Reject invalid UTF-8; JSON replacement must not alias identities.
+  Bound principal components to 256 bytes and grants to 256 per folder.
   Only principals with owner access may manage grants, delete folders and change
   limits. Keep the creator as immutable primary owner and quota account.
 - Server-generated tickets and blobs bind principal, folder, path and base version.
@@ -31,6 +32,18 @@ Security takes priority over convenience:
   trust uploaded size claims; inspect stored bytes at commit. Reservations expire.
   Recheck changed limits at commit, and allow deletes even above lowered quota.
   Keep rejected files locally, with reasons and backoff in replica status.
+- Keep cross-tenant folder capacity allocated against the primary owner quota.
+  Only the primary owner may change allocations; other principals see folder
+  limits and generic owner-quota failures. Never expose owner activity through
+  reservation or allocation probes. Saturate accounting and cap request sizes.
+- Charge sealed metadata, fixed row costs, tombstones and queued garbage. Enforce
+  owner row budgets and scoped SQLite queries. Persist cleanup before freeing
+  physical blob charges; collect cancelled/expired uploads and staging files.
+- Preserve busy paths, retry only actual CAS losers, commit renames with credits,
+  persist pending winner/retry state, and maintain a one-to-one local path map.
+  Quarantine bad peers/unreadable files without blocking unrelated sync.
+- Sync parents of newly created directories before index/authority acknowledgement.
+  Match ignores under NFC/case folding and revisit skipped rows after unignore.
 - Maintain native FSEvents on macOS through purego; kqueue's descriptor per file
   is unsuitable. Use inotify on Linux and keep periodic rescans as a safety net.
 

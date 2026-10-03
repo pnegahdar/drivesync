@@ -534,7 +534,7 @@ func TestMaliciousMetadataThroughReplica(t *testing.T) {
 	f, k := folderFor(t, c, Limits{})
 	ctx := context.Background()
 	pid := strings.Repeat("a", 64)
-	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, SealedSize(0)})
+	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: SealedSize(0)})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -638,7 +638,7 @@ func TestCaseDirectoryBatchAndTypeReplacement(t *testing.T) {
 			content = nil
 		}
 		pid, _ := PathID(k, f.ID, p)
-		ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, SealedSize(int64(len(content)))})
+		ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: SealedSize(int64(len(content)))})
 		if e != nil {
 			t.Fatal(e)
 		}

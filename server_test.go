@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,7 +55,7 @@ func put(t testing.TB, c Client, f Folder, k FolderKey, p string, base uint64, d
 	if e != nil {
 		t.Fatal(e)
 	}
-	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, base, SealedSize(int64(len(data)))})
+	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: base, SealedSize: SealedSize(int64(len(data)))})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -128,7 +129,7 @@ func TestAccessMatrix(t *testing.T) {
 							}
 						case "reserve":
 							allowed = role.write
-							_, e = c.Reserve(ctx, f.ID, UploadRequest{row.PathID, row.Version, 1})
+							_, e = c.Reserve(ctx, f.ID, UploadRequest{PathID: row.PathID, BaseVersion: row.Version, SealedSize: 1})
 						case "upload":
 							allowed = role.write
 							creator := admin
@@ -136,7 +137,7 @@ func TestAccessMatrix(t *testing.T) {
 								creator = c
 							}
 							pid := fmt.Sprintf("%064x", 99)
-							ticket, ce := creator.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+							ticket, ce := creator.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 							if ce != nil {
 								t.Fatal(ce)
 							}
@@ -151,7 +152,7 @@ func TestAccessMatrix(t *testing.T) {
 								creator = c
 							}
 							pid := fmt.Sprintf("%064x", 99)
-							ticket, ce := creator.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+							ticket, ce := creator.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 							if ce != nil {
 								t.Fatal(ce)
 							}
@@ -217,7 +218,7 @@ func TestOpaqueDenialAndBlobBinding(t *testing.T) {
 				t.Fatal(e)
 			}
 			pid, _ := PathID(k, f.ID, "pending")
-			ticket, e := admin.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+			ticket, e := admin.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -262,7 +263,7 @@ func TestImmediateRevocation(t *testing.T) {
 			}
 			defer open.Close()
 			pid, _ := PathID(k, f.ID, "next")
-			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -291,7 +292,7 @@ func TestImmediateRevocation(t *testing.T) {
 func TestSubscriptions(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
-	f, k := folderFor(t, c, Limits{})
+	f, k := folderFor(t, c, Limits{MaxTotalBytes: 1 << 20})
 	p := Principal{"t", "p"}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -331,7 +332,7 @@ func TestLimitsBoundaries(t *testing.T) {
 				case "file":
 					l.MaxFileBytes = SealedSize(3)
 				case "bytes":
-					l.MaxTotalBytes = SealedSize(3)
+					l.MaxTotalBytes = accountedTestFile("one", []byte("abc"))
 				case "files":
 					l.MaxFiles = 1
 				}
@@ -345,7 +346,7 @@ func TestLimitsBoundaries(t *testing.T) {
 					base = row.Version
 					size = SealedSize(4)
 				}
-				_, e := c.Reserve(ctx, f.ID, UploadRequest{p, base, size})
+				_, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: p, BaseVersion: base, SealedSize: size})
 				var le *LimitError
 				if !errors.As(e, &le) {
 					t.Fatalf("expected limit: %v", e)
@@ -353,7 +354,12 @@ func TestLimitsBoundaries(t *testing.T) {
 				if _, e = c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}}); e != nil {
 					t.Fatal(e)
 				}
-				if _, e = c.Reserve(ctx, f.ID, UploadRequest{p, 0, SealedSize(1)}); e != nil && which != "file" {
+				if which == "bytes" {
+					if e = c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: RowCost + RowCost + SealedSize(1)}); e != nil {
+						t.Fatal(e)
+					}
+				}
+				if _, e = c.Reserve(ctx, f.ID, UploadRequest{PathID: p, BaseVersion: 0, SealedSize: SealedSize(1)}); e != nil && which != "file" {
 					t.Fatal(e)
 				}
 			})
@@ -363,7 +369,7 @@ func TestLimitsBoundaries(t *testing.T) {
 func TestReservationRacesExpiryAndLies(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
-	f, _ := folderFor(t, c, Limits{MaxTotalBytes: 10, MaxFiles: 10})
+	f, _ := folderFor(t, c, Limits{MaxTotalBytes: 10 * (RowCost + 1), MaxFiles: 10})
 	ctx := context.Background()
 	var count atomic.Int32
 	var wg sync.WaitGroup
@@ -372,7 +378,7 @@ func TestReservationRacesExpiryAndLies(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			pid := fmt.Sprintf("%064x", i)
-			if _, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1}); e == nil {
+			if _, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e == nil {
 				count.Add(1)
 			} else {
 				var l *LimitError
@@ -387,7 +393,7 @@ func TestReservationRacesExpiryAndLies(t *testing.T) {
 		t.Fatalf("%d reservations", count.Load())
 	}
 	got, _ := c.GetFolder(ctx, f.ID)
-	if got.Usage.Reserved != 10 {
+	if got.Usage.Reserved != 10*(RowCost+1) {
 		t.Fatal(got.Usage)
 	}
 	s.Now = func() time.Time { return time.Now().Add(time.Hour) }
@@ -396,14 +402,14 @@ func TestReservationRacesExpiryAndLies(t *testing.T) {
 		t.Fatal(got.Usage)
 	}
 	pid := fmt.Sprintf("%064x", 200)
-	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 3})
+	ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 3})
 	if e != nil {
 		t.Fatal(e)
 	}
 	if e = c.Upload(ctx, f.ID, ticket, bytes.NewBufferString("1234")); e != ErrInvalid {
 		t.Fatal(e)
 	}
-	ticket, e = c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 3})
+	ticket, e = c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 3})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -416,7 +422,7 @@ func TestOwnerQuotaAndLowering(t *testing.T) {
 	c := s.Client(owner)
 	ctx := context.Background()
 	var max atomic.Int64
-	max.Store(SealedSize(3))
+	max.Store(accountedTestFile("x", []byte("abc")))
 	s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) {
 		return Quota{MaxTotalBytes: max.Load(), MaxFolders: 2, MaxFileBytes: SealedSize(3)}, nil
 	})
@@ -424,20 +430,22 @@ func TestOwnerQuotaAndLowering(t *testing.T) {
 	row := put(t, c, f, k, "x", 0, []byte("abc"))
 	g, _ := folderFor(t, c, Limits{})
 	pid, _ := PathID(k, g.ID, "x")
-	if _, e := c.Reserve(ctx, g.ID, UploadRequest{pid, 0, 1}); e == nil {
+	if _, e := c.Reserve(ctx, g.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e == nil {
 		t.Fatal("owner quota exceeded")
 	}
 	if _, e := c.CreateFolder(ctx, FolderSpec{Name: "third", KeyCheck: KeyCheck(k)}); e == nil {
 		t.Fatal("folder quota exceeded")
 	}
 	max.Store(1)
-	if _, e := c.Reserve(ctx, f.ID, UploadRequest{row.PathID, row.Version, 1}); e == nil {
+	if _, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: row.PathID, BaseVersion: row.Version, SealedSize: 1}); e == nil {
 		t.Fatal("write below usage allowed")
 	}
 	if _, e := c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}}); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := c.Reserve(ctx, g.ID, UploadRequest{pid, 0, 1}); e != nil {
+	// The retained tombstone still costs a row, so restore enough quota.
+	max.Store(2*RowCost + 1)
+	if _, e := c.Reserve(ctx, g.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -451,7 +459,7 @@ func TestEveryOperationAfterDeletion(t *testing.T) {
 			ctx := context.Background()
 			row := put(t, c, f, k, "file", 0, []byte("file"))
 			pid, _ := PathID(k, f.ID, "pending")
-			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1})
+			ticket, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -459,7 +467,10 @@ func TestEveryOperationAfterDeletion(t *testing.T) {
 				t.Fatal(e)
 			}
 			methods := map[string]func() error{
-				"get": func() error { _, e := c.GetFolder(ctx, f.ID); return e }, "changes": func() error { _, e := c.Changes(ctx, f.ID, 0); return e }, "wait": func() error { _, e := c.Wait(ctx, f.ID, 0); return e }, "download": func() error { _, e := c.Download(ctx, f.ID, row.BlobID); return e }, "reserve": func() error { _, e := c.Reserve(ctx, f.ID, UploadRequest{pid, 0, 1}); return e }, "upload": func() error { return c.Upload(ctx, f.ID, ticket, bytes.NewReader([]byte{1})) }, "cancel": func() error { return c.CancelUpload(ctx, f.ID, ticket.ID) }, "commit": func() error {
+				"get": func() error { _, e := c.GetFolder(ctx, f.ID); return e }, "changes": func() error { _, e := c.Changes(ctx, f.ID, 0); return e }, "wait": func() error { _, e := c.Wait(ctx, f.ID, 0); return e }, "download": func() error { _, e := c.Download(ctx, f.ID, row.BlobID); return e }, "reserve": func() error {
+					_, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
+					return e
+				}, "upload": func() error { return c.Upload(ctx, f.ID, ticket, bytes.NewReader([]byte{1})) }, "cancel": func() error { return c.CancelUpload(ctx, f.ID, ticket.ID) }, "commit": func() error {
 					_, e := c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}})
 					return e
 				}, "grant": func() error { return c.Grant(ctx, f.ID, Principal{"t", "p"}, Reader) }, "revoke": func() error { return c.Revoke(ctx, f.ID, Principal{"t", "p"}) }, "delete": func() error { return c.DeleteFolder(ctx, f.ID) }, "limits": func() error { return c.SetLimits(ctx, f.ID, Limits{}) }, "subscribe": func() error { _, e := s.Subscribe(ctx, owner, f.ID, 0); return e }}
@@ -507,4 +518,12 @@ func TestInvalidUTF8PrincipalsNeverAlias(t *testing.T) {
 			}
 		})
 	}
+}
+
+func accountedTestFile(path string, content []byte) int64 {
+	k := FolderKey{}
+	id := strings.Repeat("0", 32)
+	pid, _ := PathID(k, id, path)
+	meta, _ := SealMetadata(k, id, pid, FileMetadata{Path: path, BlobID: id, Size: int64(len(content)), Mode: 0600, Hash: hashBytes(content)})
+	return RowCost + int64(len(meta)) + SealedSize(int64(len(content)))
 }

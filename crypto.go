@@ -242,11 +242,19 @@ func OpenContent(w io.Writer, r io.Reader, k FolderKey, folder, blob, pid string
 		}
 		if final == 1 {
 			var trailing [1]byte
-			n, e := r.Read(trailing[:])
-			if n != 0 || e != io.EOF {
-				return ErrIntegrity
+			for empty := 0; empty < 100; empty++ {
+				n, e := r.Read(trailing[:])
+				if n != 0 {
+					return ErrIntegrity
+				}
+				if e == io.EOF {
+					return nil
+				}
+				if e != nil {
+					return ErrIntegrity
+				}
 			}
-			return nil
+			return io.ErrNoProgress
 		}
 		if e = writeAll(w, p); e != nil {
 			return e

@@ -57,6 +57,12 @@ func (s *Server) notify() {
 func (s *Server) expire(m *Metadata) {
 	for id, t := range m.Tickets {
 		if !t.Expires.After(s.now()) {
+			s.retireTicket(m, t)
+			if !t.Uploaded && !t.Writing {
+				g := m.Garbage[t.FolderID+"/"+t.BlobID]
+				g.Size = RowCost
+				m.Garbage[t.FolderID+"/"+t.BlobID] = g
+			}
 			delete(m.Tickets, id)
 		}
 	}
@@ -65,27 +71,119 @@ func (s *Server) quota(ctx context.Context, p Principal) (Quota, error) {
 	if s.Quotas == nil {
 		return Quota{}, nil
 	}
-	q, e := s.Quotas.Quota(ctx, p)
-	if e == nil && (q.MaxTotalBytes < 0 || q.MaxFolders < 0 || q.MaxFileBytes < 0) {
+	q, e := bounded(ctx, func(c context.Context) (Quota, error) { return s.Quotas.Quota(c, p) })
+	if e == nil && (q.MaxTotalBytes < 0 || q.MaxFolders < 0 || q.MaxFileBytes < 0 || q.MaxFiles < 0) {
 		e = ErrInvalid
 	}
 	return q, e
 }
+func sat(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+func rowBytes(r Row) int64 { return sat(RowCost, sat(r.SealedSize, int64(len(r.Metadata)))) }
 func usage(m *Metadata, id string) Usage {
 	var u Usage
 	for _, r := range m.Files[id] {
+		u.Bytes = sat(u.Bytes, rowBytes(r))
+		u.Rows++
 		if !r.Deleted {
-			u.Bytes += r.SealedSize
 			u.Files++
 		}
 	}
 	for _, t := range m.Tickets {
 		if t.FolderID == id {
-			u.Reserved += t.ReservedBytes
-			u.ReservedFiles += t.ReservedFiles
+			u.Reserved = sat(u.Reserved, t.ReservedBytes)
+			u.ReservedFiles = sat(u.ReservedFiles, t.ReservedFiles)
+			u.ReservedRows = sat(u.ReservedRows, t.ReservedRows)
+		}
+	}
+	for _, g := range m.Garbage {
+		if g.FolderID == id {
+			u.GarbageRows++
+			u.Bytes = sat(u.Bytes, g.Size)
 		}
 	}
 	return u
+}
+func ownerUsage(m *Metadata, p Principal) (bytes, rows int64) {
+	for id, f := range m.Folders {
+		if f.Folder.Owner == p {
+			u := usage(m, id)
+			n := sat(u.Bytes, u.Reserved)
+			r := sat(sat(u.Rows, u.GarbageRows), u.ReservedRows)
+			if f.Allocated {
+				n = max(n, f.Folder.Limits.MaxTotalBytes)
+				r = max(r, allocatedRows(f.Folder.Limits))
+			}
+			bytes = sat(bytes, n)
+			rows = sat(rows, r)
+		}
+	}
+	for _, g := range m.Garbage {
+		if g.Owner == p {
+			if _, ok := m.Folders[g.FolderID]; !ok {
+				bytes = sat(bytes, g.Size)
+				rows = sat(rows, 1)
+			}
+		}
+	}
+	return
+}
+func allocatedRows(l Limits) int64 { r := l.MaxTotalBytes / RowCost; return minimum(r, rowBudget(l)) }
+func ownerLimit(p Principal, f FolderRecord, name string, max, n int64) error {
+	if e := limit(name, max, n); e != nil {
+		if p != f.Folder.Owner {
+			return ErrQuota
+		}
+		return e
+	}
+	return nil
+}
+func crossTenant(f FolderRecord) bool {
+	for key := range f.Grants {
+		var p Principal
+		_ = json.Unmarshal([]byte(key), &p)
+		if p.Tenant != f.Folder.Owner.Tenant {
+			return true
+		}
+	}
+	return false
+}
+func (s *Server) allocation(ctx context.Context, m *Metadata, p Principal, f FolderRecord) error {
+	nextAllocated := crossTenant(f)
+	if p != f.Folder.Owner && f.Allocated != nextAllocated {
+		return ErrDenied
+	}
+	if !nextAllocated {
+		f.Allocated = false
+		m.Folders[f.Folder.ID] = f
+		return nil
+	}
+	if f.Folder.Limits.MaxTotalBytes == 0 {
+		return ErrInvalid
+	}
+	if f.Allocated && p != f.Folder.Owner {
+		m.Folders[f.Folder.ID] = f
+		return nil
+	}
+	q, e := s.quota(ctx, f.Folder.Owner)
+	if e != nil {
+		return e
+	}
+	// Shared capacity is a public folder promise, independent of future private activity.
+	if q.MaxFileBytes > 0 && (f.Folder.Limits.MaxFileBytes == 0 || f.Folder.Limits.MaxFileBytes > q.MaxFileBytes) {
+		return ErrQuota
+	}
+	f.Allocated = true
+	m.Folders[f.Folder.ID] = f
+	bytes, rows := ownerUsage(m, f.Folder.Owner)
+	if e = ownerLimit(p, f, "owner bytes", q.MaxTotalBytes, bytes); e != nil {
+		return e
+	}
+	return ownerLimit(p, f, "owner rows", q.MaxFiles, rows)
 }
 func limit(name string, max, requested int64) error {
 	if max > 0 && requested > max {
@@ -95,12 +193,15 @@ func limit(name string, max, requested int64) error {
 }
 func (s *Server) folder(ctx context.Context, m *Metadata, p Principal, f FolderRecord) (Folder, error) {
 	v := f.Folder
-	q, e := s.quota(ctx, v.Owner)
-	if e != nil {
-		return v, e
+	if p == v.Owner && !f.Allocated {
+		q, e := s.quota(ctx, v.Owner)
+		if e != nil {
+			return v, e
+		}
+		v.Limits.MaxFileBytes = minimum(v.Limits.MaxFileBytes, q.MaxFileBytes)
+		v.Limits.MaxTotalBytes = minimum(v.Limits.MaxTotalBytes, q.MaxTotalBytes)
+		v.Limits.MaxFiles = minimum(v.Limits.MaxFiles, q.MaxFiles)
 	}
-	v.Limits.MaxFileBytes = minimum(v.Limits.MaxFileBytes, q.MaxFileBytes)
-	v.Limits.MaxTotalBytes = minimum(v.Limits.MaxTotalBytes, q.MaxTotalBytes)
 	v.Usage = usage(m, v.ID)
 	v.Role = f.Grants[principalKey(p)]
 	if v.Owner == p {
@@ -113,7 +214,7 @@ func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec)
 	if !p.valid() {
 		return f, ErrDenied
 	}
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, "", true, func(m *Metadata) error {
 		if spec.Name == "" || !utf8.ValidString(spec.Name) || !utf8.ValidString(spec.Description) || len(spec.Name) > 255 || len(spec.Description) > 4096 || len(spec.KeyCheck) != 32 || !validLimits(spec.Limits) {
 			return ErrInvalid
 		}
@@ -134,14 +235,14 @@ func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec)
 			return e
 		}
 		f = Folder{ID: randomID(), Owner: p, Name: spec.Name, Description: spec.Description, Limits: spec.Limits, KeyCheck: append([]byte(nil), spec.KeyCheck...)}
-		m.Folders[f.ID] = FolderRecord{f, map[string]Role{}}
+		m.Folders[f.ID] = FolderRecord{Folder: f, Grants: map[string]Role{}}
 		m.Files[f.ID] = map[string]Row{}
 		return nil
 	})
 	return f, e
 }
 func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Principal, role Role) error {
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
 			return e
@@ -149,16 +250,20 @@ func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Prin
 		if !grantee.valid() || (role != Reader && role != Writer && role != Owner) || grantee == f.Folder.Owner {
 			return ErrInvalid
 		}
+		if _, exists := f.Grants[principalKey(grantee)]; !exists && len(f.Grants) >= MaxGrants {
+			return ErrInvalid
+		}
 		f.Grants[principalKey(grantee)] = role
 		if role == Reader {
 			for tid, t := range m.Tickets {
 				if t.FolderID == id && t.Principal == grantee {
+					s.retireTicket(m, t)
 					delete(m.Tickets, tid)
 				}
 			}
 		}
 		m.Folders[id] = f
-		return nil
+		return s.allocation(ctx, m, p, f)
 	})
 	if e == nil {
 		s.notify()
@@ -166,7 +271,7 @@ func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Prin
 	return e
 }
 func (s *Server) Revoke(ctx context.Context, p Principal, id string, grantee Principal) error {
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
 			return e
@@ -178,10 +283,11 @@ func (s *Server) Revoke(ctx context.Context, p Principal, id string, grantee Pri
 		m.Folders[id] = f
 		for tid, t := range m.Tickets {
 			if t.FolderID == id && t.Principal == grantee {
+				s.retireTicket(m, t)
 				delete(m.Tickets, tid)
 			}
 		}
-		return nil
+		return s.allocation(ctx, m, p, f)
 	})
 	if e == nil {
 		s.notify()
@@ -189,17 +295,21 @@ func (s *Server) Revoke(ctx context.Context, p Principal, id string, grantee Pri
 	return e
 }
 func (s *Server) DeleteFolder(ctx context.Context, p Principal, id string) error {
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		if _, e := access(m, p, id, false, true); e != nil {
 			return e
 		}
-		delete(m.Folders, id)
+		for _, row := range m.Files[id] {
+			s.retireRow(m, row)
+		}
 		delete(m.Files, id)
 		for tid, t := range m.Tickets {
 			if t.FolderID == id {
+				s.retireTicket(m, t)
 				delete(m.Tickets, tid)
 			}
 		}
+		delete(m.Folders, id)
 		return nil
 	})
 	if e == nil {
@@ -208,7 +318,7 @@ func (s *Server) DeleteFolder(ctx context.Context, p Principal, id string) error
 	return e
 }
 func (s *Server) SetLimits(ctx context.Context, p Principal, id string, l Limits) error {
-	return s.Meta.Transaction(ctx, func(m *Metadata) error {
+	return s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
 			return e
@@ -216,9 +326,12 @@ func (s *Server) SetLimits(ctx context.Context, p Principal, id string, l Limits
 		if !validLimits(l) {
 			return ErrInvalid
 		}
+		if f.Allocated && p != f.Folder.Owner && l != f.Folder.Limits {
+			return ErrDenied
+		}
 		f.Folder.Limits = l
 		m.Folders[id] = f
-		return nil
+		return s.allocation(ctx, m, p, f)
 	})
 }
 func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error) {
@@ -226,7 +339,7 @@ func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error)
 	if !p.valid() {
 		return nil, ErrDenied
 	}
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, "", false, func(m *Metadata) error {
 		s.expire(m)
 		for id, f := range m.Folders {
 			if _, e := access(m, p, id, false, false); e == nil {
@@ -244,7 +357,7 @@ func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error)
 }
 func (s *Server) GetFolder(ctx context.Context, p Principal, id string) (Folder, error) {
 	var out Folder
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
 		f, e := access(m, p, id, false, false)
 		if e != nil {
 			return e
@@ -257,75 +370,116 @@ func (s *Server) GetFolder(ctx context.Context, p Principal, id string) (Folder,
 }
 func (s *Server) Reserve(ctx context.Context, p Principal, id string, r UploadRequest) (Ticket, error) {
 	var t Ticket
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	// Retire our own stale ticket in a separate durable transaction, then collect
+	// its object before reserving replacement capacity. Busy peers are left alone.
+	pre := s.transaction(ctx, p, id, true, func(m *Metadata) error {
+		if _, e := access(m, p, id, true, false); e != nil {
+			return e
+		}
+		s.expire(m)
+		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > MaxRequestBytes {
+			return ErrInvalid
+		}
+		if m.Files[id][r.PathID].Version != r.BaseVersion {
+			return &ConflictError{[]string{r.PathID}}
+		}
+		for tid, v := range m.Tickets {
+			if v.FolderID == id && v.PathID == r.PathID && v.Principal == p {
+				s.retireTicket(m, v)
+				delete(m.Tickets, tid)
+			}
+		}
+		return nil
+	})
+	if pre != nil {
+		return t, pre
+	}
+	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, true, false)
 		if e != nil {
 			return e
 		}
+		if crossTenant(f) && !f.Allocated {
+			return ErrQuota
+		}
 		s.expire(m)
-		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > math.MaxInt64/4 {
+		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > MaxRequestBytes || r.MetadataBytes < 0 || r.MetadataBytes > 16384 || len(r.Deletes) > 255 {
 			return ErrInvalid
 		}
 		old := m.Files[id][r.PathID]
 		if old.Version != r.BaseVersion {
-			return ErrConflict
+			return &ConflictError{[]string{r.PathID}}
 		}
-		for _, v := range m.Tickets {
+		for tid, v := range m.Tickets {
 			if v.FolderID == id && v.PathID == r.PathID {
-				return ErrConflict
-			}
-		}
-		q, e := s.quota(ctx, f.Folder.Owner)
-		if e != nil {
-			return e
-		}
-		maxFile := minimum(f.Folder.Limits.MaxFileBytes, q.MaxFileBytes)
-		if e = limit("file bytes", maxFile, r.SealedSize); e != nil {
-			return e
-		}
-		delta := r.SealedSize
-		files := int64(1)
-		if old.Version > 0 && !old.Deleted {
-			delta -= old.SealedSize
-			files = 0
-		}
-		if delta < 0 {
-			delta = 0
-		}
-		u := usage(m, id)
-		if u.Bytes > math.MaxInt64-u.Reserved-delta {
-			return ErrInvalid
-		}
-		if e = limit("folder bytes", f.Folder.Limits.MaxTotalBytes, u.Bytes+u.Reserved+delta); e != nil {
-			return e
-		}
-		if e = limit("folder files", f.Folder.Limits.MaxFiles, u.Files+u.ReservedFiles+files); e != nil {
-			return e
-		}
-		var ownerBytes int64
-		for fid, v := range m.Folders {
-			if v.Folder.Owner == f.Folder.Owner {
-				a := usage(m, fid)
-				if ownerBytes > math.MaxInt64-a.Bytes-a.Reserved {
-					return ErrInvalid
+				if v.Principal != p {
+					return ErrBusy
 				}
-				ownerBytes += a.Bytes + a.Reserved
+				s.retireTicket(m, v)
+				delete(m.Tickets, tid)
 			}
 		}
-		if ownerBytes > math.MaxInt64-delta {
-			return ErrInvalid
+		q := Quota{}
+		if !f.Allocated {
+			q, e = s.quota(ctx, f.Folder.Owner)
+			if e != nil {
+				return e
+			}
 		}
-		if e = limit("owner bytes", q.MaxTotalBytes, ownerBytes+delta); e != nil {
+		if e = limit("file bytes", f.Folder.Limits.MaxFileBytes, r.SealedSize); e != nil {
 			return e
+		}
+		if !f.Allocated {
+			if e = ownerLimit(p, f, "owner file bytes", q.MaxFileBytes, r.SealedSize); e != nil {
+				return e
+			}
+		}
+		delta := sat(r.SealedSize, sat(RowCost, r.MetadataBytes))
+		files := int64Bool(old.Version == 0 || old.Deleted)
+		rows := int64(1)
+		if old.Version > 0 {
+			delta -= rowBytes(old)
+			rows = 0
+		}
+		seen := map[string]bool{r.PathID: true}
+		for _, d := range r.Deletes {
+			o := m.Files[id][d.PathID]
+			if !validPathID(d.PathID) || seen[d.PathID] || !d.Deleted || d.TicketID != "" || len(d.Metadata) != 0 || o.Version == 0 || o.Deleted || o.Version != d.BaseVersion {
+				return ErrInvalid
+			}
+			seen[d.PathID] = true
+			delta -= rowBytes(o) - RowCost
+			files--
+		}
+		delta = max(delta, 0)
+		u := usage(m, id)
+		if e = limit("folder files", f.Folder.Limits.MaxFiles, sat(sat(u.Files, u.ReservedFiles), max(files, 0))); e != nil {
+			return e
+		}
+		if e = limit("folder bytes", f.Folder.Limits.MaxTotalBytes, sat(sat(u.Bytes, u.Reserved), delta)); e != nil {
+			return e
+		}
+		if e = limit("folder rows", rowBudget(f.Folder.Limits), sat(sat(sat(u.Rows, u.GarbageRows), u.ReservedRows), rows)); e != nil {
+			return e
+		}
+		if !f.Allocated {
+			bytes, nrows := ownerUsage(m, f.Folder.Owner)
+			if e = ownerLimit(p, f, "owner bytes", q.MaxTotalBytes, sat(bytes, delta)); e != nil {
+				return e
+			}
+			if e = ownerLimit(p, f, "owner rows", q.MaxFiles, sat(nrows, rows)); e != nil {
+				return e
+			}
 		}
 		ttl := s.ReservationTTL
 		if ttl <= 0 {
 			ttl = 5 * time.Minute
 		}
-		t = Ticket{ID: randomID(), FolderID: id, BlobID: randomID(), PathID: r.PathID, Principal: p, BaseVersion: r.BaseVersion, SealedSize: r.SealedSize, ReservedBytes: delta, ReservedFiles: files, Expires: s.now().Add(ttl)}
+		t = Ticket{ID: randomID(), FolderID: id, BlobID: randomID(), PathID: r.PathID, Principal: p, BaseVersion: r.BaseVersion, SealedSize: r.SealedSize, ReservedBytes: delta, ReservedFiles: max(files, 0), ReservedRows: rows, Expires: s.now().Add(ttl), Deletes: r.Deletes}
 		m.Tickets[t.ID] = t
 		return nil
 	})
+
 	return t, e
 }
 func (s *Server) ticket(ctx context.Context, p Principal, id, tid string) (Ticket, error) {
@@ -333,13 +487,16 @@ func (s *Server) ticket(ctx context.Context, p Principal, id, tid string) (Ticke
 		return reader.authorize(ctx, p, id, true, tid, "", s.now())
 	}
 	var t Ticket
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
 		}
 		v, ok := m.Tickets[tid]
-		if !ok || v.FolderID != id || v.Principal != p || !v.Expires.After(s.now()) {
+		if !ok || v.FolderID != id || v.Principal != p {
 			return ErrDenied
+		}
+		if !v.Expires.After(s.now()) {
+			return ErrExpired
 		}
 		t = v
 		return nil
@@ -354,7 +511,28 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 	if t.Uploaded {
 		return ErrInvalid
 	}
-	guard := &checkedReader{r: r, check: func() error { _, e := s.ticket(ctx, p, id, t.ID); return e }}
+	e = s.transaction(ctx, p, id, false, func(m *Metadata) error {
+		if _, e := access(m, p, id, true, false); e != nil {
+			return e
+		}
+		v, ok := m.Tickets[t.ID]
+		if !ok || v.Principal != p || v.FolderID != id {
+			return ErrDenied
+		}
+		if !v.Expires.After(s.now()) {
+			return ErrExpired
+		}
+		if v.Writing || v.Uploaded {
+			return ErrBusy
+		}
+		v.Writing = true
+		m.Tickets[t.ID] = v
+		return nil
+	})
+	if e != nil {
+		return e
+	}
+	guard := &renewingReader{r: r, renew: func() error { return s.renew(ctx, p, id, t.ID) }}
 	n, e := s.Blobs.Put(ctx, id, t.BlobID, io.LimitReader(guard, t.SealedSize+1))
 	if e != nil {
 		_ = s.CancelUpload(ctx, p, id, t.ID)
@@ -365,15 +543,19 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 		_ = s.CancelUpload(ctx, p, id, t.ID)
 		return ErrInvalid
 	}
-	e = s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e = s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
 		}
 		v, ok := m.Tickets[t.ID]
-		if !ok || v.FolderID != id || v.Principal != p || !v.Expires.After(s.now()) {
+		if !ok || v.FolderID != id || v.Principal != p {
 			return ErrDenied
 		}
+		if !v.Expires.After(s.now()) {
+			return ErrExpired
+		}
 		v.Uploaded = true
+		v.Writing = false
 		m.Tickets[t.ID] = v
 		return nil
 	})
@@ -383,7 +565,7 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 	return e
 }
 func (s *Server) CancelUpload(ctx context.Context, p Principal, id, tid string) error {
-	return s.Meta.Transaction(ctx, func(m *Metadata) error {
+	return s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
 		}
@@ -391,97 +573,133 @@ func (s *Server) CancelUpload(ctx context.Context, p Principal, id, tid string) 
 		if !ok || t.Principal != p || t.FolderID != id {
 			return ErrDenied
 		}
+		s.retireTicket(m, t)
 		delete(m.Tickets, tid)
 		return nil
 	})
 }
 func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutation) (Delta, error) {
 	var out Delta
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	if e := s.cleanupAuthorized(ctx, p, id, mut); e != nil {
+		return out, e
+	}
+	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, true, false)
 		if e != nil {
 			return e
+		}
+		if crossTenant(f) && !f.Allocated {
+			return ErrQuota
 		}
 		s.expire(m)
 		if len(mut) == 0 || len(mut) > 256 {
 			return ErrInvalid
 		}
-		seen := map[string]bool{}
-		q, e := s.quota(ctx, f.Folder.Owner)
-		if e != nil {
-			return e
+		seen := map[string]Mutation{}
+		var conflicts []string
+		for _, v := range mut {
+			if !validPathID(v.PathID) || len(v.Metadata) > 16384 {
+				return ErrInvalid
+			}
+			if _, ok := seen[v.PathID]; ok {
+				return ErrInvalid
+			}
+			seen[v.PathID] = v
+			if m.Files[id][v.PathID].Version != v.BaseVersion {
+				conflicts = append(conflicts, v.PathID)
+			}
 		}
-		// Revalidate limits as plans may have been lowered since the reservation. Deletes remain legal.
+		if len(conflicts) > 0 {
+			return &ConflictError{conflicts}
+		}
+		q := Quota{}
+		if !f.Allocated {
+			q, e = s.quota(ctx, f.Folder.Owner)
+			if e != nil {
+				return e
+			}
+		}
+		var retired []Row
 		writes := false
-		for _, v := range mut {
-			if !v.Deleted {
-				writes = true
-			}
-		}
-		if writes {
-			u := usage(m, id)
-			if e = limit("folder bytes", f.Folder.Limits.MaxTotalBytes, u.Bytes+u.Reserved); e != nil {
-				return e
-			}
-			if e = limit("folder files", f.Folder.Limits.MaxFiles, u.Files+u.ReservedFiles); e != nil {
-				return e
-			}
-			var n int64
-			for fid, v := range m.Folders {
-				if v.Folder.Owner == f.Folder.Owner {
-					u := usage(m, fid)
-					n += u.Bytes + u.Reserved
-				}
-			}
-			if e = limit("owner bytes", q.MaxTotalBytes, n); e != nil {
-				return e
-			}
-		}
-		for _, v := range mut {
-			if !validPathID(v.PathID) || seen[v.PathID] || len(v.Metadata) > 16384 {
-				return ErrInvalid
-			}
-			seen[v.PathID] = true
-			old := m.Files[id][v.PathID]
-			if old.Version != v.BaseVersion {
-				return ErrConflict
-			}
-			if v.Deleted {
-				if v.TicketID != "" || len(v.Metadata) != 0 {
-					return ErrInvalid
-				}
-				continue
-			}
-			t, ok := m.Tickets[v.TicketID]
-			if !ok || t.FolderID != id || t.PathID != v.PathID || t.Principal != p || t.BaseVersion != v.BaseVersion || !t.Uploaded || !t.Expires.After(s.now()) {
-				return ErrDenied
-			}
-			if len(v.Metadata) < 28 {
-				return ErrInvalid
-			}
-			n, e := s.Blobs.Size(ctx, id, t.BlobID)
-			if e != nil || n != t.SealedSize {
-				return ErrInvalid
-			}
-			if e = limit("file bytes", minimum(f.Folder.Limits.MaxFileBytes, q.MaxFileBytes), n); e != nil {
-				return e
-			}
-		}
+		growth := false
 		if f.Folder.Version == math.MaxUint64 {
 			return ErrInvalid
 		}
 		f.Folder.Version++
 		for _, v := range mut {
+			old := m.Files[id][v.PathID]
 			row := Row{FolderID: id, PathID: v.PathID, Version: f.Folder.Version, Deleted: v.Deleted}
-			if !v.Deleted {
-				t := m.Tickets[v.TicketID]
+			if v.Deleted {
+				if v.TicketID != "" || len(v.Metadata) != 0 {
+					return ErrInvalid
+				}
+				if old.Version == 0 {
+					growth = true
+				}
+			} else {
+				writes = true
+				t, ok := m.Tickets[v.TicketID]
+				if !ok || t.FolderID != id || t.PathID != v.PathID || t.Principal != p || t.BaseVersion != v.BaseVersion || !t.Uploaded {
+					return ErrDenied
+				}
+				if !t.Expires.After(s.now()) {
+					return ErrExpired
+				}
+				if len(v.Metadata) < 28 {
+					return ErrInvalid
+				}
+				for _, d := range t.Deletes {
+					actual, ok := seen[d.PathID]
+					if !ok || !actual.Deleted || actual.BaseVersion != d.BaseVersion {
+						return ErrInvalid
+					}
+				}
+				n, se := bounded(ctx, func(c context.Context) (int64, error) { return s.Blobs.Size(c, id, t.BlobID) })
+				if se != nil || n != t.SealedSize {
+					return ErrInvalid
+				}
+				if e = limit("file bytes", f.Folder.Limits.MaxFileBytes, n); e != nil {
+					return e
+				}
+				if !f.Allocated {
+					if e = ownerLimit(p, f, "owner file bytes", q.MaxFileBytes, n); e != nil {
+						return e
+					}
+				}
 				row.BlobID = t.BlobID
-				row.SealedSize = t.SealedSize
+				row.SealedSize = n
 				row.Metadata = append([]byte(nil), v.Metadata...)
 				delete(m.Tickets, t.ID)
 			}
+			if old.BlobID != "" {
+				retired = append(retired, old)
+			}
 			m.Files[id][v.PathID] = row
 			out.Rows = append(out.Rows, row)
+		}
+		if writes || growth {
+			u := usage(m, id)
+			if e = limit("folder files", f.Folder.Limits.MaxFiles, sat(u.Files, u.ReservedFiles)); e != nil {
+				return e
+			}
+			if e = limit("folder bytes", f.Folder.Limits.MaxTotalBytes, sat(u.Bytes, u.Reserved)); e != nil {
+				return e
+			}
+			if e = limit("folder rows", rowBudget(f.Folder.Limits), sat(sat(u.Rows, u.GarbageRows), u.ReservedRows)); e != nil {
+				return e
+			}
+			if !f.Allocated {
+				bytes, rows := ownerUsage(m, f.Folder.Owner)
+				if e = ownerLimit(p, f, "owner bytes", q.MaxTotalBytes, bytes); e != nil {
+					return e
+				}
+				if e = ownerLimit(p, f, "owner rows", q.MaxFiles, rows); e != nil {
+					return e
+				}
+			}
+		}
+		for _, row := range retired {
+			s.retireRow(m, row)
 		}
 		m.Folders[id] = f
 		out.Version = f.Folder.Version
@@ -494,7 +712,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 }
 func (s *Server) Changes(ctx context.Context, p Principal, id string, after uint64) (Delta, error) {
 	var out Delta
-	e := s.Meta.Transaction(ctx, func(m *Metadata) error {
+	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
 		f, e := access(m, p, id, false, false)
 		if e != nil {
 			return e
@@ -524,7 +742,7 @@ func (s *Server) blobAccess(ctx context.Context, p Principal, id, blob string) e
 		_, e := reader.authorize(ctx, p, id, false, "", blob, s.now())
 		return e
 	}
-	return s.Meta.Transaction(ctx, func(m *Metadata) error {
+	return s.transaction(ctx, p, id, false, func(m *Metadata) error {
 		if _, e := access(m, p, id, false, false); e != nil {
 			return e
 		}
@@ -670,4 +888,23 @@ func (c *InProcessClient) Download(x context.Context, id, blob string) (io.ReadC
 }
 func (c *InProcessClient) Wait(x context.Context, id string, v uint64) (uint64, error) {
 	return c.Server.Wait(x, c.Principal, id, v)
+}
+
+func rowBudget(l Limits) int64 {
+	if l.MaxRows > 0 {
+		return l.MaxRows
+	}
+	if l.MaxFiles > 0 {
+		if l.MaxFiles >= 62_500 {
+			return 1_000_000
+		}
+		return l.MaxFiles * 16
+	}
+	return 1_000_000
+}
+func int64Bool(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
