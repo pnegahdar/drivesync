@@ -90,7 +90,7 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		`CREATE INDEX IF NOT EXISTS folders_owner ON folders(owner)`,
 		`CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`,
 		`CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, writing INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner,json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`,
 		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder,id)`,
@@ -105,11 +105,21 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 			return nil, e
 		}
 	}
-	// Databases created before size was a column still open. Fresh databases
-	// already have it, so the duplicate-column error is expected.
+	// Databases created before these columns still open. Fresh databases already
+	// have them, so the duplicate-column error is expected. Writing is backfilled
+	// only when the column is new; afterwards the column is authoritative.
 	if _, e = db.Exec(`ALTER TABLE garbage ADD COLUMN size INTEGER NOT NULL DEFAULT 0`); e != nil && !strings.Contains(strings.ToLower(e.Error()), "duplicate column") {
 		db.Close()
 		return nil, e
+	}
+	if _, e = db.Exec(`ALTER TABLE garbage ADD COLUMN writing INTEGER NOT NULL DEFAULT 0`); e != nil && !strings.Contains(strings.ToLower(e.Error()), "duplicate column") {
+		db.Close()
+		return nil, e
+	} else if e == nil {
+		if _, e = db.Exec(`UPDATE garbage SET writing=1 WHERE json_extract(data,'$.Writing')=1`); e != nil {
+			db.Close()
+			return nil, e
+		}
 	}
 	hubName := name
 	var seq int
@@ -489,9 +499,9 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		}
 		width := 3
 		if table == "garbage" {
-			prefix = "INSERT INTO garbage(id,folder,size,data) VALUES "
-			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder,size=excluded.size"
-			width = 4
+			prefix = "INSERT INTO garbage(id,folder,size,writing,data) VALUES "
+			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder,size=excluded.size,writing=excluded.writing"
+			width = 5
 		}
 		updated, created := []any{}, []any{}
 		for id, b := range next[table] {
@@ -507,7 +517,11 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			case "tickets":
 				args = []any{id, m.Tickets[id].FolderID, b}
 			case "garbage":
-				args = []any{id, m.Garbage[id].FolderID, m.Garbage[id].Size, b}
+				writing := 0
+				if m.Garbage[id].Writing {
+					writing = 1
+				}
+				args = []any{id, m.Garbage[id].FolderID, m.Garbage[id].Size, writing, b}
 			}
 			if table == "folders" && old[table][id] == nil {
 				created = append(created, args...)

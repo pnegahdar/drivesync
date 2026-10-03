@@ -179,36 +179,18 @@ func (s *Server) surveyCollectSQL(ctx context.Context, db *SQLiteMetaStore) (map
 		return nil, nil, nil, e
 	}
 	rows.Close()
-	pending := map[string]Garbage{}
-	rows, e = db.reads.QueryContext(ctx, "SELECT id, data FROM garbage")
-	if e != nil {
-		return nil, nil, nil, e
-	}
-	for rows.Next() {
-		var key string
-		var data []byte
-		var g Garbage
-		if e = rows.Scan(&key, &data); e == nil {
-			e = json.Unmarshal(data, &g)
-		}
-		if e != nil {
-			rows.Close()
-			return nil, nil, nil, e
-		}
-		if !g.Writing || !s.wakes.live(key) {
-			pending[key] = g
-		}
-	}
-	e = rows.Err()
-	rows.Close()
-	return pending, expired, deleted, e
+	// Garbage is paged by primary key during deletion. Unmarshalling the whole
+	// backlog here used up the collect budget before a row was removed.
+	return map[string]Garbage{}, expired, deleted, nil
 }
 
 const maintenanceBatch = 128
 
 // Each garbage batch is its own transaction: the writer is released between
 // batches, and the delete is one statement rather than one round trip per blob.
+// SQLite pages a larger batch so a backlog costs few commits on a slow disk.
 const garbageBatch = 64
+const garbagePage = 512
 
 func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbage []string) context.Context {
 	return context.WithValue(ctx, scopeKey{}, Scope{Folder: folder, Paths: paths, Tickets: tickets, Garbage: garbage})
@@ -291,57 +273,13 @@ func (s *Server) collect(ctx context.Context) error {
 			}
 		}
 	}
-	groups := map[string][]Garbage{}
-	for _, g := range pending {
-		groups[g.FolderID] = append(groups[g.FolderID], g)
-	}
 	var errs []error
-	for folder, garbage := range groups {
-		for len(garbage) > 0 {
-			if e := ctx.Err(); e != nil {
-				return errors.Join(append(errs, e)...)
-			}
-			batch := garbage[:min(len(garbage), garbageBatch)]
-			garbage = garbage[len(batch):]
-			collected := map[string]bool{}
-			ids := []string{}
-			// Blob deletion stays outside the metadata writer. The collect
-			// budget bounds the pass; the writer lock is taken only below.
-			for _, g := range batch {
-				if e := ctx.Err(); e != nil {
-					errs = append(errs, e)
-					break
-				}
-				key := folder + "/" + g.BlobID
-				if s.wakes.live(key) {
-					continue
-				}
-				if de := s.Blobs.Delete(ctx, folder, g.BlobID); de != nil && !errors.Is(de, os.ErrNotExist) {
-					errs = append(errs, de)
-					continue
-				}
-				collected[key] = true
-				ids = append(ids, key)
-			}
-			if len(ids) == 0 {
-				continue
-			}
-			if db, ok := s.Meta.(*SQLiteMetaStore); ok {
-				e = db.deleteGarbageBatch(ctx, folder, ids, s.wakes.live)
-			} else {
-				e = s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, ids), func(m *Metadata) error {
-					for key := range collected {
-						if !s.wakes.live(key) {
-							delete(m.Garbage, key)
-						}
-					}
-					return nil
-				})
-			}
-			if e != nil {
-				return errors.Join(append(errs, e)...)
-			}
+	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+		if e = s.collectGarbagePages(ctx, db, &errs); e != nil {
+			return e
 		}
+	} else if e = s.collectLoadedGarbage(ctx, pending, &errs); e != nil {
+		return e
 	}
 	// Tombstones retain their existing blob charge until physical deletion.
 	rows, e := s.maintenanceRows(ctx, "", true, 0)
@@ -404,6 +342,126 @@ func (s *Server) collect(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// collectGarbagePages walks the garbage primary key. Each page deletes blobs
+// outside the writer, then one transaction drops those rows and their usage.
+func (s *Server) collectGarbagePages(ctx context.Context, db *SQLiteMetaStore, errs *[]error) error {
+	var after string
+	for {
+		if e := ctx.Err(); e != nil {
+			return errors.Join(append(*errs, e)...)
+		}
+		rows, e := db.reads.QueryContext(ctx, `SELECT id, folder, writing FROM garbage WHERE id>? ORDER BY id LIMIT ?`, after, garbagePage)
+		if e != nil {
+			return errors.Join(append(*errs, e)...)
+		}
+		type item struct {
+			id, folder string
+			writing    int64
+		}
+		page := make([]item, 0, garbagePage)
+		for rows.Next() {
+			var it item
+			if e = rows.Scan(&it.id, &it.folder, &it.writing); e != nil {
+				rows.Close()
+				return errors.Join(append(*errs, e)...)
+			}
+			page = append(page, it)
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return errors.Join(append(*errs, e)...)
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		after = page[len(page)-1].id
+		byFolder := map[string][]string{}
+		var stopped error
+		for _, it := range page {
+			if e = ctx.Err(); e != nil {
+				*errs = append(*errs, e)
+				stopped = e
+				break
+			}
+			if it.writing != 0 && s.wakes.live(it.id) {
+				continue
+			}
+			blob := ""
+			if len(it.id) == 65 && it.id[32] == '/' && it.id[:32] == it.folder {
+				blob = it.id[33:]
+			}
+			// A row stays charged until its blob delete succeeds. Missing blobs are success.
+			if !validID(it.folder) || !validID(blob) {
+				*errs = append(*errs, ErrInvalid)
+				continue
+			}
+			if de := s.Blobs.Delete(ctx, it.folder, blob); de != nil && !errors.Is(de, os.ErrNotExist) {
+				*errs = append(*errs, de)
+				continue
+			}
+			byFolder[it.folder] = append(byFolder[it.folder], it.id)
+		}
+		for folder, ids := range byFolder {
+			if e = db.deleteGarbageBatch(ctx, folder, ids, s.wakes.live); e != nil {
+				return errors.Join(append(*errs, e)...)
+			}
+		}
+		if stopped != nil {
+			return errors.Join(*errs...)
+		}
+	}
+}
+
+func (s *Server) collectLoadedGarbage(ctx context.Context, pending map[string]Garbage, errs *[]error) error {
+	groups := map[string][]Garbage{}
+	for _, g := range pending {
+		groups[g.FolderID] = append(groups[g.FolderID], g)
+	}
+	for folder, garbage := range groups {
+		for len(garbage) > 0 {
+			if e := ctx.Err(); e != nil {
+				return errors.Join(append(*errs, e)...)
+			}
+			batch := garbage[:min(len(garbage), garbageBatch)]
+			garbage = garbage[len(batch):]
+			collected := map[string]bool{}
+			ids := []string{}
+			for _, g := range batch {
+				if e := ctx.Err(); e != nil {
+					*errs = append(*errs, e)
+					break
+				}
+				key := folder + "/" + g.BlobID
+				if s.wakes.live(key) {
+					continue
+				}
+				if de := s.Blobs.Delete(ctx, folder, g.BlobID); de != nil && !errors.Is(de, os.ErrNotExist) {
+					*errs = append(*errs, de)
+					continue
+				}
+				collected[key] = true
+				ids = append(ids, key)
+			}
+			if len(ids) == 0 {
+				continue
+			}
+			e := s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, ids), func(m *Metadata) error {
+				for key := range collected {
+					if !s.wakes.live(key) {
+						delete(m.Garbage, key)
+					}
+				}
+				return nil
+			})
+			if e != nil {
+				return errors.Join(append(*errs, e)...)
+			}
+		}
+	}
+	return nil
 }
 
 // Selection stays on WAL readers; no unrelated rows enter a write transaction.
