@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/zeebo/blake3"
 	"io"
@@ -42,7 +43,7 @@ func TestCryptoIntegrity(t *testing.T) {
 			if name == "truncated" {
 				expected = io.ErrUnexpectedEOF
 			}
-			if e := OpenContent(&bytes.Buffer{}, bytes.NewReader(blob), k, f, b, pid); e != expected {
+			if e := OpenContent(&bytes.Buffer{}, bytes.NewReader(blob), k, f, b, pid); !errors.Is(e, expected) {
 				t.Fatal(e)
 			}
 		})
@@ -55,7 +56,7 @@ func TestCryptoIntegrity(t *testing.T) {
 			t.Fatal(e)
 		}
 	}
-	if CheckKey(NewFolderKey(), KeyCheck(k)) != ErrKey {
+	if CheckKey(NewFolderKey(), KeyCheck(k, randomID())) != ErrKey {
 		t.Fatal("key check")
 	}
 	m := FileMetadata{Path: "file", BlobID: b, Size: int64(len(data)), Mode: 0600, Hash: hashBytes(data)}

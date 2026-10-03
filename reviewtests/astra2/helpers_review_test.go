@@ -34,7 +34,7 @@ func setup(t *testing.T) (*ds.Server, ds.Client) {
 }
 func folder(t *testing.T, c ds.Client, name string, k ds.FolderKey) ds.Folder {
 	t.Helper()
-	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, KeyCheck: ds.KeyCheck(k)})
+	f, e := ds.CreateFolder(ctx, c, ds.FolderSpec{Name: name}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -141,6 +141,9 @@ func readFiles(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	e := filepath.WalkDir(dir, func(p string, d os.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil {
 			return e
 		}

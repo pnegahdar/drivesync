@@ -15,6 +15,9 @@ import (
 
 func diskBytes(dir string) (total int64) {
 	filepath.WalkDir(dir, func(p string, d fs.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e == nil && !d.IsDir() {
 			i, _ := d.Info()
 			total += i.Size()

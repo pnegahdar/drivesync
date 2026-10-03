@@ -245,7 +245,7 @@ func TestReviewNULPrincipalsStayScoped(t *testing.T) {
 	if e != nil || len(fs) != 1 || fs[0].ID != f.ID {
 		t.Fatal("opaque principal scope mismatch", fs, e)
 	}
-	if _, e = c.CreateFolder(ctx, ds.FolderSpec{Name: "second", KeyCheck: ds.KeyCheck(k)}); e == nil {
+	if _, e = ds.CreateFolder(ctx, c, ds.FolderSpec{Name: "second"}, k); e == nil {
 		t.Fatal("NUL identity bypassed folder quota")
 	}
 }
@@ -353,7 +353,9 @@ func TestReviewRawJSONVariants(t *testing.T) {
 	for _, v := range cases {
 		body := fmt.Sprintf(`{"Op":"grant","Folder":%q,"Grantee":{"Tenant":"outside","Subject":"%s"},"Role":"reader"}`, f.ID, v.subject)
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("POST", "/rpc", strings.NewReader(body)))
+		req := httptest.NewRequest("POST", "/rpc", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		h.ServeHTTP(w, req)
 		if (w.Code == 200) != v.valid {
 			t.Errorf("subject %q valid=%v code=%d", v.subject, v.valid, w.Code)
 		}

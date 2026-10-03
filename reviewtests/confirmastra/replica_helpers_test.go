@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
@@ -18,7 +19,7 @@ func attach(t testing.TB, c ds.Client, f ds.Folder, k ds.FolderKey, name string)
 	t.Helper()
 	base := t.TempDir()
 	dir := filepath.Join(base, "files")
-	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{Name: name, StateDir: filepath.Join(base, "state"), Manual: true})
+	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{Name: name, StateDir: filepath.Join(base, "state"), Manual: true, RetryInterval: time.Nanosecond})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -36,6 +37,9 @@ func write(t testing.TB, r rep, p, content string) {
 func files(t testing.TB, r rep) map[string]string {
 	out := map[string]string{}
 	filepath.WalkDir(r.dir, func(p string, d fs.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil || d.IsDir() {
 			return nil
 		}

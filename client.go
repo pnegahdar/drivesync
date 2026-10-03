@@ -11,6 +11,7 @@ import (
 // Its replication and encryption protocol is private to the library.
 type Client struct{ client engine.Client }
 
+// NewHTTPClient connects to an authority. Use HTTPS outside local tests.
 func NewHTTPClient(url string, headers http.Header) *Client {
 	return &Client{client: engine.NewHTTPClient(url, headers)}
 }
@@ -18,7 +19,10 @@ func NewHTTPClient(url string, headers http.Header) *Client {
 // CreateFolder computes the key check locally; the key is never sent to the
 // authority. Keep it securely and supply the same key to every attachment.
 func (c *Client) CreateFolder(ctx context.Context, spec FolderSpec, key FolderKey) (Folder, error) {
-	f, e := c.client.CreateFolder(ctx, engine.FolderSpec{Name: spec.Name, Description: spec.Description, Limits: engine.Limits(spec.Limits), KeyCheck: engine.KeyCheck(engine.FolderKey(key))})
+	if key == (FolderKey{}) {
+		return Folder{}, ErrKey
+	}
+	f, e := engine.CreateFolder(ctx, c.client, engine.FolderSpec{Name: spec.Name, Description: spec.Description, Limits: engine.Limits(spec.Limits)}, engine.FolderKey(key))
 	out := publicFolder(f)
 	if e == nil {
 		out.Role = Owner

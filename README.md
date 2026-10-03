@@ -41,17 +41,36 @@ The example combines authority/client setup for brevity; usually they run on
 different nodes. `auth` authenticates each HTTP request and returns an opaque
 `Principal{Tenant, Subject}`. `plans` implements `QuotaPolicy`. Preserve the key
 securely and distribute it to each attachment; creation computes its check
-locally, and the key never goes to the authority. Folder IDs are random 128-bit IDs.
+locally, with a random salt bound to the authority-issued folder ID; the key
+never goes to the authority. Folder IDs are random 128-bit IDs.
 Names are unique per primary owner. `Grant`, `Revoke`, `SetLimits`, `ListFolders`,
 `GetFolder` and `DeleteFolder` are the folder management API.
 
 `Folder` contains ID, name, description, owner, role, configured limits and usage
 (bytes, live entries and reserved bytes). `Replica.Sync(ctx)` forces one sync;
-`Status()` reports actionable local state; `Close()` stops the replica.
-`Options.StateDir` must be outside the attachment. Default automatic sync uses
+`Status()` reports actionable local state; `Close()` stops the replica. The
+context passed to `Attach` bounds setup only; the replica lives until `Close`.
+`Retry()` retries rejected/quarantined transfers and acknowledges an intentional
+mass removal for the next sync. Root identity failures cannot be overridden.
+
+Default state lives under `os.UserCacheDir()/drivesync/<folder>/<root-hash>`,
+with private permissions. Explicit `Options.StateDir` must be dedicated to this
+attachment, outside every attachment; a nonempty directory without its matching
+state marker is refused. State contains plaintext paths: protect it and exclude
+it from other sharing systems. `.drivesync*` control files are reserved and ignored.
+Nested and overlapping attachments are refused, including closed attachments
+whose root markers remain. Default automatic sync uses
 native FSEvents through purego on macOS, inotify on Linux, a 150 ms debounce and
 periodic rescans. Existing files matching authenticated remote hashes are adopted
-without conflict copies. Symlinks and unreadable files appear in status errors.
+without conflict copies. Symlinks, unsupported entries and unreadable files
+appear in status errors and protect their subtrees from deletion detection.
+
+The root contains a random `.drivesync-root` marker; saved state also binds its
+device/inode. Missing or replaced roots pause sync, preventing an unmounted disk
+from deleting peer files. Do not remove or copy this marker to relocate a replica;
+attach a new directory with new dedicated state. If at least five tracked entries
+exist and 80% disappear without matching moves, deletes pause with a status error.
+Inspect the disk before calling `Retry()` to acknowledge a deliberate removal.
 
 ## Authority and extension points
 
@@ -59,7 +78,9 @@ without conflict copies. Symlinks and unreadable files appear in status errors.
 closed by the embedder. Its transactions, accounting and replication records
 are internal. `BlobStore` and `QuotaPolicy` remain pluggable. Blob stores stream
 immutable sealed objects under authority-generated IDs, report actual sizes,
-open streams and delete objects. Memory and durable local-directory backends
+open streams and delete objects. `Put` must stage until clean EOF and never publish
+when its reader errors; oversize streams are terminated before publication.
+Memory and durable local-directory backends
 are included; an embedder can implement S3/R2 without an AWS SDK dependency.
 
 `ServerOptions` holds quota policy, clock, reservation/tombstone TTLs and maintenance
@@ -72,7 +93,11 @@ returned errors; cancel and join it before closing stores.
 **Use one authority process per metadata/blob store.** Recovery cannot prove that
 another process has stopped publishing. Same-process authorities coordinate
 publication and notifications. Startup recovery excludes active publications;
-failed cleanup remains durable and charged. Reads and authorization use separate
+failed cleanup remains durable and charged. Expiry and invalidated tickets are
+retired by background maintenance; they retain their charge until then. Folder
+deletion revokes access in a small transaction, then retires rows in bounded
+background batches. Compaction selects on readers and writes bounded path batches;
+GC updates only the cleanup records it touches. Reads and authorization use separate
 read-only WAL connections. Writes select touched file rows and cached usage;
 accounting is linear. External pricing/size hooks honor cancellation and are
 bounded to two seconds inside a five-second write transaction. Replicas currently
@@ -86,7 +111,17 @@ UTF-8 tenant/subject pairs, each component at most 256 bytes. Malformed raw JSON
 cannot alias identities. Grants are capped at 256 per folder; the immutable
 primary owner remains the quota account. Revocation and deletion invalidate
 subscriptions and upload tickets immediately, including streaming access checks.
+An actual grant change invalidates all outstanding tickets in that folder, so
+other writers may need to retry; unchanged grants do not invalidate tickets.
 Delivered/cached bytes cannot be revoked, and revocation does not rotate the key.
+`Server.Client(p)` trusts the supplied principal: use it only after authenticating
+inside the embedding app. Use HTTPS for HTTP clients. `/rpc` requires
+`Content-Type: application/json`; HTML form requests are refused.
+
+Use random keys only, generated by `NewFolderKey`. `ParseFolderKey` imports their
+64-character hex encoding and rejects malformed and zero keys. Creation and
+attachment reject zero keys too. Passphrases or their hashes are unsuitable:
+salted key checks and encrypted files still permit offline candidate verification.
 
 File paths, contents and metadata use separated keys and authenticated encryption.
 The authority sees control-plane labels, sizes, counts and relationships.
@@ -94,8 +129,10 @@ Untrusted peer paths are validated and confined with `os.Root`; symlink parents
 are refused. Case collisions receive unique local aliases. Downloads authenticate
 staging files before fsync and rename. Losing writes survive as conflict files.
 Renames commit their create/delete pairs atomically; if full, they remain local
-and pending. Ignored-only directory contents are removed during remote deletes;
-tracked children keep the delete pending. `.drivesyncignore` accepts globs,
+and pending. Remote directory deletes preserve user-ignored contents, including
+`.git`; the directory becomes untracked when no tracked children remain. Only
+known junk (`.DS_Store`, `Thumbs.db`) is automatically removed. Tracked children
+keep the delete pending. `.drivesyncignore` accepts globs,
 comments and directory patterns, with case-folded NFC matching. Defaults exclude
 Finder/editor temporary files and staging files. Unignored rows are fetched later.
 
@@ -116,7 +153,12 @@ below current bytes/rows (including reservations/garbage) are refused. Revocatio
 downgrades, reductions and existing-row deletes never consult pricing. Folder
 reads return stored limits. Non-primary principals receive generic owner-quota
 errors. Rejected files remain local with a reason and retry backoff. Corrupt rows
-are quarantined; transient transfers retry independently.
+are quarantined by decrypted path when available; transient transfers and local
+obstacles retry independently. A short network stream retries; a truncated stored
+blob whose advertised bytes were all received is quarantined. Local edits can
+replace quarantined versions. Permission-only changes also sync. Status errors
+clear after a successful sync. Up to 256 waits per principal keep folder push
+updates active; excess waits return `ErrWaitLimit` and back off.
 
 A malicious authority can delete or roll back files; encryption cannot prevent
 this. Historical recovery, snapshots, key rotation, chunk deduplication and
@@ -130,7 +172,7 @@ go run ./cmd/drivesync serve -data ./drivesync-data
 # In another terminal, using the same token:
 go run ./cmd/drivesync create -name shared
 # Store the printed hex key in a private file, then use the printed folder ID:
-go run ./cmd/drivesync attach -folder ID -key-file ./folder.key -dir ./shared
+go run ./cmd/drivesync attach -folder ID -key-file ./folder.key -dir ./shared -state ./replica-state
 # Or provide the key through DRIVESYNC_KEY; never put it in argv.
 go run ./cmd/drivesync status -state ./replica-state
 ```
@@ -138,4 +180,5 @@ go run ./cmd/drivesync status -state ./replica-state
 The CLI's bearer authenticator represents one principal for local testing;
 production applications supply their own hook. See [AGENTS.md](AGENTS.md) for
 required checks, [API_SURFACE.md](API_SURFACE.md) for before/after documentation,
-and [SECURITY_FIXES.md](SECURITY_FIXES.md) for adversarial regression history.
+and [SECURITY_FIXES.md](SECURITY_FIXES.md) / [QA_FIXES.md](QA_FIXES.md) for
+adversarial regression history and the latest repairs.

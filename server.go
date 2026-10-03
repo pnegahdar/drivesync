@@ -58,6 +58,8 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 		return internalPrincipal(p), e
 	})
 }
+
+// Client trusts p, which the embedding app must authenticate before calling.
 func (s *Server) Client(p Principal) *Client {
 	return &Client{client: s.server.Client(internalPrincipal(p))}
 }

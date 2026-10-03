@@ -2,12 +2,17 @@ package engine
 
 import (
 	"path"
+	"strings"
 )
 
 // A Full pull replaces pending state with the current snapshot. Missing indexed
 // paths get synthetic deletes with base zero, accepted below the horizon.
 func (r *Replica) reconcileFull(d *Delta) {
 	present := map[string]Row{}
+	r.tombstones = map[string]uint64{}
+	if _, e := r.db.Exec("DELETE FROM tombstones"); e != nil {
+		r.addError(e)
+	}
 	for _, row := range d.Rows {
 		present[row.PathID] = row
 	}
@@ -35,8 +40,7 @@ func (r *Replica) reconcileFull(d *Delta) {
 	}
 }
 
-// Only ignored descendants are disposable. Unignored/tracked children keep the
-// directory tombstone pending, including case-only renames arriving in pieces.
+// Only known junk is disposable. Ignored user content is always retained.
 func (r *Replica) removeIgnored(dir string, patterns []string) error {
 	if e := r.safe(dir); e != nil {
 		return e
@@ -52,16 +56,11 @@ func (r *Replica) removeIgnored(dir string, patterns []string) error {
 	}
 	for _, entry := range entries {
 		p := path.Join(dir, entry.Name())
-		if !r.ignore(p, entry.IsDir(), patterns) {
+		if entry.IsDir() || (strings.ToLower(foldPath(entry.Name())) != ".ds_store" && strings.ToLower(foldPath(entry.Name())) != "thumbs.db") {
 			continue
 		}
 		if e = r.safe(p); e != nil {
 			return e
-		}
-		if entry.IsDir() {
-			if e = r.removeIgnored(p, patterns); e != nil {
-				return e
-			}
 		}
 		if e = r.root.Remove(p); e != nil {
 			return e

@@ -51,6 +51,26 @@ func apiWrite(t testing.TB, r *testReplica, p, data string) {
 	}
 }
 
+func TestParseFolderKey(t *testing.T) {
+	key := NewFolderKey()
+	got, e := ParseFolderKey(hex.EncodeToString(key[:]))
+	if e != nil || got != key {
+		t.Fatal(got, e)
+	}
+	for _, text := range []string{"", "password", strings.Repeat("z", 64), strings.Repeat("0", 64), strings.Repeat("1", 62), strings.Repeat("1", 66)} {
+		if _, e := ParseFolderKey(text); !errors.Is(e, ErrKey) {
+			t.Fatalf("invalid import %q: %v", text, e)
+		}
+	}
+	c := apiServer(t, ServerOptions{}).Client(Principal{"t", "owner"})
+	if _, e := c.CreateFolder(context.Background(), FolderSpec{Name: "zero"}, FolderKey{}); !errors.Is(e, ErrKey) {
+		t.Fatal("zero create", e)
+	}
+	if _, e := Attach(context.Background(), c, "missing", FolderKey{}, t.TempDir(), Options{}); !errors.Is(e, ErrKey) {
+		t.Fatal("zero attach", e)
+	}
+}
+
 func TestFolderAndReplicaAPI(t *testing.T) {
 	for _, transport := range []string{"inprocess", "http"} {
 		t.Run(transport, func(t *testing.T) {
@@ -191,7 +211,9 @@ func TestCreateComputesKeyCheckLocally(t *testing.T) {
 		if e != nil {
 			t.Error(e)
 		}
-		capture <- body
+		if bytes.Contains(body, []byte(`"Op":"create"`)) {
+			capture <- body
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		handler.ServeHTTP(w, r)
 	}))
@@ -205,7 +227,7 @@ func TestCreateComputesKeyCheckLocally(t *testing.T) {
 	if e := json.Unmarshal(captured, &request); e != nil {
 		t.Fatal(e)
 	}
-	if !bytes.Equal(request.Spec.KeyCheck, engine.KeyCheck(engine.FolderKey(key))) || bytes.Contains(captured, []byte(hex.EncodeToString(key[:]))) {
+	if engine.CheckKey(engine.FolderKey(key), request.Spec.KeyCheck) != nil || bytes.Contains(captured, []byte(hex.EncodeToString(key[:]))) {
 		t.Fatal("raw key sent or key check missing")
 	}
 }

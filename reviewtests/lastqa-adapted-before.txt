@@ -1,0 +1,153 @@
+=== RUN   TestCompactionBetweenIncrementalPagesLosesDeletes
+    compaction_test.go:108: server rows=1 horizon=7 version=8; replica keeps 88 deleted files
+    compaction_test.go:110: replica never applies 88 remote deletes after compaction raced its incremental pull
+--- FAIL: TestCompactionBetweenIncrementalPagesLosesDeletes (15.74s)
+=== RUN   TestGarbageBacklogDrainIsQuadraticAndHoldsWriter
+    gcdrain_test.go:52: garbage backlog 20000: one GC pass (5.009168875s) collected 178; victim worst write 37.264084ms
+    gcdrain_test.go:54: GC throughput collapses with backlog size: 178 of 20000 per pass
+--- FAIL: TestGarbageBacklogDrainIsQuadraticAndHoldsWriter (5.12s)
+=== RUN   TestKeyCheckDoesNotLinkFolders
+    keycheck_test.go:33: authority can link folders sharing a key (equal=true)
+--- FAIL: TestKeyCheckDoesNotLinkFolders (0.00s)
+=== RUN   TestRecreatingUnindexedTombstonesScansWholeFolderPerFile
+    recreate_test.go:75: one sync recreating 300 paths: 302 Changes calls returning 990586 rows
+    recreate_test.go:77: recreating 300 previously deleted paths cost 302 full-folder listings (990586 rows)
+--- FAIL: TestRecreatingUnindexedTombstonesScansWholeFolderPerFile (2.15s)
+=== RUN   TestWholeFolderWriterTransactionsStallOtherTenants
+=== RUN   TestWholeFolderWriterTransactionsStallOtherTenants/compact
+    stall_test.go:73: seeded 60000 rows in 1.945865s
+    stall_test.go:103: compact of 60000 other-tenant rows: op=1.096619917s err=<nil>; victim baseline worst=1.426208ms, during worst=997.743958ms failures=0
+    stall_test.go:105: victim write latency grows with another tenant's rows: 997.743958ms vs baseline 1.426208ms (failures 0)
+=== RUN   TestWholeFolderWriterTransactionsStallOtherTenants/delete
+    stall_test.go:73: seeded 60000 rows in 1.940198208s
+    stall_test.go:103: delete of 60000 other-tenant rows: op=1.167454792s err=<nil>; victim baseline worst=2.158041ms, during worst=1.161093667s failures=0
+    stall_test.go:105: victim write latency grows with another tenant's rows: 1.161093667s vs baseline 2.158041ms (failures 0)
+--- FAIL: TestWholeFolderWriterTransactionsStallOtherTenants (6.98s)
+    --- FAIL: TestWholeFolderWriterTransactionsStallOtherTenants/compact (3.46s)
+    --- FAIL: TestWholeFolderWriterTransactionsStallOtherTenants/delete (3.52s)
+=== RUN   TestStoredTruncatedBlobRetriesForeverAndPinsLocalEdits
+    truncated_test.go:80: downloads of the same unchanged truncated row over 10 syncs: 20; quarantined=0; pendingUp=84; errors[-1]="unexpected EOF"
+    truncated_test.go:98: unchanged truncated row was downloaded 20 more times instead of being quarantined
+    truncated_test.go:101: local edit to the path is never uploaded while the remote row stays unreadable
+--- FAIL: TestStoredTruncatedBlobRetriesForeverAndPinsLocalEdits (0.09s)
+=== RUN   TestStationWithManyFoldersLosesPushAndReportsWrongError
+    waitcap_test.go:48: replica #64 never woke for a remote change; status errors (5) e.g. "path has an active upload | path has an active upload"
+--- FAIL: TestStationWithManyFoldersLosesPushAndReportsWrongError (5.76s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/lastqaopus	35.966s
+=== RUN   TestAttachContextSilentlyStopsReplica
+    attachctx_test.go:40: folder files=0; status errors=[] pendingUp=0
+    attachctx_test.go:42: replica stopped syncing when the Attach context ended; Status reports no error
+--- FAIL: TestAttachContextSilentlyStopsReplica (1.09s)
+=== RUN   TestDirectoryBlobStoreLeaksPerFolderDirectories
+    blobdirs_test.go:55: 20 folders deleted and collected (0 remain), but 20 per-folder directories remain in the blob store
+--- FAIL: TestDirectoryBlobStoreLeaksPerFolderDirectories (1.56s)
+=== RUN   TestRPCAcceptsCrossSiteSimpleRequestBodies
+    csrf_test.go:39: text/plain cross-site body executed an RPC: {"Folder":{"ID":"db5405d17a195aa933208d3e3e152dd2","Owner":{"Tenant":"acme","Sub
+--- FAIL: TestRPCAcceptsCrossSiteSimpleRequestBodies (0.02s)
+=== RUN   TestEmptyMountpointPropagatesMassDelete
+    emptyroot_test.go:66: authority live files=0; peer now holds 0 entries
+    emptyroot_test.go:68: an empty attachment root deleted 5 remote files and they vanished from every peer
+--- FAIL: TestEmptyMountpointPropagatesMassDelete (0.40s)
+=== RUN   TestBlockedRemoteDirectoryDeleteStillDestroysIgnoredFiles
+    ignoreddelete_test.go:51: remote delete of D destroyed local-only ignored file (D kept for new.txt: true)
+--- FAIL: TestBlockedRemoteDirectoryDeleteStillDestroysIgnoredFiles (0.34s)
+=== RUN   TestRemoteDirectoryDeleteDestroysIgnoredGitHistory
+    ignoreddelete_test.go:97: peer's directory delete erased this node's ignored .git history (status errors: [])
+--- FAIL: TestRemoteDirectoryDeleteDestroysIgnoredGitHistory (0.37s)
+=== RUN   TestPublicAccessMatrixBothTransports
+=== RUN   TestPublicAccessMatrixBothTransports/inprocess
+=== RUN   TestPublicAccessMatrixBothTransports/http
+--- PASS: TestPublicAccessMatrixBothTransports (0.71s)
+    --- PASS: TestPublicAccessMatrixBothTransports/inprocess (0.33s)
+    --- PASS: TestPublicAccessMatrixBothTransports/http (0.38s)
+=== RUN   TestDefaultStateDirLeaksNestedFolderToOuterGrantees
+    nested_test.go:99: bob (no vault grant) received vault's plaintext file names via the default StateDir: .drivesync-state-28fbf2b3d3d3fb2d12270559294ad859-f50fa053b170/index.sqlite-wal
+--- FAIL: TestDefaultStateDirLeaksNestedFolderToOuterGrantees (0.50s)
+=== RUN   TestLocalObstacleQuarantinesValidRemoteRowForever
+    quarantine_test.go:52: valid remote file never arrives after the local obstacle is removed; quarantined=[eb2deec545e3d2d0f5b20cf60cad34190785d94d6663fe89264669da79972b7e] now=[eb2deec545e3d2d0f5b20cf60cad34190785d94d6663fe89264669da79972b7e]
+--- FAIL: TestLocalObstacleQuarantinesValidRemoteRowForever (0.22s)
+=== RUN   TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes
+    staging_test.go:20: set QA_RLIMIT=1 and run alone: changes a process-wide rlimit
+--- SKIP: TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes (0.00s)
+=== RUN   TestAttachDeletesUnrelatedFilesInSharedStateDir
+    statedir_test.go:40: Attach deleted the embedder's upload-queue.json (state dir mode now -rwx------)
+--- FAIL: TestAttachDeletesUnrelatedFilesInSharedStateDir (0.08s)
+=== RUN   TestStatusErrorsNeverClearAfterRecovery
+    status_test.go:38: healthy replica still reports 1 stale errors: ["context canceled"]
+--- FAIL: TestStatusErrorsNeverClearAfterRecovery (0.13s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/lastqapublic	5.549s
+=== RUN   TestCompletedUploadAckFailureDoesNotPinCapacityForever
+=== RUN   TestCompletedUploadAckFailureDoesNotPinCapacityForever/false
+    qa_test.go:71: completed failed upload pins capacity despite cancellation and healthy GC: folder bytes limit: 514 requested, 257 limit; usage={Bytes:257 Files:0 Rows:0 Reserved:0 ReservedFiles:0 ReservedRows:0 GarbageRows:1}
+=== RUN   TestCompletedUploadAckFailureDoesNotPinCapacityForever/true
+    qa_test.go:71: completed failed upload pins capacity despite cancellation and healthy GC: folder bytes limit: 514 requested, 257 limit; usage={Bytes:257 Files:0 Rows:0 Reserved:0 ReservedFiles:0 ReservedRows:0 GarbageRows:1}
+--- FAIL: TestCompletedUploadAckFailureDoesNotPinCapacityForever (0.04s)
+    --- FAIL: TestCompletedUploadAckFailureDoesNotPinCapacityForever/false (0.04s)
+    --- FAIL: TestCompletedUploadAckFailureDoesNotPinCapacityForever/true (0.01s)
+=== RUN   TestPublicReplicaCanRetryQuarantinedDownload
+=== RUN   TestPublicReplicaCanRetryQuarantinedDownload/false
+    qa_test.go:160: valid stored row remains quarantined across restart; public Replica has no RetryRejected, opens=1 status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[3a0f3c790125124f776fec200225e1fe6ef87f0f3fd647c2c8b66076b4f0945f] LastSync:2026-10-03 10:21:55.128356 -0400 EDT m=+0.254934126 Errors:[]}
+=== RUN   TestPublicReplicaCanRetryQuarantinedDownload/true
+    qa_test.go:160: valid stored row remains quarantined across restart; public Replica has no RetryRejected, opens=1 status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[0245063aff0fd01f14e4608a97228c58bca249911c62e2c76d0abd5cd96ec237] LastSync:2026-10-03 10:21:55.330438 -0400 EDT m=+0.457015834 Errors:[]}
+--- FAIL: TestPublicReplicaCanRetryQuarantinedDownload (0.42s)
+    --- FAIL: TestPublicReplicaCanRetryQuarantinedDownload/false (0.22s)
+    --- FAIL: TestPublicReplicaCanRetryQuarantinedDownload/true (0.19s)
+=== RUN   TestPublicCreateRejectsUninitializedFolderKey
+    qa_test.go:179: uninitialized all-zero FolderKey accepted for folder 789bf1bb9ddc1608589f8b7fddc8ad9b; authority/storage observers can derive every encryption key
+--- FAIL: TestPublicCreateRejectsUninitializedFolderKey (0.00s)
+=== RUN   TestPermissionOnlyChangePropagates
+=== RUN   TestPermissionOnlyChangePropagates/false
+    qa_test.go:245: remote chmod silently ignored forever: want 0700 got 0600; status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[] LastSync:2026-10-03 10:21:55.481375 -0400 EDT m=+0.607952209 Errors:[]}
+=== RUN   TestPermissionOnlyChangePropagates/true
+    qa_test.go:245: remote chmod silently ignored forever: want 0700 got 0600; status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[] LastSync:2026-10-03 10:21:55.564953 -0400 EDT m=+0.691530126 Errors:[]}
+--- FAIL: TestPermissionOnlyChangePropagates (0.23s)
+    --- FAIL: TestPermissionOnlyChangePropagates/false (0.15s)
+    --- FAIL: TestPermissionOnlyChangePropagates/true (0.08s)
+=== RUN   TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren
+=== RUN   TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren/false
+    qa_test.go:276: skipping a symlinked tracked parent generated remote child deletion: data="" err=open /var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildrenfalse2124565980/003/files/dir/precious: no such file or directory source status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[] LastSync:2026-10-03 10:21:55.641815 -0400 EDT m=+0.768391792 Errors:[dir: symlink]}
+=== RUN   TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren/true
+    qa_test.go:276: skipping a symlinked tracked parent generated remote child deletion: data="" err=open /var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildrentrue811613230/003/files/dir/precious: no such file or directory source status={PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Quarantined:[] LastSync:2026-10-03 10:21:55.736533 -0400 EDT m=+0.863109459 Errors:[dir: symlink]}
+--- FAIL: TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren (0.18s)
+    --- FAIL: TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren/false (0.08s)
+    --- FAIL: TestSymlinkedTrackedDirectoryDoesNotDeleteRemoteChildren/true (0.10s)
+=== RUN   TestOversizedUploadRetainsActualCharge
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=false
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=false/false
+    qa_test.go:356: owner charged 256, stored sealed bytes 1 plus 1 garbage row(s) cost 257; folder cap 256, reported usage 256
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=false/true
+    qa_test.go:356: owner charged 256, stored sealed bytes 1 plus 1 garbage row(s) cost 257; folder cap 256, reported usage 256
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=true
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=true/false
+    qa_test.go:356: owner charged 256, stored sealed bytes 1 plus 1 garbage row(s) cost 257; folder cap 256, reported usage 256
+=== RUN   TestOversizedUploadRetainsActualCharge/disk=true/true
+    qa_test.go:356: owner charged 256, stored sealed bytes 1 plus 1 garbage row(s) cost 257; folder cap 256, reported usage 256
+--- FAIL: TestOversizedUploadRetainsActualCharge (0.10s)
+    --- FAIL: TestOversizedUploadRetainsActualCharge/disk=false (0.01s)
+        --- FAIL: TestOversizedUploadRetainsActualCharge/disk=false/false (0.00s)
+        --- FAIL: TestOversizedUploadRetainsActualCharge/disk=false/true (0.00s)
+    --- FAIL: TestOversizedUploadRetainsActualCharge/disk=true (0.09s)
+        --- FAIL: TestOversizedUploadRetainsActualCharge/disk=true/false (0.06s)
+        --- FAIL: TestOversizedUploadRetainsActualCharge/disk=true/true (0.03s)
+=== RUN   TestDeniedMutationDoesNotObserveUnrelatedWriter
+=== RUN   TestDeniedMutationDoesNotObserveUnrelatedWriter/false
+    qa_test.go:414: denied nonexistent-folder mutation exposes unrelated writer activity: idle=ErrDenied, busy=context deadline exceeded after 101.822917ms
+=== RUN   TestDeniedMutationDoesNotObserveUnrelatedWriter/true
+    qa_test.go:414: denied nonexistent-folder mutation exposes unrelated writer activity: idle=ErrDenied, busy=Post "http://127.0.0.1:49651/rpc": context deadline exceeded after 100.091625ms
+--- FAIL: TestDeniedMutationDoesNotObserveUnrelatedWriter (0.24s)
+    --- FAIL: TestDeniedMutationDoesNotObserveUnrelatedWriter/false (0.11s)
+    --- FAIL: TestDeniedMutationDoesNotObserveUnrelatedWriter/true (0.13s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/lastqaastra	1.378s
+FAIL
+
+Isolated process-wide RLIMIT reproduction:
+=== RUN   TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes
+    staging_test.go:63: last sync error: write /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes2199327556/002/.drivesync-state-202483bba222efd922ba74a3c4005933-3d917bb99c95/upload-3762409124: file too large; peer has b-notes.txt=false, deleted c-old.txt still present=true
+    staging_test.go:66: one unstageable file blocked unrelated upload/delete on every sync
+--- FAIL: TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes (0.13s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/lastqapublic	0.263s
+FAIL

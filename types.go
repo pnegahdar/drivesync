@@ -4,6 +4,7 @@ package drivesync
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -30,6 +31,7 @@ var (
 	ErrInvalid   = engine.ErrInvalid
 	ErrKey       = engine.ErrKey
 	ErrIntegrity = engine.ErrIntegrity
+	ErrWaitLimit = engine.ErrWaitLimit
 )
 
 // LimitError identifies a folder limit that rejected an operation.
@@ -65,6 +67,21 @@ type FolderKey [32]byte
 
 func NewFolderKey() FolderKey { return FolderKey(engine.NewFolderKey()) }
 
+// ParseFolderKey imports a 64-character hex encoding of a random 256-bit key.
+// Passphrases and hashes of passphrases are not suitable folder keys.
+func ParseFolderKey(s string) (FolderKey, error) {
+	var k FolderKey
+	b, e := hex.DecodeString(s)
+	if e != nil || len(b) != len(k) {
+		return k, ErrKey
+	}
+	copy(k[:], b)
+	if k == (FolderKey{}) {
+		return k, ErrKey
+	}
+	return k, nil
+}
+
 type Usage struct{ Bytes, Files, Reserved int64 }
 type FolderSpec struct {
 	Name, Description string
@@ -79,7 +96,8 @@ type Folder struct {
 	Usage             Usage
 }
 
-// Options configures a local replica. StateDir must be outside the synced tree.
+// Options configures a local replica. StateDir must be dedicated and outside
+// all synced trees; its default is a folder/root directory in the user's cache.
 // Manual disables automatic sync; Sync remains available explicitly.
 type Options struct {
 	Name, StateDir                          string

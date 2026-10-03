@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
@@ -57,7 +58,7 @@ func TestTruncatedHTTPDownloadIsQuarantinedForever(t *testing.T) {
 
 	base := t.TempDir()
 	dir := filepath.Join(base, "files")
-	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{Name: "b", StateDir: filepath.Join(base, "state"), Manual: true})
+	r, e := ds.Attach(bg, c, f.ID, k, dir, ds.Options{Name: "b", StateDir: filepath.Join(base, "state"), Manual: true, RetryInterval: time.Nanosecond})
 	if e != nil {
 		t.Fatal(e)
 	}

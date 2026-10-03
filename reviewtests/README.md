@@ -64,3 +64,34 @@ After API simplification, adversarial fixtures import `internal/engine`; all
 existing assertions and cardinalities remain. Original private tests moved to
 `internal/engine`, while root `api_test.go` verifies the reduced public facade.
 Before-log source paths refer to the historical root layout.
+
+`lastqaopus/`, `lastqapublic/` and `lastqaastra/` import every last-QA proof on
+5365ec9, including the passing public access-control matrix. Original runs are
+`lastqa-opus-before.txt`, `lastqa-astra-before.txt` and the isolated
+`lastqa-rlimit-before.txt`. `lastqa-adapted-before.txt` runs the current adaptations
+on that baseline: every defect proof still fails by assertion, while the matrix
+control passes. A temporary baseline-only creation helper computes the old check
+to adapt the new private helper signature; it changes no authority behavior.
+
+Proof adaptations accept attach refusal for unsafe nesting/state directories and
+absence of a rejected oversize blob. File enumerations exclude the reserved root
+marker. The wait-cap proof uses a fixed 64-folder station, preserving its original
+scale independently of the raised admission limit. The quarantine proof checks
+the requested public `Retry()` method. The salted-check proof asserts unlinkability
+and correct-key acceptance: offline candidate verification remains inherent to
+authenticated encryption and is explicitly documented, not claimed eliminated.
+Record counts (60,000 rows, 20,000 garbage objects, 1,000 recreated paths) and all
+latency assertions are unchanged. See ../QA_FIXES.md for item-by-item changes.
+
+Run the process-wide file-size limit proof separately:
+
+```sh
+QA_RLIMIT=1 go test ./reviewtests/lastqapublic -run '^TestOneUnstageableFile' -count=1
+```
+
+Existing expiry fixtures now run background collection before asserting reusable
+capacity, while checking immediate denial first. Retry fixtures select short
+retry intervals; seeded simulation retains all three original seeds and survival
+assertions. Raw malformed-JSON tests set JSON Content-Type so they still exercise
+the decoder. The wait-exhaustion proof expects the new distinct error. The tests
+never lower performance fixture counts to accommodate instrumentation.

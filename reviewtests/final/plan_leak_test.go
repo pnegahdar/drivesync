@@ -17,7 +17,7 @@ func TestGranteeSeesOwnerPlanFileCap(t *testing.T) {
 	})
 	owner := s.Client(ds.Principal{Tenant: "acme", Subject: "owner"})
 	guest := ds.Principal{Tenant: "partner", Subject: "guest"}
-	f, e := owner.CreateFolder(bg, ds.FolderSpec{Name: "missing-file-cap", Limits: ds.Limits{MaxTotalBytes: 1 << 20, MaxRows: 100}, KeyCheck: ds.KeyCheck(ds.NewFolderKey())})
+	f, e := ds.CreateFolder(bg, owner, ds.FolderSpec{Name: "missing-file-cap", Limits: ds.Limits{MaxTotalBytes: 1 << 20, MaxRows: 100}}, ds.NewFolderKey())
 	if e != nil {
 		t.Fatal(e)
 	}

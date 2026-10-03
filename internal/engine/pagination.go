@@ -79,6 +79,9 @@ func pageMode(page string, after, until, horizon uint64) (pageCursor, error) {
 	if e != nil || c.horizon > horizon {
 		return c, ErrInvalid
 	}
+	if !c.full && c.horizon < horizon {
+		return c, errFullRestart
+	}
 	c.version, e = strconv.ParseUint(parts[2], 10, 64)
 	if e != nil || c.version > until || !c.full && c.version < after || c.full != (after == 0 || after < c.horizon) {
 		return c, ErrInvalid

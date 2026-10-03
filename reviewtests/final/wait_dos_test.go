@@ -31,7 +31,7 @@ func TestIdleWaitersSlowOtherTenants(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, e := attacker.Wait(ctx, af.ID, 0)
-			if e == ds.ErrBusy {
+			if e == ds.ErrWaitLimit {
 				busy.Add(1)
 			}
 		}()

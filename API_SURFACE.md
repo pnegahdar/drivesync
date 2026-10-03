@@ -182,3 +182,11 @@ CLI status projects the same actionable fields as Replica.Status.
 Round-4 repairs are the preceding commit, 877c60e. Its complete per-finding
 summary, proof provenance and net delta (+2,499 lines; +361 production Go lines)
 remain in [SECURITY_FIXES.md](SECURITY_FIXES.md).
+
+Last-QA additions on 5365ec9: `ParseFolderKey` imports checked hex keys;
+`Replica.Retry()` clears actionable backoff and acknowledges deliberate mass
+removal. `ErrWaitLimit` distinguishes exhausted push-wait admission. Replication
+and crypto types remain private; folder creation salts its check after obtaining
+an authority-issued, principal-bound creation challenge. The `go doc -short`
+surface gains one line for `ParseFolderKey`; method documentation describes setup
+contexts, dedicated state, random keys, trusted principals and HTTPS.

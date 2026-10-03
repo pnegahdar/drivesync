@@ -34,7 +34,7 @@ func mkFolder(t testing.TB, c ds.Client, l ds.Limits) (ds.Folder, ds.FolderKey) 
 		l.MaxFileBytes = l.MaxTotalBytes
 	}
 	k := ds.NewFolderKey()
-	f, e := c.CreateFolder(bg, ds.FolderSpec{Name: fmt.Sprintf("f%d-%d", time.Now().UnixNano(), seq.Add(1)), Limits: l, KeyCheck: ds.KeyCheck(k)})
+	f, e := ds.CreateFolder(bg, c, ds.FolderSpec{Name: fmt.Sprintf("f%d-%d", time.Now().UnixNano(), seq.Add(1)), Limits: l}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -116,7 +116,7 @@ func seedOwners(t testing.TB, s *ds.Server, m *ds.SQLiteMetaStore, n int, shared
 	if shared != nil {
 		limits = ds.Limits{MaxTotalBytes: 1, MaxRows: 1, MaxFileBytes: 1}
 	}
-	f, e := s.Client(first).CreateFolder(bg, ds.FolderSpec{Name: "f", Limits: limits, KeyCheck: ds.KeyCheck(ds.NewFolderKey())})
+	f, e := ds.CreateFolder(bg, s.Client(first), ds.FolderSpec{Name: "f", Limits: limits}, ds.NewFolderKey())
 	if e != nil {
 		t.Fatal(e)
 	}

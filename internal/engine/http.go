@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -34,12 +35,13 @@ type wireError struct {
 	Limit *LimitError `json:",omitempty"`
 }
 type wireResponse struct {
-	Folder  Folder
-	Folders []Folder
-	Ticket  Ticket
-	Delta   Delta
-	Version uint64
-	Error   *wireError `json:",omitempty"`
+	Challenge FolderChallenge
+	Folder    Folder
+	Folders   []Folder
+	Ticket    Ticket
+	Delta     Delta
+	Version   uint64
+	Error     *wireError `json:",omitempty"`
 }
 
 func encodeError(e error) *wireError {
@@ -56,6 +58,10 @@ func encodeError(e error) *wireError {
 	}
 	code := "internal"
 	switch {
+	case errors.Is(e, errFullRestart):
+		code = "full_restart"
+	case errors.Is(e, ErrWaitLimit):
+		code = "wait_limit"
 	case errors.Is(e, ErrQuota):
 		code = "quota"
 	case errors.Is(e, ErrBusy):
@@ -84,6 +90,10 @@ func decodeError(e *wireError) error {
 		return nil
 	}
 	switch e.Code {
+	case "full_restart":
+		return errFullRestart
+	case "wait_limit":
+		return ErrWaitLimit
 	case "denied":
 		return ErrDenied
 	case "quota":
@@ -157,6 +167,11 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 		}
 		c := s.Client(p)
 		if r.URL.Path == "/rpc" && r.Method == http.MethodPost {
+			media, _, me := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if me != nil || media != "application/json" {
+				http.Error(w, "application/json required", http.StatusUnsupportedMediaType)
+				return
+			}
 			var req WireRequest
 			if e = DecodeWire(http.MaxBytesReader(w, r.Body, 1<<20), &req); e != nil {
 				reply(wireResponse{}, e)
@@ -164,6 +179,8 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 			}
 			var out wireResponse
 			switch req.Op {
+			case "prepare_folder":
+				out.Challenge, e = s.PrepareFolder(r.Context(), p)
 			case "create":
 				out.Folder, e = c.CreateFolder(r.Context(), req.Spec)
 			case "grant":
@@ -332,6 +349,13 @@ func (c *HTTPClient) Changes(x context.Context, id string, v uint64) (Delta, err
 	until := uint64(0)
 	for {
 		r, e := c.rpc(x, WireRequest{Op: "changes", Folder: id, After: v, Until: until, Page: page})
+		if errors.Is(e, errFullRestart) {
+			out = Delta{}
+			page = ""
+			until = 0
+			v = 0
+			continue
+		}
 		if e != nil {
 			return Delta{}, e
 		}
@@ -460,4 +484,9 @@ func (r *responseLimit) Read(p []byte) (int, error) {
 	n, e := r.reader.Read(p)
 	r.remaining -= int64(n)
 	return n, e
+}
+
+func (c *HTTPClient) PrepareFolder(ctx context.Context) (FolderChallenge, error) {
+	r, e := c.rpc(ctx, WireRequest{Op: "prepare_folder"})
+	return r.Challenge, e
 }

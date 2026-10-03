@@ -26,6 +26,11 @@ Security takes priority over convenience:
   and confine operations with os.Root. Case collisions must preserve both contents.
 - Stream file bytes; stage and authenticate downloads before publishing them with
   fsync and rename. Keep replica SQLite state outside the shared tree.
+  Default state belongs in the per-user cache, in a dedicated folder/root directory;
+  refuse unrelated nonempty state, nested/overlapping attachments and state aliases
+  into attachments. Reserve `.drivesync*` names. Bind state to a random root marker
+  and device/inode; never propagate deletes from a changed root. Pause suspicious
+  mass removals until explicit Retry, which cannot override root identity failures.
 - Preserve losing writes in conflict copies before replacing them. CAS batches
   are atomic. Keep tombstone versions so deleting and recreating a path works.
 - Reserve quota atomically, including concurrent folder and owner usage. Never
@@ -62,6 +67,9 @@ Security takes priority over convenience:
   Apply case-rename deletes before creates; batch indivisible rename pairs and retry
   a limit-failed independent batch one unit at a time. Early stream EOF is transient;
   authentication/framing failures are quarantined. Abort failed HTTP streams.
+  If all advertised sealed bytes arrive but framing is truncated, quarantine the
+  stored blob; otherwise retry with backoff. Local obstacles are retryable. Keep
+  tombstone versions from pulls instead of listing the whole folder per upload.
 - Revocation, downgrades, limit reductions and existing-row deletes never query
   quota. Only allocation growth queries pricing policy. Allocations persist until
   deletion and cleanup, including when the last grant is revoked.
@@ -108,9 +116,21 @@ Confirmation-review invariants:
   Compact only physically collected tombstones; deletes must never overshoot caps.
 - Persist replica upload session IDs. Only an identical nonempty principal/session
   may replace its stale ticket; siblings get ErrBusy.
-- Build rename hash/fold maps once per sync, batch pairs, remove ignored-only
-  directory contents and retry deletes while tracked children remain. Measure
+- Build rename hash/fold maps once per sync, batch pairs, preserve user-ignored
+  directory contents and retry deletes while tracked children remain. Only known
+  junk (.DS_Store, Thumbs.db) may be removed automatically; otherwise accept the
+  tombstone and leave the directory untracked. Skipped unsupported/symlink entries
+  block their entire subtree from rename/delete detection. Measure
   scaling with unchanged record counts, including under the race detector.
+- Preauthorize mutations on indexed WAL readers before entering the writer queue,
+  then reauthorize transactionally. Cache transfer usage, index folder+record IDs,
+  and load only touched tickets/garbage. Select compaction on readers and write
+  bounded path batches. DeleteFolder acknowledges revocation before bounded
+  background retirement; keep rows charged throughout. Maintenance retries failed
+  publication acknowledgements without losing in-flight cleanup responsibility.
+- Blob Put must not publish on a reader error. Enforce reservation size before
+  publication, and remove empty local blob directories. Stream uploads from
+  verified handles; reject one failing path with backoff and continue siblings.
 
 Public API rules:
 
@@ -118,6 +138,12 @@ Public API rules:
   clients only manage folders and attach replicas; compute key checks locally.
 - Keep Folder, Usage and Status focused on agent-visible decisions. Configure
   authority policy/clock/TTLs in ServerOptions and expose maintenance only as Run.
+  Attach's context bounds setup; Close owns lifetime. Expose Retry and decrypted
+  quarantine paths, clear errors after successful sync and persist mode changes
+  only after chmod/fsync. Require random keys, reject zero keys, validate imports,
+  and salt key checks bound to authority-issued folder IDs. Never claim salts
+  prevent offline guessing. RPC requires JSON Content-Type; document trusted
+  in-process principals and HTTPS for HTTP clients.
 - Metadata is concrete SQLite. BlobStore and QuotaPolicy remain pluggable; do not
   expose transaction types to add extension points.
 - Preserve protocol/adversarial tests in internal/engine and reviewtests. Keep

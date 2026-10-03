@@ -24,6 +24,7 @@ func (m *MetaStore) Close() error { return m.store.Close() }
 // BlobStore holds immutable sealed blobs. Keys are authority-generated IDs.
 // Put streams bytes, Size reports actual stored bytes, and Delete is idempotent
 // (os.ErrNotExist is also accepted). Implementations must honor cancellation.
+// Put must publish only after clean EOF; a reader error must discard staging.
 type BlobStore interface {
 	Put(context.Context, string, string, io.Reader) (int64, error)
 	Open(context.Context, string, string) (io.ReadCloser, error)

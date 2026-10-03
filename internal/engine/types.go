@@ -27,14 +27,16 @@ const (
 )
 
 var (
-	ErrDenied    = errors.New("not found or access denied")
-	ErrBusy      = errors.New("path has an active upload")
-	ErrExpired   = errors.New("upload reservation expired")
-	ErrQuota     = errors.New("owner quota limit")
-	ErrConflict  = errors.New("version conflict")
-	ErrInvalid   = errors.New("invalid request")
-	ErrKey       = errors.New("incorrect folder key")
-	ErrIntegrity = errors.New("encrypted data integrity failure")
+	ErrWaitLimit   = errors.New("too many outstanding waits; retry later")
+	errFullRestart = errors.New("compaction requires a full pull restart")
+	ErrDenied      = errors.New("not found or access denied")
+	ErrBusy        = errors.New("path has an active upload")
+	ErrExpired     = errors.New("upload reservation expired")
+	ErrQuota       = errors.New("owner quota limit")
+	ErrConflict    = errors.New("version conflict")
+	ErrInvalid     = errors.New("invalid request")
+	ErrKey         = errors.New("incorrect folder key")
+	ErrIntegrity   = errors.New("encrypted data integrity failure")
 )
 
 type LimitError struct {
@@ -59,6 +61,8 @@ func (f QuotaFunc) Quota(c context.Context, p Principal) (Quota, error) { return
 
 type Usage struct{ Bytes, Files, Rows, Reserved, ReservedFiles, ReservedRows, GarbageRows int64 }
 type FolderSpec struct {
+	ID                string
+	CreationProof     []byte
 	Name, Description string
 	Limits            Limits
 	KeyCheck          []byte
@@ -93,6 +97,7 @@ type UploadRequest struct {
 	MetadataBytes int64
 }
 type Ticket struct {
+	AuthEpoch                                string
 	SessionID                                string
 	ID, FolderID, BlobID, PathID             string
 	Principal                                Principal
@@ -135,6 +140,7 @@ type Event struct {
 
 // Client is an authenticated transport. Server authorization is independent of transport.
 type Client interface {
+	PrepareFolder(context.Context) (FolderChallenge, error)
 	CreateFolder(context.Context, FolderSpec) (Folder, error)
 	Grant(context.Context, string, Principal, Role) error
 	Revoke(context.Context, string, Principal) error

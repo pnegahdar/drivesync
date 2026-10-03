@@ -36,7 +36,7 @@ func folderFor(t testing.TB, c Client, l Limits) (Folder, FolderKey) {
 		l.MaxFileBytes = l.MaxTotalBytes
 	}
 	k := NewFolderKey()
-	f, e := c.CreateFolder(context.Background(), FolderSpec{Name: randomID(), Limits: l, KeyCheck: KeyCheck(k)})
+	f, e := CreateFolder(context.Background(), c, FolderSpec{Name: randomID(), Limits: l}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -91,7 +91,7 @@ func TestAccessMatrix(t *testing.T) {
 				p                   Principal
 				read, write, manage bool
 			}{{"owner", owner, true, true, true}, {"delegated owner", Principal{"tenant", "delegated"}, true, true, true}, {"writer", Principal{"tenant", "writer"}, true, true, false}, {"reader", Principal{"tenant", "reader"}, true, false, false}, {"other tenant", Principal{"other", "owner"}, false, false, false}, {"ungranted", Principal{"tenant", "stranger"}, false, false, false}, {"revoked", Principal{"tenant", "revoked"}, false, false, false}, {"anonymous", Principal{}, false, false, false}}
-			methods := []string{"get", "changes", "wait", "download", "reserve", "upload", "commit", "cancel", "grant", "revoke", "delete", "limits", "list", "create"}
+			methods := []string{"get", "changes", "wait", "download", "reserve", "upload", "commit", "cancel", "grant", "revoke", "delete", "limits", "list", "create", "prepare"}
 			for _, role := range roles {
 				for _, method := range methods {
 					t.Run(role.name+"/"+method, func(t *testing.T) {
@@ -188,9 +188,12 @@ func TestAccessMatrix(t *testing.T) {
 									t.Fatalf("listed %d, want %d", len(folders), want)
 								}
 							}
+						case "prepare":
+							allowed = role.p.valid()
+							_, e = c.PrepareFolder(ctx)
 						case "create":
 							allowed = role.p.valid()
-							_, e = c.CreateFolder(ctx, FolderSpec{Name: "own", KeyCheck: KeyCheck(k)})
+							_, e = CreateFolder(ctx, c, FolderSpec{Name: "own"}, k)
 						}
 						if allowed && e != nil {
 							t.Fatalf("allowed: %v", e)
@@ -406,6 +409,9 @@ func TestReservationRacesExpiryAndLies(t *testing.T) {
 		t.Fatal(got.Usage)
 	}
 	s.Now = func() time.Time { return time.Now().Add(time.Hour) }
+	if e := s.CollectGarbage(ctx); e != nil {
+		t.Fatal(e)
+	}
 	got, _ = c.GetFolder(ctx, f.ID)
 	if got.Usage.Reserved != 0 {
 		t.Fatal(got.Usage)
@@ -442,7 +448,7 @@ func TestOwnerQuotaAndLowering(t *testing.T) {
 	if _, e := c.Reserve(ctx, g.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e == nil {
 		t.Fatal("owner quota exceeded")
 	}
-	if _, e := c.CreateFolder(ctx, FolderSpec{Name: "third", KeyCheck: KeyCheck(k)}); e == nil {
+	if _, e := CreateFolder(ctx, c, FolderSpec{Name: "third"}, k); e == nil {
 		t.Fatal("folder quota exceeded")
 	}
 	max.Store(1)
@@ -518,7 +524,7 @@ func TestInvalidUTF8PrincipalsNeverAlias(t *testing.T) {
 				if _, e := cc(bad).GetFolder(ctx, f.ID); e != ErrDenied {
 					t.Fatal("invalid identity aliased", e)
 				}
-				if _, e := cc(bad).CreateFolder(ctx, FolderSpec{Name: "invalid", KeyCheck: KeyCheck(k)}); e != ErrDenied {
+				if _, e := CreateFolder(ctx, cc(bad), FolderSpec{Name: "invalid"}, k); e != ErrDenied {
 					t.Fatal(e)
 				}
 				if e := admin.Grant(ctx, f.ID, bad, Reader); e != ErrInvalid {

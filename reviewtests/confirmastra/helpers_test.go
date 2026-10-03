@@ -33,7 +33,7 @@ func mkFolder(t testing.TB, c ds.Client, l ds.Limits) (ds.Folder, ds.FolderKey) 
 		l.MaxFileBytes = l.MaxTotalBytes
 	}
 	k := ds.NewFolderKey()
-	f, e := c.CreateFolder(bg, ds.FolderSpec{Name: fmt.Sprintf("f%d-%d", time.Now().UnixNano(), seq.Add(1)), Limits: l, KeyCheck: ds.KeyCheck(k)})
+	f, e := ds.CreateFolder(bg, c, ds.FolderSpec{Name: fmt.Sprintf("f%d-%d", time.Now().UnixNano(), seq.Add(1)), Limits: l}, k)
 	if e != nil {
 		t.Fatal(e)
 	}

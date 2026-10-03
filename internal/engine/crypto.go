@@ -28,13 +28,27 @@ func NewFolderKey() FolderKey {
 	}
 	return k
 }
-func KeyCheck(k FolderKey) []byte {
+func KeyCheck(k FolderKey, folder string) []byte {
+	// The prefix contains the authority-issued folder ID and a random salt.
+	check := make([]byte, 32)
+	if _, e := rand.Read(check); e != nil {
+		panic(e)
+	}
+	id, e := hex.DecodeString(folder)
+	if e != nil || len(id) != 16 {
+		panic("invalid key-check folder ID")
+	}
+	copy(check[:16], id)
+	return append(check, keyCheckMAC(k, check)...)
+}
+func keyCheckMAC(k FolderKey, prefix []byte) []byte {
 	h := hmac.New(sha256.New, k[:])
 	h.Write([]byte("drivesync/v1/key-check"))
+	h.Write(prefix)
 	return h.Sum(nil)
 }
 func CheckKey(k FolderKey, check []byte) error {
-	if !hmac.Equal(KeyCheck(k), check) {
+	if k == (FolderKey{}) || len(check) != 64 || !hmac.Equal(keyCheckMAC(k, check[:32]), check[32:]) {
 		return ErrKey
 	}
 	return nil
@@ -68,7 +82,7 @@ func NormalizePath(s string) (string, error) {
 			return "", ErrInvalid
 		}
 		base := strings.ToUpper(strings.SplitN(part, ".", 2)[0])
-		if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" || strings.EqualFold(part, ".drivesync") || strings.EqualFold(part, ".drivesyncignore") || strings.HasPrefix(strings.ToLower(part), ".drivesync-tmp-") {
+		if base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" || strings.HasPrefix(strings.ToLower(part), ".drivesync") {
 			return "", ErrInvalid
 		}
 		if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9' {
@@ -280,7 +294,11 @@ func writeAll(w io.Writer, p []byte) error {
 
 func contentReadError(e error) error {
 	if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
-		return io.ErrUnexpectedEOF
+		return &incompleteContent{io.ErrUnexpectedEOF}
 	}
 	return e
 }
+
+type incompleteContent struct{ error }
+
+func (e *incompleteContent) Unwrap() error { return e.error }

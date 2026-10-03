@@ -34,7 +34,7 @@ func setup(t *testing.T) (*ds.Server, ds.Client) {
 }
 func folder(t *testing.T, c ds.Client, name string, k ds.FolderKey) ds.Folder {
 	t.Helper()
-	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, Limits: ds.Limits{MaxTotalBytes: 4000, MaxFileBytes: 4000, MaxRows: 1000}, KeyCheck: ds.KeyCheck(k)})
+	f, e := ds.CreateFolder(ctx, c, ds.FolderSpec{Name: name, Limits: ds.Limits{MaxTotalBytes: 4000, MaxFileBytes: 4000, MaxRows: 1000}}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -94,7 +94,7 @@ func TestWriterOwnerUsageLeak(t *testing.T) {
 	s, c := setup(t)
 	s.Quotas = ds.QuotaFunc(func(context.Context, ds.Principal) (ds.Quota, error) { return ds.Quota{MaxTotalBytes: 10000}, nil })
 	k := ds.NewFolderKey()
-	uncapped, e := c.CreateFolder(ctx, ds.FolderSpec{Name: "uncapped", KeyCheck: ds.KeyCheck(k)})
+	uncapped, e := ds.CreateFolder(ctx, c, ds.FolderSpec{Name: "uncapped"}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -140,6 +140,9 @@ func readFiles(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	e := filepath.WalkDir(dir, func(p string, d os.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil {
 			return e
 		}

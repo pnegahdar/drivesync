@@ -221,6 +221,9 @@ func TestOutstandingTicketsAfterDeletionAndDowngrade(t *testing.T) {
 	if e = s.Client(p).Upload(ctx, f.ID, ticket, bytes.NewReader([]byte{1})); e != ErrDenied {
 		t.Fatal(e)
 	}
+	if e = s.CollectGarbage(ctx); e != nil {
+		t.Fatal(e)
+	}
 	f, _ = c.GetFolder(ctx, f.ID)
 	if f.Usage.Reserved != 0 {
 		t.Fatal(f.Usage)
@@ -268,6 +271,9 @@ func TestCommitExcludesExpiredReservations(t *testing.T) {
 		t.Fatal(e)
 	}
 	clock = clock.Add(31 * time.Second)
+	if e = s.CollectGarbage(ctx); e != nil {
+		t.Fatal(e)
+	}
 	maximum.Store(RowCost + 1 + int64(len(metaForReservationTest(k, f.ID, pid, ticket.BlobID))))
 	meta, e := SealMetadata(k, f.ID, pid, FileMetadata{Path: "new", BlobID: ticket.BlobID, Mode: 0600})
 	if e != nil {

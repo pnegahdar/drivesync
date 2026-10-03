@@ -28,29 +28,28 @@ func (m *Metadata) fileTotals(id string) Usage {
 
 // allUsage groups reservations and garbage once, rather than rescanning them
 // for every folder. Runtime is linear in the selected records.
-func allUsage(m *Metadata) map[string]Usage {
+func allUsage(m *Metadata) map[string]Usage { return usageWithTransfers(m, transferUsage(m)) }
+func usageWithTransfers(m *Metadata, transfers map[string]Usage) map[string]Usage {
 	out := make(map[string]Usage, len(m.Folders))
 	for id := range m.Folders {
 		out[id] = m.fileTotals(id)
 	}
-	for _, t := range m.Tickets {
-		u := out[t.FolderID]
-		u.Reserved = sat(u.Reserved, t.ReservedBytes)
-		u.ReservedFiles = sat(u.ReservedFiles, t.ReservedFiles)
-		u.ReservedRows = sat(u.ReservedRows, t.ReservedRows)
-		out[t.FolderID] = u
+	for id, f := range m.Folders {
+		extra := transfers[id]
+		if m.transfersPartial {
+			extra = transferDelta(f.TransferUsage, m.selectedTransfers[id], extra)
+		}
+		u := out[id]
+		u.Bytes = sat(u.Bytes, extra.Bytes)
+		u.Reserved, u.ReservedFiles, u.ReservedRows, u.GarbageRows = extra.Reserved, extra.ReservedFiles, extra.ReservedRows, extra.GarbageRows
+		out[id] = u
 	}
-	for _, g := range m.Garbage {
-		u := out[g.FolderID]
-		u.GarbageRows++
-		u.Bytes = sat(u.Bytes, g.Size)
-		out[g.FolderID] = u
-	}
+
 	return out
 }
-func contributions(m *Metadata) map[string]Account {
+func contributions(m *Metadata) map[string]Account { return contributionTotals(m, allUsage(m)) }
+func contributionTotals(m *Metadata, totals map[string]Usage) map[string]Account {
 	out := map[string]Account{}
-	totals := allUsage(m)
 	for id, f := range m.Folders {
 		key := principalKey(f.Folder.Owner)
 		a := out[key]
@@ -90,12 +89,14 @@ func (m *Metadata) Prepare(filesLoaded bool) {
 			m.selected[id] = fileUsage(rows)
 		}
 	}
-	m.baseline = contributions(m)
+	m.selectedTransfers = transferUsage(m)
+	m.baseline = contributionTotals(m, usageWithTransfers(m, m.selectedTransfers))
 }
 
 // Finish computes contributions once and atomically updates caches/counters.
 func (m *Metadata) Finish() {
-	next := contributions(m)
+	extra := transferUsage(m)
+	next := contributionTotals(m, usageWithTransfers(m, extra))
 	if m.Accounts == nil {
 		m.Accounts = map[string]Account{}
 	}
@@ -107,7 +108,33 @@ func (m *Metadata) Finish() {
 		m.Accounts[key] = accountDelta(m.Accounts[key], Account{}, a)
 	}
 	for id, f := range m.Folders {
+		if m.transfersPartial {
+			f.TransferUsage = transferDelta(f.TransferUsage, m.selectedTransfers[id], extra[id])
+		} else {
+			f.TransferUsage = extra[id]
+		}
 		f.FileUsage = m.fileTotals(id)
 		m.Folders[id] = f
 	}
+}
+
+func transferUsage(m *Metadata) map[string]Usage {
+	out := map[string]Usage{}
+	for _, t := range m.Tickets {
+		u := out[t.FolderID]
+		u.Reserved = sat(u.Reserved, t.ReservedBytes)
+		u.ReservedFiles = sat(u.ReservedFiles, t.ReservedFiles)
+		u.ReservedRows = sat(u.ReservedRows, t.ReservedRows)
+		out[t.FolderID] = u
+	}
+	for _, g := range m.Garbage {
+		u := out[g.FolderID]
+		u.GarbageRows++
+		u.Bytes = sat(u.Bytes, g.Size)
+		out[g.FolderID] = u
+	}
+	return out
+}
+func transferDelta(total, old, next Usage) Usage {
+	return Usage{Bytes: sat(max(0, total.Bytes-old.Bytes), next.Bytes), Reserved: sat(max(0, total.Reserved-old.Reserved), next.Reserved), ReservedFiles: sat(max(0, total.ReservedFiles-old.ReservedFiles), next.ReservedFiles), ReservedRows: sat(max(0, total.ReservedRows-old.ReservedRows), next.ReservedRows), GarbageRows: sat(max(0, total.GarbageRows-old.GarbageRows), next.GarbageRows)}
 }

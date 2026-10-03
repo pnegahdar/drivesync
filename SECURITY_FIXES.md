@@ -1,3 +1,7 @@
+The latest repairs and current directory/state safety rules are in
+[QA_FIXES.md](QA_FIXES.md). The sections below record earlier commits; the
+latest rules supersede historical ignored-directory cleanup behavior.
+
 # Confirmation-review repairs
 
 Reviewed base: `6420600`. All 17 Opus and four Astra proofs were imported under

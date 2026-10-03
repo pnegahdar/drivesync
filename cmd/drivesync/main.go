@@ -138,11 +138,11 @@ func main() {
 	if keyHex == "" && command == "create" {
 		key = ds.NewFolderKey()
 	} else {
-		b, e := hex.DecodeString(keyHex)
-		if e != nil || len(b) != 32 {
-			log.Fatal("-key-file or DRIVESYNC_KEY must contain 64 hex characters")
+		var e error
+		key, e = ds.ParseFolderKey(keyHex)
+		if e != nil {
+			log.Fatal("-key-file or DRIVESYNC_KEY must contain a nonzero random key encoded as 64 hex characters")
 		}
-		copy(key[:], b)
 	}
 	switch command {
 	case "create":
@@ -180,14 +180,18 @@ func main() {
 func decodeStatus(b []byte) (ds.Status, error) {
 	var stored struct {
 		ds.Status
-		Quarantined []struct{ PathID string }
+		Quarantined []struct{ PathID, Path string }
 		Skipped     []string
 	}
 	if e := json.Unmarshal(b, &stored); e != nil {
 		return ds.Status{}, e
 	}
 	for _, row := range stored.Quarantined {
-		stored.Status.Quarantined = append(stored.Status.Quarantined, row.PathID)
+		name := row.Path
+		if name == "" {
+			name = row.PathID
+		}
+		stored.Status.Quarantined = append(stored.Status.Quarantined, name)
 	}
 	stored.Status.Errors = append(stored.Status.Errors, stored.Skipped...)
 	return stored.Status, nil

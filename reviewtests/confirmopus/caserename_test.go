@@ -74,7 +74,9 @@ func TestCaseOnlyDirectoryRenameObservedMidway(t *testing.T) {
 	entries, _ := os.ReadDir(mac.dir)
 	var names []string
 	for _, e := range entries {
-		names = append(names, e.Name())
+		if e.Name() != ".drivesync-root" {
+			names = append(names, e.Name())
+		}
 	}
 	remote, _ := c.Changes(bg, f.ID, 0)
 	var live []string

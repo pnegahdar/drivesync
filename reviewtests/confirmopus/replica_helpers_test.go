@@ -36,6 +36,9 @@ func write(t testing.TB, r rep, p, content string) {
 func files(t testing.TB, r rep) map[string]string {
 	out := map[string]string{}
 	filepath.WalkDir(r.dir, func(p string, d fs.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil || d.IsDir() {
 			return nil
 		}

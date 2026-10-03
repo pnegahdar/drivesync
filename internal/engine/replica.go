@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ type Rejection struct {
 	RetryAt      time.Time
 }
 type QuarantinedRow struct {
+	Path    string
 	PathID  string
 	Version uint64
 }
@@ -61,10 +63,16 @@ type LocalFile struct {
 	Directory         bool
 }
 type pendingRow struct {
-	Row  Row
-	Kind string
+	Row     Row
+	Kind    string
+	RetryAt time.Time
 }
 type Replica struct {
+	identity        rootIdentity
+	allowMassDelete bool
+	tombstones      map[string]uint64
+	retryAt         map[string]time.Time
+
 	client       Client
 	folder       string
 	session      string
@@ -100,6 +108,9 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	if e != nil {
 		return nil, e
 	}
+	if len(f.KeyCheck) != 64 || hex.EncodeToString(f.KeyCheck[:16]) != id {
+		return nil, ErrKey
+	}
 	if e = CheckKey(k, f.KeyCheck); e != nil {
 		return nil, e
 	}
@@ -127,18 +138,10 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	if e != nil {
 		return nil, e
 	}
-	if o.StateDir == "" {
-		sum := blake3.Sum256([]byte(dir))
-		o.StateDir = filepath.Join(filepath.Dir(dir), fmt.Sprintf(".drivesync-state-%s-%x", id, sum[:6]))
-	}
-	o.StateDir, e = filepath.Abs(o.StateDir)
-	if e != nil {
+	if e = checkAttachments(ctx, dir, id); e != nil {
 		return nil, e
 	}
-	if e = durableDirectory(o.StateDir); e != nil {
-		return nil, e
-	}
-	o.StateDir, e = filepath.EvalSymlinks(o.StateDir)
+	o.StateDir, e = prepareState(dir, id, o.StateDir)
 	if e != nil {
 		return nil, e
 	}
@@ -166,7 +169,7 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	}
 	db.SetMaxOpenConns(1)
 	cleanup := func() { db.Close(); lock.Close(); root.Close() }
-	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", `CREATE TABLE IF NOT EXISTS entries (path TEXT PRIMARY KEY,data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY,value TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS pending (id TEXT PRIMARY KEY,data BLOB NOT NULL)`} {
+	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA synchronous=FULL", `CREATE TABLE IF NOT EXISTS entries (path TEXT PRIMARY KEY,data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY,value TEXT NOT NULL)`, `CREATE TABLE IF NOT EXISTS pending (id TEXT PRIMARY KEY,data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS tombstones (id TEXT PRIMARY KEY,version INTEGER NOT NULL)`} {
 		if _, e = db.Exec(q); e != nil {
 			cleanup()
 			return nil, e
@@ -200,8 +203,39 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 			return nil, e
 		}
 	}
-	rctx, cancel := context.WithCancel(ctx)
-	r := &Replica{session: session, quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]IndexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
+	rctx, cancel := context.WithCancel(context.Background())
+	r := &Replica{tombstones: map[string]uint64{}, retryAt: map[string]time.Time{}, session: session, quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]IndexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
+	if e = ctx.Err(); e == nil {
+		e = r.bindRoot()
+	}
+	if e != nil {
+		cancel()
+		cleanup()
+		return nil, e
+	}
+	tombs, e := db.Query("SELECT id,version FROM tombstones")
+	if e != nil {
+		cancel()
+		cleanup()
+		return nil, e
+	}
+	for tombs.Next() {
+		var pid string
+		var version uint64
+		if e = tombs.Scan(&pid, &version); e != nil {
+			break
+		}
+		r.tombstones[pid] = version
+	}
+	if e == nil {
+		e = tombs.Err()
+	}
+	tombs.Close()
+	if e != nil {
+		cancel()
+		cleanup()
+		return nil, e
+	}
 	rows, e := db.Query("SELECT data FROM entries")
 	if e != nil {
 		cancel()
@@ -263,6 +297,7 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 			r.ignoredRows[pid] = saved.Row
 		case "retry":
 			r.retryRows[pid] = saved.Row
+			r.retryAt[pid] = saved.RetryAt
 		case "quarantine":
 			r.quarantine[pid] = saved.Row
 		default:
@@ -367,6 +402,8 @@ func (r *Replica) Close() error {
 }
 func (r *Replica) RetryRejected() {
 	r.syncMu.Lock()
+	r.allowMassDelete = true
+	r.retryAt = map[string]time.Time{}
 	for pid, row := range r.quarantine {
 		r.retryRows[pid] = row
 		delete(r.quarantine, pid)
@@ -391,7 +428,12 @@ func (r *Replica) listen(v uint64) {
 			select {
 			case <-r.ctx.Done():
 				return
-			case <-time.After(time.Second):
+			case <-time.After(func() time.Duration {
+				if errors.Is(e, ErrWaitLimit) {
+					return 5 * time.Second
+				}
+				return time.Second
+			}()):
 			}
 			continue
 		}
@@ -473,7 +515,7 @@ func (r *Replica) ignore(p string, dir bool, patterns []string) bool {
 func (r *Replica) ignoreOne(p string, dir bool, patterns []string) bool {
 	p = strings.ToLower(foldPath(p))
 	base := path.Base(p)
-	if base == ".ds_store" || base == ".drivesyncignore" || strings.HasPrefix(base, ".drivesync-tmp-") || strings.HasPrefix(base, ".~") || strings.HasPrefix(base, "~$") || strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") || strings.HasSuffix(base, ".tmp") {
+	if base == ".ds_store" || base == ".drivesyncignore" || strings.HasPrefix(base, ".drivesync") || strings.HasPrefix(base, ".~") || strings.HasPrefix(base, "~$") || strings.HasSuffix(base, "~") || strings.HasSuffix(base, ".swp") || strings.HasSuffix(base, ".swo") || strings.HasSuffix(base, ".tmp") {
 		return true
 	}
 	for _, raw := range patterns {
@@ -521,7 +563,7 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 		if e != nil {
 			skipped = append(skipped, full+": "+e.Error())
 			if rel, re := filepath.Rel(r.dir, full); re == nil {
-				r.blockedLocal[r.remotePath(filepath.ToSlash(rel))] = true
+				r.blockLocal(filepath.ToSlash(rel))
 			}
 			return nil
 		}
@@ -540,15 +582,20 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 			return nil
 		}
 		if d.Type()&os.ModeSymlink != 0 {
+			r.blockLocal(local)
 			skipped = append(skipped, local+": symlink")
 			return nil
 		}
 		p := r.remotePath(local)
 		if _, e = NormalizePath(p); e != nil {
+			r.blockLocal(local)
 			skipped = append(skipped, local+": invalid path")
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if prior, ok := r.index[p]; d.IsDir() && ok && prior.Deleted && prior.Directory {
 			return nil
 		}
 		v, e := r.inspect(p, local)
@@ -556,7 +603,7 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 			if errors.Is(e, os.ErrNotExist) {
 				return nil
 			}
-			r.blockedLocal[p] = true
+			r.blockLocal(local)
 			skipped = append(skipped, local+": "+e.Error())
 			return nil
 		}
@@ -582,7 +629,7 @@ func (r *Replica) safe(p string) error {
 			return e
 		}
 		if s.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlink component: %s", p)
+			return fmt.Errorf("%w: symlink component %s", errLocalObstacle, p)
 		}
 		if i < len(parts)-1 && !s.IsDir() {
 			return os.ErrNotExist
@@ -600,7 +647,7 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 		return v, e
 	}
 	if !before.IsDir() && !before.Mode().IsRegular() {
-		return v, ErrInvalid
+		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
 	}
 	f, e := openLocal(r.root, local)
 	if e != nil {
@@ -612,7 +659,7 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 		return v, e
 	}
 	if !os.SameFile(before, s) || (!s.IsDir() && !s.Mode().IsRegular()) {
-		return v, ErrInvalid
+		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
 	}
 	v.Mode = uint32(s.Mode().Perm())
 	v.Directory = s.IsDir()
@@ -623,7 +670,7 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 		return v, nil
 	}
 	if !s.Mode().IsRegular() {
-		return v, ErrInvalid
+		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
 	}
 	h := blake3.New()
 	if _, e = io.Copy(h, f); e != nil {
@@ -638,12 +685,18 @@ func sameFile(v LocalFile, i IndexEntry) bool {
 func (r *Replica) Sync(ctx context.Context) error {
 	r.syncMu.Lock()
 	defer r.syncMu.Unlock()
+	defer func() { r.allowMassDelete = false }()
 	if e := r.ctx.Err(); e != nil {
 		return e
 	}
 	e := r.sync(ctx)
 	if e != nil {
 		r.addError(e)
+	}
+	if e == nil {
+		r.mu.Lock()
+		r.status.Errors = nil
+		r.mu.Unlock()
 	}
 	if pe := r.persistStatus(); pe != nil && e == nil {
 		e = pe
@@ -652,6 +705,9 @@ func (r *Replica) Sync(ctx context.Context) error {
 	return e
 }
 func (r *Replica) sync(ctx context.Context) error {
+	if e := r.validRoot(); e != nil {
+		return e
+	}
 	folder, e := r.client.GetFolder(ctx, r.folder)
 	if e != nil {
 		return e
@@ -670,6 +726,8 @@ func (r *Replica) sync(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
+	deleteErr := r.deleteSafety(local)
+	record(deleteErr)
 	record(r.pull(ctx, local))
 	local, e = r.ScanLocal()
 	if e != nil {
@@ -678,10 +736,6 @@ func (r *Replica) sync(ctx context.Context) error {
 	paths := make([]string, 0, len(local))
 	var up int64
 	for p, v := range local {
-		pid, _ := PathID(r.key, r.folder, p)
-		if _, pending := r.retryRows[pid]; pending {
-			continue
-		}
 		if i, ok := r.index[p]; !ok || !sameFile(v, i) {
 			paths = append(paths, p)
 			up += SealedSize(v.Size)
@@ -707,7 +761,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		presentLocal[v.Local] = true
 	}
 	for old, i := range r.index {
-		if i.Deleted || i.Awaiting || r.localBlocked(old) || presentLocal[i.Local] {
+		if deleteErr != nil || i.Deleted || i.Awaiting || r.localBlocked(old) || presentLocal[i.Local] {
 			continue
 		}
 		hashes[i.Hash] = append(hashes[i.Hash], old)
@@ -754,6 +808,14 @@ func (r *Replica) sync(ctx context.Context) error {
 	flush = func() error {
 		if len(batch) == 0 {
 			return nil
+		}
+		for _, m := range batch {
+			if m.Deleted {
+				if e := r.validRoot(); e != nil {
+					return e
+				}
+				break
+			}
 		}
 		d, e := r.client.Commit(ctx, r.folder, batch)
 		if errors.Is(e, ErrConflict) {
@@ -927,6 +989,10 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 		base := r.index[p].Version
 		pid, _ := PathID(r.key, r.folder, p)
+		base = max(base, r.tombstones[pid])
+		if pending, ok := r.quarantine[pid]; ok {
+			base = max(base, pending.Version)
+		}
 		renameDelete := []Mutation{}
 		if old, ok := renames[p]; ok {
 			i := r.index[old]
@@ -936,22 +1002,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		preview, _ := SealMetadata(r.key, r.folder, pid, FileMetadata{Path: p, BlobID: strings.Repeat("0", 32), Size: v.Size, Mode: v.Mode, Directory: v.Directory, Hash: v.Hash})
 		request := UploadRequest{SessionID: r.session, PathID: pid, BaseVersion: base, SealedSize: SealedSize(v.Size), MetadataBytes: int64(len(preview))}
 		t, e := r.client.Reserve(ctx, r.folder, request)
-		if errors.Is(e, ErrConflict) {
-			if i, known := r.index[p]; !known || i.Deleted {
-				delta, ce := r.client.Changes(ctx, r.folder, 0)
-				if ce != nil {
-					return ce
-				}
-				for _, row := range delta.Rows {
-					if row.PathID == pid && row.Deleted {
-						base = row.Version
-						request.BaseVersion = base
-						t, e = r.client.Reserve(ctx, r.folder, request)
-						break
-					}
-				}
-			}
-		}
+
 		if e != nil {
 			var l *LimitError
 			if errors.As(e, &l) || errors.Is(e, ErrQuota) {
@@ -975,62 +1026,64 @@ func (r *Replica) sync(ctx context.Context) error {
 			record(e)
 			continue
 		}
-		// Stage a stable plaintext snapshot outside the shared tree. This never loads the whole file.
-		temp, e := os.CreateTemp(r.opts.StateDir, "upload-")
-		if e != nil {
-			_ = r.client.CancelUpload(ctx, r.folder, t.ID)
-			return e
-		}
-		if e = temp.Chmod(0600); e != nil {
-			temp.Close()
-			os.Remove(temp.Name())
-			return e
-		}
-		h := blake3.New()
-		n := int64(0)
+		// Stream a verified handle; commit only when its streamed hash still matches the scan.
+		var src io.ReadCloser = io.NopCloser(strings.NewReader(""))
 		if !v.Directory {
-			var src *os.File
 			if e = r.safe(v.Local); e == nil {
-				src, e = openLocal(r.root, v.Local)
+				var before os.FileInfo
+				before, e = r.root.Lstat(v.Local)
+				if e == nil && !before.Mode().IsRegular() {
+					e = fmt.Errorf("unsupported local entry: %s", v.Local)
+				}
+				if e == nil {
+					var file *os.File
+					file, e = openLocal(r.root, v.Local)
+					if e == nil {
+						var opened os.FileInfo
+						opened, e = file.Stat()
+						if e == nil && (!os.SameFile(before, opened) || opened.Size() != v.Size) {
+							e = ErrBusy
+						}
+						if e != nil {
+							file.Close()
+						} else {
+							src = file
+						}
+					}
+				}
 			}
-			if e == nil {
-				n, e = io.Copy(io.MultiWriter(temp, h), &contextReader{ctx, src})
-				src.Close()
-			}
 		}
-		if e == nil {
-			_, e = temp.Seek(0, 0)
-		}
-		hash := fmt.Sprintf("%x", h.Sum(nil))
-		if v.Directory {
-			hash = "directory"
-		}
-		if e != nil || n != v.Size || hash != v.Hash {
-			temp.Close()
-			os.Remove(temp.Name())
+		if e != nil {
+			src.Close()
 			_ = r.client.CancelUpload(ctx, r.folder, t.ID)
-			if e != nil {
-				return e
-			}
+			r.reject(p, v.Hash, e)
+			record(e)
 			continue
 		}
+		h := blake3.New()
 		pr, pw := io.Pipe()
 		sealedDone := make(chan error, 1)
 		go func() {
-			e := SealContent(pw, temp, r.key, r.folder, t.BlobID, pid)
+			e := SealContent(pw, io.TeeReader(&contextReader{ctx, src}, h), r.key, r.folder, t.BlobID, pid)
 			_ = pw.CloseWithError(e)
 			sealedDone <- e
 		}()
 		e = r.client.Upload(ctx, r.folder, t, pr)
 		_ = pr.CloseWithError(e)
 		se := <-sealedDone
-		temp.Close()
-		os.Remove(temp.Name())
+		src.Close()
 		if e == nil {
 			e = se
 		}
+		if e == nil && !v.Directory && fmt.Sprintf("%x", h.Sum(nil)) != v.Hash {
+			e = ErrBusy
+		}
 		if e != nil {
 			_ = r.client.CancelUpload(ctx, r.folder, t.ID)
+			var pe *os.PathError
+			if isTransferError(e) || errors.As(e, &pe) {
+				r.reject(p, v.Hash, e)
+			}
 			record(e)
 			continue
 		}
@@ -1058,7 +1111,7 @@ func (r *Replica) sync(ctx context.Context) error {
 	// Missing tracked files become CAS tombstones. A failed delete restores the winner on pull.
 	deleted := []string{}
 	for p, v := range r.index {
-		if _, ok := local[p]; !ok && !v.Deleted && !v.Awaiting && !heldDeletes[p] && !r.localBlocked(p) {
+		if _, ok := local[p]; !ok && !v.Deleted && !v.Awaiting && !heldDeletes[p] && !r.localBlocked(p) && deleteErr == nil {
 			if !writable || r.ignore(v.Local, v.Directory, r.patterns()) {
 				continue
 			}
@@ -1073,6 +1126,9 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 		pid, _ := PathID(r.key, r.folder, p)
 		var tombstone Delta
+		if e = r.validRoot(); e != nil {
+			return e
+		}
 		tombstone, e = r.client.Commit(ctx, r.folder, []Mutation{{PathID: pid, BaseVersion: i.Version, Deleted: true}})
 		if e != nil && !errors.Is(e, ErrConflict) {
 			record(e)
@@ -1108,8 +1164,10 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 		}
 	}
 	for pid, row := range r.retryRows {
+		if time.Now().Before(r.retryAt[pid]) {
+			continue
+		}
 		delta.Rows = append(delta.Rows, row)
-		delete(r.retryRows, pid)
 	}
 	for pid, row := range r.ignoredRows {
 		delta.Rows = append(delta.Rows, row)
@@ -1171,14 +1229,22 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 	for len(pending) > 0 {
 		row := pending[0]
 		pending = pending[1:]
+		if prior, ok := r.retryRows[row.PathID]; ok && prior.Version == row.Version && time.Now().Before(r.retryAt[row.PathID]) {
+			continue
+		}
+		delete(r.retryRows, row.PathID)
+		delete(r.retryAt, row.PathID)
 		if old, ok := r.quarantine[row.PathID]; ok && old.Version == row.Version {
 			continue
 		}
 		if e = r.apply(ctx, row); e != nil {
-			if errors.Is(e, ErrIntegrity) || errors.Is(e, ErrInvalid) {
+			if errors.Is(e, ErrIntegrity) {
 				r.quarantine[row.PathID] = row
 			} else {
 				r.retryRows[row.PathID] = row
+				if isTransferError(e) {
+					r.retryAt[row.PathID] = time.Now().Add(r.opts.RetryInterval)
+				}
 			}
 			r.addError(fmt.Errorf("remote %s: %w", row.PathID, e))
 			if firstError == nil {
@@ -1198,7 +1264,7 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 	}
 	for kind, set := range map[string]map[string]Row{"quarantine": r.quarantine, "ignored": r.ignoredRows, "retry": r.retryRows} {
 		for pid, row := range set {
-			b, me := json.Marshal(pendingRow{Row: row, Kind: kind})
+			b, me := json.Marshal(pendingRow{Row: row, Kind: kind, RetryAt: r.retryAt[pid]})
 			if me != nil {
 				return me
 			}
@@ -1206,6 +1272,31 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 				return me
 			}
 		}
+	}
+	// Persist only this pull's tombstones, in bounded SQL batches. Rewriting the
+	// complete cache on idle pulls makes a compactable large folder quadratic.
+	tombs := []any{}
+	flushTombs := func() error {
+		if len(tombs) == 0 {
+			return nil
+		}
+		q := "INSERT INTO tombstones(id,version) VALUES " + strings.TrimSuffix(strings.Repeat("(?,?),", len(tombs)/2), ",") + " ON CONFLICT(id) DO UPDATE SET version=excluded.version WHERE version!=excluded.version"
+		_, e := stateTx.Exec(q, tombs...)
+		tombs = tombs[:0]
+		return e
+	}
+	for _, row := range delta.Rows {
+		if row.Deleted {
+			tombs = append(tombs, row.PathID, r.tombstones[row.PathID])
+			if len(tombs) == 256 {
+				if e = flushTombs(); e != nil {
+					return e
+				}
+			}
+		}
+	}
+	if e = flushTombs(); e != nil {
+		return e
 	}
 	if _, e = stateTx.Exec("INSERT INTO config(key,value) VALUES('version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", delta.Version); e != nil {
 		return e
@@ -1218,7 +1309,13 @@ func (r *Replica) pull(ctx context.Context, local map[string]LocalFile) error {
 	r.status.Version = r.version
 	r.status.Quarantined = nil
 	for _, row := range r.quarantine {
-		r.status.Quarantined = append(r.status.Quarantined, QuarantinedRow{row.PathID, row.Version})
+		r.status.Quarantined = append(r.status.Quarantined, QuarantinedRow{PathID: row.PathID, Version: row.Version, Path: func() string {
+			m, e := OpenMetadata(r.key, r.folder, row)
+			if e == nil {
+				return m.Path
+			}
+			return ""
+		}()})
 	}
 	sort.Slice(r.status.Quarantined, func(i, j int) bool { return r.status.Quarantined[i].PathID < r.status.Quarantined[j].PathID })
 	r.status.LastSync = time.Now()
@@ -1340,6 +1437,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	p, known := r.byID[row.PathID]
 	i := r.index[p]
 	if row.Deleted {
+		r.tombstones[row.PathID] = max(r.tombstones[row.PathID], row.Version)
 		if !known {
 			return nil
 		}
@@ -1372,7 +1470,16 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 					return e
 				}
 				if e = r.root.Remove(i.Local); e != nil {
-					return e
+					for child, entry := range r.index {
+						if child != p && strings.HasPrefix(entry.Local, i.Local+"/") && !entry.Deleted {
+							return e
+						}
+					}
+					// User-ignored contents survive. The directory becomes untracked.
+					i.Deleted = true
+					i.Hash = ""
+					i.Version = row.Version
+					return r.save(i)
 				}
 				if e = r.syncParent(i.Local); e != nil {
 					return e
@@ -1392,7 +1499,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	}
 	m, e := OpenMetadata(r.key, r.folder, row)
 	if e != nil {
-		return e
+		return fmt.Errorf("%w: %v", ErrIntegrity, e)
 	}
 	p = m.Path
 	for parent := p; parent != "."; parent = path.Dir(parent) {
@@ -1429,7 +1536,10 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			if oe != nil {
 				return oe
 			}
-			e = f.Sync()
+			e = f.Chmod(os.FileMode(m.Mode | 0600))
+			if e == nil {
+				e = f.Sync()
+			}
 			f.Close()
 			if e != nil {
 				return e
@@ -1437,7 +1547,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			if e = r.syncParent(local); e != nil {
 				return e
 			}
-			return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: v.Mode})
+			return r.save(IndexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: m.Mode | 0600})
 		}
 	}
 	if m.Directory {
@@ -1449,10 +1559,11 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			return de
 		}
 		counter := &countWriter{Writer: io.Discard}
-		de = OpenContent(counter, stream, r.key, r.folder, row.BlobID, row.PathID)
+		received := &countReader{Reader: stream}
+		de = OpenContent(counter, received, r.key, r.folder, row.BlobID, row.PathID)
 		stream.Close()
 		if de != nil {
-			return de
+			return storedContentError(de, received.n, row.SealedSize)
 		}
 		if counter.n != 0 {
 			return ErrIntegrity
@@ -1466,6 +1577,15 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 			return e
 		}
 		if e = r.root.Chmod(local, os.FileMode(m.Mode|0700)); e != nil {
+			return e
+		}
+		opened, oe := r.root.Open(local)
+		if oe != nil {
+			return oe
+		}
+		e = opened.Sync()
+		opened.Close()
+		if e != nil {
 			return e
 		}
 		return r.save(IndexEntry{Path: p, Local: local, Hash: "directory", Version: row.Version, Directory: true, Mode: m.Mode | 0700})
@@ -1489,8 +1609,10 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	}
 	h := blake3.New()
 	counter := &countWriter{Writer: io.MultiWriter(f, h)}
-	e = OpenContent(counter, stream, r.key, r.folder, row.BlobID, row.PathID)
+	received := &countReader{Reader: stream}
+	e = OpenContent(counter, received, r.key, r.folder, row.BlobID, row.PathID)
 	stream.Close()
+	e = storedContentError(e, received.n, row.SealedSize)
 	if e == nil && (counter.n != m.Size || fmt.Sprintf("%x", h.Sum(nil)) != m.Hash) {
 		e = ErrIntegrity
 	}
@@ -1668,6 +1790,19 @@ func (r *Replica) localBlocked(p string) bool {
 		p = path.Dir(p)
 		if p == "." {
 			return false
+		}
+	}
+}
+
+func (r *Replica) blockLocal(local string) {
+	r.blockedLocal[r.remotePath(local)] = true
+	if old, ok := r.byFold[foldPath(local)]; ok {
+		r.blockedLocal[old] = true
+	}
+	for parent := path.Dir(local); parent != "."; parent = path.Dir(parent) {
+		if old, ok := r.byFold[foldPath(parent)]; ok {
+			r.blockedLocal[old+strings.TrimPrefix(local, parent)] = true
+			break
 		}
 	}
 }

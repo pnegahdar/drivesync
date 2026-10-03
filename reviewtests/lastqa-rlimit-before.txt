@@ -1,0 +1,6 @@
+--- FAIL: TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes (0.15s)
+    staging_test.go:63: last sync error: write /private/var/folders/09/6_3mqw5x6_z735j77p6zr15c0000gn/T/TestOneUnstageableFileBlocksAllLaterUploadsAndDeletes1636914093/002/.drivesync-state-27d730d59020826a707ceeafaa278b3d-cf4fb6026d48/upload-3615502513: file too large; peer has b-notes.txt=false, deleted c-old.txt still present=true
+    staging_test.go:66: one unstageable file blocked unrelated upload/delete on every sync
+FAIL
+FAIL	github.com/pnegahdar/drivesync/qapublic	0.313s
+FAIL

@@ -26,7 +26,7 @@ func TestForeignFoldersSlowVictimList(t *testing.T) {
 	k := ds.NewFolderKey()
 	// Admit one folder publicly, then retain the exact 20,000-folder scale
 	// through one legal fixture transaction instead of 20,000 durable writes.
-	seed, e := attacker.CreateFolder(bg, ds.FolderSpec{Name: "x0", KeyCheck: ds.KeyCheck(k)})
+	seed, e := ds.CreateFolder(bg, attacker, ds.FolderSpec{Name: "x0"}, k)
 	if e != nil {
 		t.Fatal(e)
 	}

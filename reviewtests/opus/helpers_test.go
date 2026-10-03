@@ -36,7 +36,7 @@ func mkFolder(t testing.TB, c ds.Client, l ds.Limits) (ds.Folder, ds.FolderKey) 
 		l.MaxFileBytes = l.MaxTotalBytes
 	}
 	k := ds.NewFolderKey()
-	f, e := c.CreateFolder(bg, ds.FolderSpec{Name: fmt.Sprint(time.Now().UnixNano()), Limits: l, KeyCheck: ds.KeyCheck(k)})
+	f, e := ds.CreateFolder(bg, c, ds.FolderSpec{Name: fmt.Sprint(time.Now().UnixNano()), Limits: l}, k)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -94,6 +94,9 @@ func write(t testing.TB, dir, p, content string) {
 func files(t testing.TB, dir string) map[string]string {
 	out := map[string]string{}
 	filepath.WalkDir(dir, func(p string, d fs.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil || d.IsDir() {
 			return nil
 		}

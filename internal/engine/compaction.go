@@ -2,29 +2,30 @@ package engine
 
 import (
 	"context"
+	"time"
 )
 
-// CompactTombstones frees deleted rows past the retention horizon. Replicas
-// behind Horizon must reconcile the full current set before publishing writes.
-// A zero TTL disables compaction. CollectGarbage calls this in maintenance only.
+// CompactTombstones selects on the read pool and retires bounded path batches.
 func (s *Server) CompactTombstones(ctx context.Context) error {
 	if s.TombstoneTTL <= 0 {
 		return nil
 	}
-	cutoff := s.now().Add(-s.TombstoneTTL)
-	var folders []string
-	if m, ok := s.Meta.(*SQLiteMetaStore); ok {
-		rows, e := m.reads.QueryContext(ctx, `SELECT DISTINCT folder FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.BlobID')='' AND json_extract(data,'$.DeletedAt')<?`, cutoff.UnixNano())
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cutoff := s.now().Add(-s.TombstoneTTL).UnixNano()
+	candidates := map[string][]string{}
+	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+		rows, e := db.reads.QueryContext(ctx, `SELECT folder,path FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.BlobID')='' AND json_extract(data,'$.DeletedAt')>0 AND json_extract(data,'$.DeletedAt')<?`, cutoff)
 		if e != nil {
 			return e
 		}
 		for rows.Next() {
-			var id string
-			if e = rows.Scan(&id); e != nil {
+			var folder, pid string
+			if e = rows.Scan(&folder, &pid); e != nil {
 				rows.Close()
 				return e
 			}
-			folders = append(folders, id)
+			candidates[folder] = append(candidates[folder], pid)
 		}
 		e = rows.Err()
 		rows.Close()
@@ -32,9 +33,13 @@ func (s *Server) CompactTombstones(ctx context.Context) error {
 			return e
 		}
 	} else {
-		e := s.Meta.Transaction(context.WithValue(ctx, scopeKey{}, Scope{GC: true}), func(m *Metadata) error {
-			for id := range m.Folders {
-				folders = append(folders, id)
+		e := s.Meta.Transaction(context.WithValue(ctx, scopeKey{}, Scope{ReadOnly: true}), func(m *Metadata) error {
+			for folder, rows := range m.Files {
+				for pid, row := range rows {
+					if row.Deleted && row.BlobID == "" && row.DeletedAt > 0 && row.DeletedAt < cutoff {
+						candidates[folder] = append(candidates[folder], pid)
+					}
+				}
 			}
 			return nil
 		})
@@ -42,30 +47,34 @@ func (s *Server) CompactTombstones(ctx context.Context) error {
 			return e
 		}
 	}
-	for _, id := range folders {
-		e := s.Meta.Transaction(context.WithValue(ctx, scopeKey{}, Scope{Folder: id}), func(m *Metadata) error {
-			f, ok := m.Folders[id]
-			if !ok || f.Deleted {
-				return nil
-			}
-			changed := false
-			for pid, row := range m.Files[id] {
-				if row.Deleted && row.BlobID == "" && row.DeletedAt > 0 && row.DeletedAt < cutoff.UnixNano() {
-					delete(m.Files[id], pid)
-					f.Folder.Horizon = max(f.Folder.Horizon, row.Version)
-					changed = true
+	for folder, paths := range candidates {
+		for len(paths) > 0 {
+			batch := paths[:min(len(paths), maintenanceBatch)]
+			paths = paths[len(batch):]
+			e := s.Meta.Transaction(maintenanceScope(ctx, folder, batch, []string{}, []string{}), func(m *Metadata) error {
+				f, ok := m.Folders[folder]
+				if !ok || f.Deleted {
+					return nil
 				}
+				changed := false
+				for pid, row := range m.Files[folder] {
+					if row.Deleted && row.BlobID == "" && row.DeletedAt > 0 && row.DeletedAt < cutoff {
+						delete(m.Files[folder], pid)
+						f.Folder.Horizon = max(f.Folder.Horizon, row.Version)
+						changed = true
+					}
+				}
+				if changed {
+					f.Folder.Version++
+					m.Folders[folder] = f
+				}
+				return nil
+			})
+			if e != nil {
+				return e
 			}
-			if changed {
-				f.Folder.Version++
-				m.Folders[id] = f
-			}
-			return nil
-		})
-		if e != nil {
-			return e
+			s.notify(folder)
 		}
-		s.notify(id)
 	}
 	return nil
 }

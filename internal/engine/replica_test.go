@@ -52,6 +52,9 @@ func filesOn(t testing.TB, r *Replica) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	if e := filepath.WalkDir(r.dir, func(p string, d fs.DirEntry, e error) error {
+		if d != nil && d.Name() == ".drivesync-root" {
+			return nil
+		}
 		if e != nil {
 			return e
 		}
@@ -309,6 +312,8 @@ func TestSeededRandomizedReplicas(t *testing.T) {
 				c := &flakyClient{Client: base, rng: rand.New(rand.NewSource(seed + int64(i)))}
 				cs = append(cs, c)
 				rs = append(rs, replicaFor(t, c, f, k, fmt.Sprint(i), true))
+				// Exercise backoff with a short interval for this deterministic simulation.
+				rs[len(rs)-1].opts.RetryInterval = time.Millisecond
 			}
 			for round := 0; round < 12; round++ {
 				target := fmt.Sprintf("dir%d/file%d.txt", rng.Intn(3), round%4)
@@ -405,6 +410,7 @@ func TestInterruptedDownloadAndLostCommitAck(t *testing.T) {
 	put(t, base, f, k, "file", 0, bytes.Repeat([]byte("x"), ChunkSize+10))
 	c := &interruptedDownload{base, true}
 	r := replicaFor(t, c, f, k, "r", true)
+	r.opts.RetryInterval = time.Nanosecond
 	if e := r.Sync(context.Background()); e == nil {
 		t.Fatal("interruption accepted")
 	}

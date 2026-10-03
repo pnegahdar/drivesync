@@ -12,17 +12,20 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type FolderRecord struct {
-	Folder    Folder
-	Grants    map[string]Role `json:"-"`
-	Allocated bool
-	Deleted   bool
-	FileUsage Usage
+	AuthEpoch     string
+	Folder        Folder
+	Grants        map[string]Role `json:"-"`
+	Allocated     bool
+	Deleted       bool
+	FileUsage     Usage
+	TransferUsage Usage
 }
 type Garbage struct {
 	FolderID, BlobID string
@@ -31,15 +34,17 @@ type Garbage struct {
 	Writing          bool
 }
 type Metadata struct {
-	Folders     map[string]FolderRecord
-	Files       map[string]map[string]Row
-	Tickets     map[string]Ticket
-	Garbage     map[string]Garbage
-	Accounts    map[string]Account
-	selected    map[string]Usage
-	baseline    map[string]Account
-	filesLoaded bool
-	ctx         context.Context
+	Folders           map[string]FolderRecord
+	Files             map[string]map[string]Row
+	Tickets           map[string]Ticket
+	Garbage           map[string]Garbage
+	Accounts          map[string]Account
+	selected          map[string]Usage
+	baseline          map[string]Account
+	filesLoaded       bool
+	transfersPartial  bool
+	selectedTransfers map[string]Usage
+	ctx               context.Context
 }
 
 func newMetadata() *Metadata {
@@ -88,8 +93,9 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner,json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`,
-		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder)`,
-		`CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(folder)`,
+		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder,id)`,
+		`CREATE INDEX IF NOT EXISTS tickets_path ON tickets(folder,json_extract(data,'$.PathID'))`,
+		`CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(folder,id)`,
 		`CREATE INDEX IF NOT EXISTS files_version ON files(folder,json_extract(data,'$.Version'),path)`,
 		`CREATE INDEX IF NOT EXISTS files_tombstones ON files(json_extract(data,'$.DeletedAt'),folder) WHERE json_extract(data,'$.Deleted')=1`,
 		`CREATE INDEX IF NOT EXISTS files_blob ON files(folder,json_extract(data,'$.BlobID'))`,
@@ -147,13 +153,18 @@ func (s *SQLiteMetaStore) Close() error {
 // NoFiles/GC is set. ReadOnly callbacks are read snapshots without accounting
 // updates or a writer lock.
 type Scope struct {
-	Principal Principal
-	Folder    string
-	Create    bool
-	GC        bool
-	NoFiles   bool
-	ReadOnly  bool
-	Paths     []string
+	TicketPaths []string
+	Principal   Principal
+	Folder      string
+	Create      bool
+	GC          bool
+	NoFiles     bool
+	ReadOnly    bool
+	Paths       []string
+	Tickets     []string
+	Garbage     []string
+	Write       bool
+	Owner       bool
 }
 type scopeKey struct{}
 
@@ -167,6 +178,13 @@ func ScopeFromContext(ctx context.Context) (Scope, bool) {
 func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) error) error {
 	// BEGIN's first write acquires the SQLite writer lock before reading any accounting.
 	scope, scoped := ScopeFromContext(ctx)
+	if scoped && !scope.ReadOnly && scope.Folder != "" && scope.Principal.valid() {
+		if role, e := sqlRole(ctx, s.reads, scope.Principal, scope.Folder, scope.Write); e != nil {
+			return e
+		} else if scope.Owner && role != Owner {
+			return ErrDenied
+		}
+	}
 	pool := s.db
 	if scope.ReadOnly {
 		pool = s.reads
@@ -235,6 +253,34 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 				}
 			} else {
 				q += ` WHERE folder IN (SELECT id FROM folders WHERE ` + filter + ")"
+			}
+		}
+		if scoped && !scope.GC && (table == "tickets" || table == "garbage") {
+			ids := scope.Tickets
+			if table == "garbage" {
+				ids = scope.Garbage
+			}
+			if table == "tickets" && scope.TicketPaths != nil && ids == nil {
+				m.transfersPartial = true
+				if len(scope.TicketPaths) == 0 {
+					q += " AND 0"
+				} else {
+					q += " AND json_extract(data,'$.PathID') IN (" + strings.TrimSuffix(strings.Repeat("?,", len(scope.TicketPaths)), ",") + ")"
+					for _, pid := range scope.TicketPaths {
+						args = append(args, pid)
+					}
+				}
+			}
+			if ids != nil {
+				m.transfersPartial = true
+				if len(ids) == 0 {
+					q += " AND 0"
+				} else {
+					q += " AND id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + ")"
+					for _, id := range ids {
+						args = append(args, id)
+					}
+				}
 			}
 		}
 		rs, e := tx.QueryContext(ctx, q, args...)
@@ -306,6 +352,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 
 	}
 	if scoped && scope.ReadOnly {
+		m.Prepare(m.filesLoaded)
 		m.ctx = ctx
 		return fn(m)
 	}
@@ -446,6 +493,9 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 				args = []any{id[:32], id[33:], b}
 			case "folders":
 				query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
+				if _, exists := old[table][id]; !exists {
+					query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?)"
+				}
 				args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
 			case "grants":
 				query = "INSERT INTO grants(folder,principal,data) VALUES(?,?,?) ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
@@ -613,7 +663,16 @@ func (b *DirectoryBlobStore) Put(ctx context.Context, f, id string, r io.Reader)
 		return 0, e
 	}
 	temp := filepath.Join(f, ".upload-"+id)
-	w, e := b.root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	var w *os.File
+	for attempt := 0; attempt < 3; attempt++ {
+		w, e = b.root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if !errors.Is(e, os.ErrNotExist) {
+			break
+		}
+		if e = durableMkdirAll(b.root, f); e != nil {
+			return 0, e
+		}
+	}
 	if e != nil {
 		return 0, e
 	}
@@ -684,8 +743,23 @@ func (b *DirectoryBlobStore) Delete(ctx context.Context, f, id string) error {
 	if e != nil {
 		return e
 	}
-	defer d.Close()
-	return syncDirectoryFile(d)
+	e = syncDirectoryFile(d)
+	d.Close()
+	if e != nil {
+		return e
+	}
+	if e = b.root.Remove(f); e != nil {
+		if errors.Is(e, os.ErrNotExist) || errors.Is(e, syscall.ENOTEMPTY) || errors.Is(e, syscall.EEXIST) {
+			return nil
+		}
+		return e
+	}
+	parent, e := b.root.Open(".")
+	if e != nil {
+		return e
+	}
+	defer parent.Close()
+	return syncDirectoryFile(parent)
 }
 
 type contextReader struct {
@@ -740,6 +814,13 @@ func (s *SQLiteMetaStore) authorize(ctx context.Context, p Principal, id string,
 			return t, e
 		}
 		if t.FolderID != id || t.Principal != p {
+			return Ticket{}, ErrDenied
+		}
+		var epoch string
+		if e := s.reads.QueryRowContext(ctx, "SELECT COALESCE(json_extract(data,'$.AuthEpoch'),'') FROM folders WHERE id=?", id).Scan(&epoch); e != nil {
+			return Ticket{}, ErrDenied
+		}
+		if t.AuthEpoch != epoch {
 			return Ticket{}, ErrDenied
 		}
 		if !t.Expires.After(now) {

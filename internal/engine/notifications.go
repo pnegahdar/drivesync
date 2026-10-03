@@ -8,25 +8,27 @@ type folderWake struct {
 	refs int
 }
 type notifications struct {
+	creationKey FolderKey
 	publication sync.RWMutex
 	running     bool
+	active      map[string]bool
 	mu          sync.Mutex
 	folders     map[string]*folderWake
 	principals  map[string]int
 }
 
 func newNotifications() *notifications {
-	return &notifications{folders: map[string]*folderWake{}, principals: map[string]int{}}
+	return &notifications{creationKey: NewFolderKey(), active: map[string]bool{}, folders: map[string]*folderWake{}, principals: map[string]int{}}
 }
 
-const MaxWaitsPerPrincipal = 32
+const MaxWaitsPerPrincipal = 256
 
 func (n *notifications) acquire(p Principal, id string) (func(), error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	key := principalKey(p)
 	if n.principals[key] >= MaxWaitsPerPrincipal {
-		return nil, ErrBusy
+		return nil, ErrWaitLimit
 	}
 	n.principals[key]++
 	w := n.folders[id]
@@ -108,3 +110,5 @@ func sqliteNotifications(name string) (*notifications, func()) {
 		}
 	}
 }
+
+func (n *notifications) live(key string) bool { n.mu.Lock(); defer n.mu.Unlock(); return n.active[key] }
