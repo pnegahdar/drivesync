@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Same livelock without any injected hook: a 60k-row folder over HTTP (120

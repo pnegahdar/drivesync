@@ -1,4 +1,4 @@
-package drivesync
+package engine
 
 import (
 	"bytes"
@@ -499,7 +499,7 @@ func BenchmarkScan10K(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		v, e := r.scan()
+		v, e := r.ScanLocal()
 		if e != nil || len(v) != 10100 {
 			b.Fatal(len(v), e)
 		}
@@ -609,16 +609,16 @@ func BenchmarkIndexedScan10K(b *testing.B) {
 	for i := 0; i < 10000; i++ {
 		writeLocal(b, r, fmt.Sprintf("dir%d/file%d", i/100, i), "small file")
 	}
-	scanned, e := r.scan()
+	scanned, e := r.ScanLocal()
 	if e != nil {
 		b.Fatal(e)
 	}
 	for _, v := range scanned {
-		r.remember(indexEntry{Path: v.Path, Local: v.Local, Hash: v.Hash, Directory: v.Directory, Mode: v.Mode, Version: 1})
+		r.Remember(IndexEntry{Path: v.Path, Local: v.Local, Hash: v.Hash, Directory: v.Directory, Mode: v.Mode, Version: 1})
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		v, e := r.scan()
+		v, e := r.ScanLocal()
 		if e != nil || len(v) != 10100 {
 			b.Fatal(len(v), e)
 		}

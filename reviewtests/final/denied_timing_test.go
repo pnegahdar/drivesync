@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Revoked principal timing: existing-with-grants vs deleted/nonexistent folder.

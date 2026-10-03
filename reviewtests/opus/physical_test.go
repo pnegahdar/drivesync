@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Reserve -> Upload -> CancelUpload frees the logical reservation but keeps the

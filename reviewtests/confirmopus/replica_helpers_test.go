@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 type rep struct {

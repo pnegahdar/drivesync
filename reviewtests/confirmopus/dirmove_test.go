@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Moving one directory of N files is O(N^2): rename detection loops over every

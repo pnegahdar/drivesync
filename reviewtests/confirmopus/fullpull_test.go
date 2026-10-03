@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // compactingClient runs background compaction exactly when the replica issues

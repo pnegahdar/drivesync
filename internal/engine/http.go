@@ -1,4 +1,4 @@
-package drivesync
+package engine
 
 import (
 	"bytes"
@@ -16,7 +16,7 @@ import (
 )
 
 type Authenticator func(*http.Request) (Principal, error)
-type wireRequest struct {
+type WireRequest struct {
 	Op, Folder, Ticket, Blob string
 	Spec                     FolderSpec
 	Grantee                  Principal
@@ -111,7 +111,7 @@ func decodeError(e *wireError) error {
 	}
 	return errors.New("drivesync transport error")
 }
-func decodeWire(r io.Reader, v any) error {
+func DecodeWire(r io.Reader, v any) error {
 	b, e := io.ReadAll(io.LimitReader(r, (1<<20)+1))
 	if e != nil || len(b) > 1<<20 {
 		return ErrInvalid
@@ -157,8 +157,8 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 		}
 		c := s.Client(p)
 		if r.URL.Path == "/rpc" && r.Method == http.MethodPost {
-			var req wireRequest
-			if e = decodeWire(http.MaxBytesReader(w, r.Body, 1<<20), &req); e != nil {
+			var req WireRequest
+			if e = DecodeWire(http.MaxBytesReader(w, r.Body, 1<<20), &req); e != nil {
 				reply(wireResponse{}, e)
 				return
 			}
@@ -258,7 +258,7 @@ func (c *HTTPClient) request(ctx context.Context, method, path string, body io.R
 	}
 	return client.Do(r)
 }
-func (c *HTTPClient) rpc(ctx context.Context, in wireRequest) (wireResponse, error) {
+func (c *HTTPClient) rpc(ctx context.Context, in WireRequest) (wireResponse, error) {
 	var out wireResponse
 	b, e := json.Marshal(in)
 	if e != nil {
@@ -281,49 +281,49 @@ func (c *HTTPClient) rpc(ctx context.Context, in wireRequest) (wireResponse, err
 	return out, nil
 }
 func (c *HTTPClient) CreateFolder(x context.Context, v FolderSpec) (Folder, error) {
-	r, e := c.rpc(x, wireRequest{Op: "create", Spec: v})
+	r, e := c.rpc(x, WireRequest{Op: "create", Spec: v})
 	return r.Folder, e
 }
 func (c *HTTPClient) Grant(x context.Context, id string, p Principal, r Role) error {
 	if !p.valid() {
 		return ErrInvalid
 	}
-	_, e := c.rpc(x, wireRequest{Op: "grant", Folder: id, Grantee: p, Role: r})
+	_, e := c.rpc(x, WireRequest{Op: "grant", Folder: id, Grantee: p, Role: r})
 	return e
 }
 func (c *HTTPClient) Revoke(x context.Context, id string, p Principal) error {
 	if !p.valid() {
 		return ErrInvalid
 	}
-	_, e := c.rpc(x, wireRequest{Op: "revoke", Folder: id, Grantee: p})
+	_, e := c.rpc(x, WireRequest{Op: "revoke", Folder: id, Grantee: p})
 	return e
 }
 func (c *HTTPClient) DeleteFolder(x context.Context, id string) error {
-	_, e := c.rpc(x, wireRequest{Op: "delete", Folder: id})
+	_, e := c.rpc(x, WireRequest{Op: "delete", Folder: id})
 	return e
 }
 func (c *HTTPClient) SetLimits(x context.Context, id string, l Limits) error {
-	_, e := c.rpc(x, wireRequest{Op: "limits", Folder: id, Limits: l})
+	_, e := c.rpc(x, WireRequest{Op: "limits", Folder: id, Limits: l})
 	return e
 }
 func (c *HTTPClient) ListFolders(x context.Context) ([]Folder, error) {
-	r, e := c.rpc(x, wireRequest{Op: "list"})
+	r, e := c.rpc(x, WireRequest{Op: "list"})
 	return r.Folders, e
 }
 func (c *HTTPClient) GetFolder(x context.Context, id string) (Folder, error) {
-	r, e := c.rpc(x, wireRequest{Op: "get", Folder: id})
+	r, e := c.rpc(x, WireRequest{Op: "get", Folder: id})
 	return r.Folder, e
 }
 func (c *HTTPClient) Reserve(x context.Context, id string, r UploadRequest) (Ticket, error) {
-	v, e := c.rpc(x, wireRequest{Op: "reserve", Folder: id, Upload: r})
+	v, e := c.rpc(x, WireRequest{Op: "reserve", Folder: id, Upload: r})
 	return v.Ticket, e
 }
 func (c *HTTPClient) CancelUpload(x context.Context, id, tid string) error {
-	_, e := c.rpc(x, wireRequest{Op: "cancel", Folder: id, Ticket: tid})
+	_, e := c.rpc(x, WireRequest{Op: "cancel", Folder: id, Ticket: tid})
 	return e
 }
 func (c *HTTPClient) Commit(x context.Context, id string, m []Mutation) (Delta, error) {
-	v, e := c.rpc(x, wireRequest{Op: "commit", Folder: id, Mutations: m})
+	v, e := c.rpc(x, WireRequest{Op: "commit", Folder: id, Mutations: m})
 	return v.Delta, e
 }
 func (c *HTTPClient) Changes(x context.Context, id string, v uint64) (Delta, error) {
@@ -331,7 +331,7 @@ func (c *HTTPClient) Changes(x context.Context, id string, v uint64) (Delta, err
 	page := ""
 	until := uint64(0)
 	for {
-		r, e := c.rpc(x, wireRequest{Op: "changes", Folder: id, After: v, Until: until, Page: page})
+		r, e := c.rpc(x, WireRequest{Op: "changes", Folder: id, After: v, Until: until, Page: page})
 		if e != nil {
 			return Delta{}, e
 		}
@@ -391,7 +391,7 @@ func validJSONString(b []byte) bool {
 	return true
 }
 func (c *HTTPClient) Wait(x context.Context, id string, v uint64) (uint64, error) {
-	r, e := c.rpc(x, wireRequest{Op: "wait", Folder: id, After: v})
+	r, e := c.rpc(x, WireRequest{Op: "wait", Folder: id, After: v})
 	return r.Version, e
 }
 func (c *HTTPClient) Upload(x context.Context, id string, t Ticket, body io.Reader) error {

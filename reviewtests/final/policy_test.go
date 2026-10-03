@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Finding: GetFolder/ListFolders consult pricing policy for the primary owner of

@@ -1,7 +1,7 @@
 package finalreview
 
 import (
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 	"os"
 	"path/filepath"
 	"strings"

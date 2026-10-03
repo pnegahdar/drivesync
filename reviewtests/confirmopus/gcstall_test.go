@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // With the documented RunGC(ctx, time.Second) worker and ~6,000 owners (one

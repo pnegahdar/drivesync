@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A network blip during commit leaves the replica's own reservation behind. The

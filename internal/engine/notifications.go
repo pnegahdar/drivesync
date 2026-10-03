@@ -1,4 +1,4 @@
-package drivesync
+package engine
 
 import "sync"
 
@@ -8,9 +8,11 @@ type folderWake struct {
 	refs int
 }
 type notifications struct {
-	mu         sync.Mutex
-	folders    map[string]*folderWake
-	principals map[string]int
+	publication sync.RWMutex
+	running     bool
+	mu          sync.Mutex
+	folders     map[string]*folderWake
+	principals  map[string]int
 }
 
 func newNotifications() *notifications {

@@ -6,7 +6,7 @@ import (
 	"math"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // With default (unlimited) limits, a writer on one shared folder parks four huge

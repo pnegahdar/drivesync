@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A cross-tenant writer's reservation latency tracks the size of the owner's

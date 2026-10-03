@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 type abortAfter struct {

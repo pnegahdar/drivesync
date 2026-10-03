@@ -1,6 +1,6 @@
 //go:build darwin
 
-package drivesync
+package engine
 
 import (
 	"context"

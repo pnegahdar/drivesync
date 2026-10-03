@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Replica b has an ignored file (.DS_Store, created by Finder on any macOS

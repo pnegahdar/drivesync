@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 func transportClient(t *testing.T, s *ds.Server, http bool, p ds.Principal) ds.Client {

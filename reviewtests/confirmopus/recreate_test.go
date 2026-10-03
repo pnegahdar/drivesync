@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // An up-to-date replica that observed a deletion keeps the tombstone version in

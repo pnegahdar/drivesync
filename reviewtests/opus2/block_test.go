@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // slowDelete models an object store whose deletes take ~100ms (S3-like).

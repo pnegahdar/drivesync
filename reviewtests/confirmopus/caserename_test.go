@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 func putDir(t testing.TB, c ds.Client, f ds.Folder, k ds.FolderKey, p string, base uint64, extra ...ds.Mutation) ds.Delta {

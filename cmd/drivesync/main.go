@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	ds "github.com/pnegahdar/drivesync"
 	"log"
 	"net/http"
@@ -57,7 +56,11 @@ func main() {
 			if e != nil {
 				log.Fatal(e)
 			}
-			fmt.Println(string(b))
+			status, e := decodeStatus(b)
+			if e != nil {
+				log.Fatal(e)
+			}
+			printJSON(status)
 			return
 		}
 		if token == "" {
@@ -88,14 +91,22 @@ func main() {
 			log.Fatal(e)
 		}
 		defer blobs.Close()
-		server := ds.NewServer(meta, blobs)
-		if e = server.RecoverUploads(ctx); e != nil {
-			log.Fatal(e)
-		}
-		gcCtx, stopGC := context.WithCancel(ctx)
-		gcDone := make(chan struct{})
-		go func() { defer close(gcDone); server.RunGC(gcCtx, time.Second) }()
-		defer func() { stopGC(); <-gcDone }()
+		server := ds.NewServer(meta, blobs, ds.ServerOptions{})
+		runCtx, stopRun := context.WithCancel(ctx)
+		runDone := make(chan error, 1)
+		go func() {
+			e := server.Run(runCtx)
+			runDone <- e
+			if e != nil && !errors.Is(e, context.Canceled) {
+				cancel()
+			}
+		}()
+		defer func() {
+			stopRun()
+			if e := <-runDone; e != nil && !errors.Is(e, context.Canceled) {
+				log.Printf("maintenance: %v", e)
+			}
+		}()
 		httpServer := &http.Server{Addr: *addr, Handler: server.Handler(func(r *http.Request) (ds.Principal, error) {
 			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
 				return ds.Principal{}, ds.ErrDenied
@@ -135,7 +146,7 @@ func main() {
 	}
 	switch command {
 	case "create":
-		f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: *name, Description: *description, Limits: ds.Limits{MaxFileBytes: *maxFile, MaxTotalBytes: *maxTotal, MaxFiles: *maxFiles, MaxRows: *maxRows}, KeyCheck: ds.KeyCheck(key)})
+		f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: *name, Description: *description, Limits: ds.Limits{MaxFileBytes: *maxFile, MaxTotalBytes: *maxTotal, MaxFiles: *maxFiles, MaxRows: *maxRows}}, key)
 		if e != nil {
 			log.Fatal(e)
 		}
@@ -163,4 +174,21 @@ func main() {
 	default:
 		log.Fatal("unknown command")
 	}
+}
+
+// The persisted record contains private recovery state as well as status.
+func decodeStatus(b []byte) (ds.Status, error) {
+	var stored struct {
+		ds.Status
+		Quarantined []struct{ PathID string }
+		Skipped     []string
+	}
+	if e := json.Unmarshal(b, &stored); e != nil {
+		return ds.Status{}, e
+	}
+	for _, row := range stored.Quarantined {
+		stored.Status.Quarantined = append(stored.Status.Quarantined, row.PathID)
+	}
+	stored.Status.Errors = append(stored.Status.Errors, stored.Skipped...)
+	return stored.Status, nil
 }

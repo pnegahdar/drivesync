@@ -1,4 +1,4 @@
-package drivesync
+package engine
 
 // Account is a durable quota counter, updated with the selected folder delta.
 type Account struct{ Bytes, Rows, Folders int64 }

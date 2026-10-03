@@ -3,7 +3,7 @@ package dsreview
 import (
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Benign race: A creates file "notes" while B creates "notes/todo.txt". After B

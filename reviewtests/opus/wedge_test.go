@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A writer that never received the folder key commits one row with garbage

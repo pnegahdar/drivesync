@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Tickets bind a principal, not a replica. Reserve's pre-transaction retires

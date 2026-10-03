@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Grants need no consent and a grantee cannot leave a folder. N distinct owners

@@ -1,22 +1,17 @@
-// Package drivesync synchronizes encrypted shared folders to ordinary local directories.
+// Package drivesync shares encrypted folders through ordinary local directories.
+// Create a folder with a name and a key, then attach it wherever files are needed.
 package drivesync
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"errors"
 	"fmt"
-	"io"
 	"time"
-	"unicode/utf8"
+
+	"github.com/pnegahdar/drivesync/internal/engine"
 )
 
+// Principal is an opaque identity supplied by the embedding authenticator.
 type Principal struct{ Tenant, Subject string }
-
-func (p Principal) valid() bool {
-	return p.Tenant != "" && p.Subject != "" && len(p.Tenant) <= 256 && len(p.Subject) <= 256 && utf8.ValidString(p.Tenant) && utf8.ValidString(p.Subject)
-}
 
 type Role string
 
@@ -27,148 +22,77 @@ const (
 )
 
 var (
-	ErrDenied    = errors.New("not found or access denied")
-	ErrBusy      = errors.New("path has an active upload")
-	ErrExpired   = errors.New("upload reservation expired")
-	ErrQuota     = errors.New("owner quota limit")
-	ErrConflict  = errors.New("version conflict")
-	ErrInvalid   = errors.New("invalid request")
-	ErrKey       = errors.New("incorrect folder key")
-	ErrIntegrity = errors.New("encrypted data integrity failure")
+	ErrDenied    = engine.ErrDenied
+	ErrBusy      = engine.ErrBusy
+	ErrExpired   = engine.ErrExpired
+	ErrQuota     = engine.ErrQuota
+	ErrConflict  = engine.ErrConflict
+	ErrInvalid   = engine.ErrInvalid
+	ErrKey       = engine.ErrKey
+	ErrIntegrity = engine.ErrIntegrity
 )
 
+// LimitError identifies a folder limit that rejected an operation.
 type LimitError struct {
 	Limit              string
 	Maximum, Requested int64
+	cause              error
 }
 
 func (e *LimitError) Error() string {
+	if e.cause != nil {
+		return e.cause.Error()
+	}
 	return fmt.Sprintf("%s limit: %d requested, %d limit", e.Limit, e.Requested, e.Maximum)
 }
+func (e *LimitError) Unwrap() error { return e.cause }
 
+// Limits bounds sealed bytes, live entries and retained rows. Zero is unlimited
+// except MaxRows, which selects a bounded safety budget. Sharing requires explicit
+// positive byte, row and file caps. Bytes include encryption and metadata overhead.
 type Limits struct{ MaxFileBytes, MaxTotalBytes, MaxFiles, MaxRows int64 }
-type Quota struct{ MaxTotalBytes, MaxFolders, MaxFileBytes, MaxFiles int64 }
 
-// Zero limits mean unlimited; negative values are invalid. Bytes are sealed bytes.
+// Quota is an owner's plan. MaxFiles bounds retained rows across their folders.
+type Quota struct{ MaxTotalBytes, MaxFolders, MaxFileBytes, MaxFiles int64 }
 type QuotaPolicy interface {
 	Quota(context.Context, Principal) (Quota, error)
 }
 type QuotaFunc func(context.Context, Principal) (Quota, error)
 
-func (f QuotaFunc) Quota(c context.Context, p Principal) (Quota, error) { return f(c, p) }
+func (f QuotaFunc) Quota(ctx context.Context, p Principal) (Quota, error) { return f(ctx, p) }
 
-type Usage struct{ Bytes, Files, Rows, Reserved, ReservedFiles, ReservedRows, GarbageRows int64 }
+type FolderKey [32]byte
+
+func NewFolderKey() FolderKey { return FolderKey(engine.NewFolderKey()) }
+
+type Usage struct{ Bytes, Files, Reserved int64 }
 type FolderSpec struct {
 	Name, Description string
 	Limits            Limits
-	KeyCheck          []byte
 }
 type Folder struct {
 	ID                string
-	Owner             Principal
 	Name, Description string
-	Limits            Limits
-	KeyCheck          []byte
-	Version           uint64
-	Horizon           uint64
-	Usage             Usage
+	Owner             Principal
 	Role              Role
-}
-type Row struct {
-	FolderID, PathID, BlobID string
-	Version                  uint64
-	SealedSize               int64
-	Metadata                 []byte
-	Deleted                  bool
-	DeletedAt                int64
-}
-type UploadRequest struct {
-	// SessionID identifies one replica state directory (random 128-bit hex).
-	// Only the same principal/session can replace its previous ticket; empty or
-	// different sessions get ErrBusy. This is contention control, not a grant.
-	SessionID     string
-	PathID        string
-	BaseVersion   uint64
-	SealedSize    int64
-	MetadataBytes int64
-}
-type Ticket struct {
-	SessionID                                string
-	ID, FolderID, BlobID, PathID             string
-	Principal                                Principal
-	BaseVersion                              uint64
-	SealedSize, ReservedBytes, ReservedFiles int64
-	ReservedRows                             int64
-	Expires                                  time.Time
-	Uploaded                                 bool
-	Writing                                  bool
-}
-type Mutation struct {
-	PathID      string
-	BaseVersion uint64
-	TicketID    string
-	Metadata    []byte
-	Deleted     bool
-}
-type Delta struct {
-	Full    bool
-	Horizon uint64
-	Next    string `json:",omitempty"`
-	Version uint64
-	Rows    []Row
+	Limits            Limits
+	Usage             Usage
 }
 
-// ConflictError identifies only the paths whose bases are stale.
-type ConflictError struct{ Paths []string }
-
-func (e *ConflictError) Error() string { return ErrConflict.Error() }
-func (e *ConflictError) Unwrap() error { return ErrConflict }
-
-const RowCost int64 = 256
-const MaxRequestBytes int64 = 1 << 50
-const MaxGrants = 256
-
-type Event struct {
-	Version uint64
-	Err     error
+// Options configures a local replica. StateDir must be outside the synced tree.
+// Manual disables automatic sync; Sync remains available explicitly.
+type Options struct {
+	Name, StateDir                          string
+	Debounce, RescanInterval, RetryInterval time.Duration
+	Ignore                                  []string
+	Manual                                  bool
 }
-
-// Client is an authenticated transport. Server authorization is independent of transport.
-type Client interface {
-	CreateFolder(context.Context, FolderSpec) (Folder, error)
-	Grant(context.Context, string, Principal, Role) error
-	Revoke(context.Context, string, Principal) error
-	DeleteFolder(context.Context, string) error
-	SetLimits(context.Context, string, Limits) error
-	ListFolders(context.Context) ([]Folder, error)
-	GetFolder(context.Context, string) (Folder, error)
-	Reserve(context.Context, string, UploadRequest) (Ticket, error)
-	Upload(context.Context, string, Ticket, io.Reader) error
-	CancelUpload(context.Context, string, string) error
-	Commit(context.Context, string, []Mutation) (Delta, error)
-	Changes(context.Context, string, uint64) (Delta, error)
-	Download(context.Context, string, string) (io.ReadCloser, error)
-	Wait(context.Context, string, uint64) (uint64, error)
-}
-
-func randomID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(b[:])
-}
-func validID(s string) bool     { b, e := hex.DecodeString(s); return e == nil && len(b) == 16 }
-func validPathID(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
-func validLimits(l Limits) bool {
-	return l.MaxFileBytes >= 0 && l.MaxTotalBytes >= 0 && l.MaxFiles >= 0 && l.MaxRows >= 0
-}
-func minimum(a, b int64) int64 {
-	if a == 0 {
-		return b
-	}
-	if b == 0 || a < b {
-		return a
-	}
-	return b
+type Rejection struct{ Path, Reason string }
+type Status struct {
+	PendingUpBytes, PendingDownBytes int64
+	Conflicts                        []string
+	Rejected                         []Rejection
+	Quarantined                      []string
+	LastSync                         time.Time
+	Errors                           []string
 }

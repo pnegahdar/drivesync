@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // On a case-insensitive volume, a case-only rename is never propagated as a delete

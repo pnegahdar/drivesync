@@ -2,7 +2,7 @@ package dsreview2
 
 import (
 	"errors"
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 	"os"
 	"path/filepath"
 	"testing"

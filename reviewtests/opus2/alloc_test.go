@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // After a plan downgrade, the primary owner can no longer revoke a cross-tenant

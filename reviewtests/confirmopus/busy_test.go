@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // busyClient models a folder that receives one commit while a full listing is

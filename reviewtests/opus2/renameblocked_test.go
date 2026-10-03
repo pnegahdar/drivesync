@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A tracked file inside a directory that became unreadable is "missing" to

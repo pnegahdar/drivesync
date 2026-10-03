@@ -111,3 +111,16 @@ Confirmation-review invariants:
 - Build rename hash/fold maps once per sync, batch pairs, remove ignored-only
   directory contents and retry deletes while tracked children remain. Measure
   scaling with unchanged record counts, including under the race detector.
+
+Public API rules:
+
+- Keep replication/crypto/accounting records inside internal/engine. Public
+  clients only manage folders and attach replicas; compute key checks locally.
+- Keep Folder, Usage and Status focused on agent-visible decisions. Configure
+  authority policy/clock/TTLs in ServerOptions and expose maintenance only as Run.
+- Metadata is concrete SQLite. BlobStore and QuotaPolicy remain pluggable; do not
+  expose transaction types to add extension points.
+- Preserve protocol/adversarial tests in internal/engine and reviewtests. Keep
+  root fuzz/benchmark adapters so the documented commands exercise real code.
+  Cross-build internal/engine's tests as well as the public package. Real native
+  watcher integration is TestWatcherPropagation in internal/engine.

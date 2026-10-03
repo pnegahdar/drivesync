@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // The owner's plan allows 4 KiB of sealed bytes, yet the owner stores ~4 MiB of

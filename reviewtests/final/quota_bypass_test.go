@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 const plan = 1 << 20

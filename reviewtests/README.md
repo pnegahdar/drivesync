@@ -59,3 +59,8 @@ allows two seconds for the surviving upload to publish before releasing the
 barrier; it still fails on the old cancellation/livelock behavior. Root
 `confirmation_test.go` adds allocation/time scaling, selected-path loading,
 reads during a held writer, and future-base rejection controls.
+
+After API simplification, adversarial fixtures import `internal/engine`; all
+existing assertions and cardinalities remain. Original private tests moved to
+`internal/engine`, while root `api_test.go` verifies the reduced public facade.
+Before-log source paths refer to the historical root layout.

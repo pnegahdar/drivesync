@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A keyed peer publishes a file with mode 0000 (or a local user chmods one file).

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 type failingDeletes struct{ *ds.MemoryBlobStore }

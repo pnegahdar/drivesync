@@ -1,4 +1,4 @@
-package drivesync
+package engine
 
 import (
 	"context"
@@ -373,4 +373,34 @@ func (s *Server) RecoverUploads(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// Run recovers interrupted publications, then performs background collection
+// and compaction. Only one authority process may publish to these stores.
+func (s *Server) Run(ctx context.Context, interval time.Duration) error {
+	s.wakes.mu.Lock()
+	if s.wakes.running {
+		s.wakes.mu.Unlock()
+		return ErrBusy
+	}
+	s.wakes.running = true
+	s.wakes.mu.Unlock()
+	defer func() { s.wakes.mu.Lock(); s.wakes.running = false; s.wakes.mu.Unlock() }()
+	// Recovery must not race an active publication in this process. The wait
+	// honors cancellation and never queries SQLite while a stream is flowing.
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for !s.wakes.publication.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+	e := s.RecoverUploads(ctx)
+	s.wakes.publication.Unlock()
+	if e != nil {
+		return e
+	}
+	return s.RunGC(ctx, interval)
 }

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 func randPID() string { var b [32]byte; rand.Read(b[:]); return hex.EncodeToString(b[:]) }

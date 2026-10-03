@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // In a full folder, renaming a file deletes the old path everywhere while the

@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 	"github.com/zeebo/blake3"
 )
 

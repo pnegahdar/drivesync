@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // CollectGarbage's global transaction calls Metadata.Finish, which recomputes

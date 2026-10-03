@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // A cross-tenant writer on ONE shared folder learns the owner's total usage across

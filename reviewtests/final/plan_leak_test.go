@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	ds "github.com/pnegahdar/drivesync"
+	ds "github.com/pnegahdar/drivesync/internal/engine"
 )
 
 // Grantees read the owner's plan per-file cap from the folder limits when the
