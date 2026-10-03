@@ -1,0 +1,7 @@
+*.test
+/server-data/
+/drivesync-data/
+/a/
+/b/
+/a-state/
+/b-state/
