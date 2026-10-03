@@ -970,6 +970,57 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 	return out, nil
 }
 
+// listFolders returns the caller's folders from the principal grant index.
+// Usage is the same cache ListFolders shows when no file, ticket, or garbage
+// rows are loaded: file totals plus this folder's transfer counters.
+func (s *SQLiteMetaStore) listFolders(ctx context.Context, p Principal) ([]Folder, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rows, e := s.reads.QueryContext(ctx, `
+SELECT f.data, g.data
+FROM grants g
+JOIN folders f ON f.id = g.folder
+WHERE g.principal = ?
+ORDER BY f.id`, principalKey(p))
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := []Folder{}
+	for rows.Next() {
+		var folderData, roleData []byte
+		if e = rows.Scan(&folderData, &roleData); e != nil {
+			return nil, e
+		}
+		var f FolderRecord
+		var role Role
+		if e = json.Unmarshal(folderData, &f); e != nil {
+			return nil, e
+		}
+		if e = json.Unmarshal(roleData, &role); e != nil {
+			return nil, e
+		}
+		if f.Deleted {
+			continue
+		}
+		if p == f.Folder.Owner {
+			role = Owner
+		}
+		if role != Owner && role != Writer && role != Reader {
+			continue
+		}
+		v := f.Folder
+		u := f.FileUsage
+		extra := f.TransferUsage
+		u.Bytes = sat(u.Bytes, extra.Bytes)
+		u.Reserved, u.ReservedFiles, u.ReservedRows, u.GarbageRows = extra.Reserved, extra.ReservedFiles, extra.ReservedRows, extra.GarbageRows
+		v.Usage = u
+		v.Role = role
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
 // deleteGarbageBatch removes one batch of garbage and its cached usage.
 // It does not load the folder's other tickets or garbage, and the caller
 // commits this transaction before the next batch so the writer is released.

@@ -273,12 +273,24 @@ func (s *Server) SetLimits(ctx context.Context, p Principal, id string, l Limits
 	})
 }
 func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error) {
-	ctx = context.WithValue(ctx, ticketIDsKey{}, []string{})
-	ctx = context.WithValue(ctx, garbageIDsKey{}, []string{})
-	out := []Folder{}
 	if !p.valid() {
 		return nil, ErrDenied
 	}
+	// The generic loader looks up every visible folder and its grants one
+	// index probe at a time. Under the race detector that exceeds the list
+	// budget long before the result is quadratic. Ownership is a grant row,
+	// so one principal index range produces the same folders and cached usage.
+	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+		out, e := db.listFolders(ctx, p)
+		if e != nil {
+			return nil, e
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, nil
+	}
+	ctx = context.WithValue(ctx, ticketIDsKey{}, []string{})
+	ctx = context.WithValue(ctx, garbageIDsKey{}, []string{})
+	out := []Folder{}
 	e := s.read(ctx, p, "", func(m *Metadata) error {
 		s.expire(m)
 		totals := allUsage(m)
