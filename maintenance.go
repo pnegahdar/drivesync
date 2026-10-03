@@ -2,6 +2,7 @@ package drivesync
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -38,6 +39,12 @@ func bounded[T any](ctx context.Context, fn func(context.Context) (T, error)) (T
 }
 
 type noFilesKey struct{}
+type pathsKey struct{}
+type readKey struct{}
+
+func (s *Server) read(ctx context.Context, p Principal, id string, fn func(*Metadata) error) error {
+	return s.transaction(context.WithValue(ctx, readKey{}, true), p, id, false, fn)
+}
 
 func (s *Server) transaction(ctx context.Context, p Principal, id string, create bool, fn func(*Metadata) error) error {
 	if !p.valid() {
@@ -45,7 +52,7 @@ func (s *Server) transaction(ctx context.Context, p Principal, id string, create
 	}
 	txctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	scoped := context.WithValue(txctx, scopeKey{}, Scope{Principal: p, Folder: id, Create: create && id == "", NoFiles: (id == "" && !create) || ctx.Value(noFilesKey{}) == true})
+	scoped := context.WithValue(txctx, scopeKey{}, Scope{Principal: p, Folder: id, Create: create && id == "", NoFiles: (id == "" && !create) || ctx.Value(noFilesKey{}) == true, ReadOnly: ctx.Value(readKey{}) == true, Paths: func() []string { v, _ := ctx.Value(pathsKey{}).([]string); return v }()})
 	return s.Meta.Transaction(scoped, func(m *Metadata) error { m.ctx = txctx; return fn(m) })
 }
 func (s *Server) retireTicket(m *Metadata, t Ticket) {
@@ -88,26 +95,58 @@ func (s *Server) RunGC(ctx context.Context, interval time.Duration) error {
 func (s *Server) collect(gcctx context.Context) error {
 	gcctx, cancel := context.WithTimeout(gcctx, 5*time.Second)
 	defer cancel()
-	var pending map[string]Garbage
+	pending := map[string]Garbage{}
+	expired := map[string]bool{}
+	emptyDeleted := map[string]bool{}
 	ctx := gcctx
-	e := s.Meta.Transaction(gcctx, func(m *Metadata) error {
-		s.expire(m)
+	// Survey maintenance work on the read pool. Only folders with actual changes
+	// take the writer, so thousands of idle owners cannot stall unrelated writes.
+	e := s.Meta.Transaction(context.WithValue(gcctx, scopeKey{}, Scope{GC: true, ReadOnly: true}), func(m *Metadata) error {
+		totals := allUsage(m)
 		for id, f := range m.Folders {
-			if f.Deleted && usage(m, id).GarbageRows == 0 {
-				delete(m.Folders, id)
+			if f.Deleted && totals[id].GarbageRows == 0 {
+				emptyDeleted[id] = true
 			}
 		}
-		pending = map[string]Garbage{}
-		for id, g := range m.Garbage {
-			if g.Writing {
-				continue
+		for _, t := range m.Tickets {
+			if !t.Expires.After(s.now()) {
+				expired[t.FolderID] = true
 			}
-			pending[id] = g
+		}
+		for id, g := range m.Garbage {
+			if !g.Writing {
+				pending[id] = g
+			}
 		}
 		return nil
 	})
 	if e != nil {
 		return e
+	}
+	for folder := range expired {
+		e = s.Meta.Transaction(context.WithValue(gcctx, scopeKey{}, Scope{Folder: folder, NoFiles: true}), func(m *Metadata) error {
+			s.expire(m)
+			for id, g := range m.Garbage {
+				if !g.Writing {
+					pending[id] = g
+				}
+			}
+			return nil
+		})
+		if e != nil {
+			return e
+		}
+	}
+	for folder := range emptyDeleted {
+		e = s.Meta.Transaction(context.WithValue(gcctx, scopeKey{}, Scope{Folder: folder, NoFiles: true}), func(m *Metadata) error {
+			if f, ok := m.Folders[folder]; ok && f.Deleted && usage(m, folder).GarbageRows == 0 {
+				delete(m.Folders, folder)
+			}
+			return nil
+		})
+		if e != nil {
+			return e
+		}
 	}
 	var errs []error
 	for id, g := range pending {
@@ -131,9 +170,65 @@ func (s *Server) collect(gcctx context.Context) error {
 			errs = append(errs, e)
 		}
 	}
+	// Deleted rows keep their existing charge until physical deletion succeeds.
+	var tombstones []Row
+	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+		rows, qe := db.reads.QueryContext(ctx, `SELECT data FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.BlobID')!=''`)
+		if qe != nil {
+			errs = append(errs, qe)
+		} else {
+			for rows.Next() {
+				var data []byte
+				var row Row
+				if qe = rows.Scan(&data); qe == nil {
+					qe = json.Unmarshal(data, &row)
+				}
+				if qe != nil {
+					errs = append(errs, qe)
+					break
+				}
+				tombstones = append(tombstones, row)
+			}
+			errs = append(errs, rows.Err())
+			rows.Close()
+		}
+	} else {
+		qe := s.Meta.Transaction(context.WithValue(ctx, scopeKey{}, Scope{ReadOnly: true}), func(m *Metadata) error {
+			for _, rows := range m.Files {
+				for _, row := range rows {
+					if row.Deleted && row.BlobID != "" {
+						tombstones = append(tombstones, row)
+					}
+				}
+			}
+			return nil
+		})
+		errs = append(errs, qe)
+	}
+	for _, row := range tombstones {
+		_, de := bounded(ctx, func(c context.Context) (struct{}, error) {
+			return struct{}{}, s.Blobs.Delete(c, row.FolderID, row.BlobID)
+		})
+		if de != nil && !errors.Is(de, os.ErrNotExist) {
+			errs = append(errs, de)
+			continue
+		}
+		qe := s.Meta.Transaction(context.WithValue(ctx, scopeKey{}, Scope{Folder: row.FolderID, Paths: []string{row.PathID}}), func(m *Metadata) error {
+			current, ok := m.Files[row.FolderID][row.PathID]
+			if ok && current.Deleted && current.BlobID == row.BlobID {
+				current.BlobID = ""
+				current.SealedSize = 0
+				current.Metadata = nil
+				m.Files[row.FolderID][row.PathID] = current
+			}
+			return nil
+		})
+		errs = append(errs, qe)
+	}
 	return errors.Join(errs...)
 }
 func (s *Server) renew(ctx context.Context, p Principal, id, tid string) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	t, e := s.ticket(ctx, p, id, tid)
 	if e != nil {
 		return e

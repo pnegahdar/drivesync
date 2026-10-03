@@ -6,8 +6,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +36,7 @@ type Metadata struct {
 	Tickets     map[string]Ticket
 	Garbage     map[string]Garbage
 	Accounts    map[string]Account
+	selected    map[string]Usage
 	baseline    map[string]Account
 	filesLoaded bool
 	ctx         context.Context
@@ -47,9 +48,11 @@ func newMetadata() *Metadata {
 
 // MetaStore serializes transactions across all server instances sharing it. A callback's
 // error rolls back every change. Implementations must never expose state after a callback.
-// Load the scoped records and their owner Accounts, call Metadata.Prepare before
-// the callback, then Metadata.Finish and persist all changed records/counters in
-// the same transaction. Private account totals must not require account-wide rows.
+// For writes, load scoped records and owner Accounts, call Metadata.Prepare,
+// then the callback and Metadata.Finish; persist changes atomically. With Paths
+// selected, Files contains only those rows and FileUsage is the full cache.
+// ReadOnly scopes use an independent snapshot and never persist the callback.
+// Private account totals must not require account-wide rows.
 type MetaStore interface {
 	Transaction(context.Context, func(*Metadata) error) error
 }
@@ -57,6 +60,7 @@ type MetaStore interface {
 // SQLiteMetaStore stores one durable SQL row per folder, file and reservation.
 type SQLiteMetaStore struct {
 	db        *sql.DB
+	reads     *sql.DB
 	wakes     *notifications
 	release   func()
 	closeOnce sync.Once
@@ -65,6 +69,9 @@ type SQLiteMetaStore struct {
 func (s *SQLiteMetaStore) Notifications() *Notifications { return s.wakes }
 
 func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
+	if name == ":memory:" {
+		name = "file:drivesync-" + randomID() + "?mode=memory&cache=shared"
+	}
 	db, e := sql.Open("sqlite", name)
 	if e != nil {
 		return nil, e
@@ -105,20 +112,48 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 			hubName = canonical
 		}
 	}
+	readName := name
+	if file != "" {
+		readName = (&url.URL{Scheme: "file", Path: file}).String() + "?mode=ro"
+	}
+	sep := "?"
+	if strings.Contains(readName, "?") {
+		sep = "&"
+	}
+	reads, e := sql.Open("sqlite", readName+sep+"_pragma=query_only(1)&_pragma=busy_timeout(10000)")
+	if e != nil {
+		db.Close()
+		return nil, e
+	}
+	reads.SetMaxOpenConns(8)
+	if e = reads.Ping(); e != nil {
+		reads.Close()
+		db.Close()
+		return nil, e
+	}
 	wakes, release := sqliteNotifications(hubName)
-	return &SQLiteMetaStore{db: db, wakes: wakes, release: release}, nil
+	return &SQLiteMetaStore{db: db, reads: reads, wakes: wakes, release: release}, nil
 }
-func (s *SQLiteMetaStore) Close() error { e := s.db.Close(); s.closeOnce.Do(s.release); return e }
+func (s *SQLiteMetaStore) Close() error {
+	e := errors.Join(s.reads.Close(), s.db.Close())
+	s.closeOnce.Do(s.release)
+	return e
+}
 
 // Scope describes the records needed by a metadata transaction. Folder operations
 // select only Folder and its primary owner counter; an empty Folder lists visible
-// definitions or creates one. GC is an explicit maintenance scope.
+// definitions or creates one. GC is an explicit maintenance scope. A nonnil
+// Paths selects only those file rows (empty means none); nil loads all unless
+// NoFiles/GC is set. ReadOnly callbacks are read snapshots without accounting
+// updates or a writer lock.
 type Scope struct {
 	Principal Principal
 	Folder    string
 	Create    bool
 	GC        bool
 	NoFiles   bool
+	ReadOnly  bool
+	Paths     []string
 }
 type scopeKey struct{}
 
@@ -131,13 +166,20 @@ func ScopeFromContext(ctx context.Context) (Scope, bool) {
 
 func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) error) error {
 	// BEGIN's first write acquires the SQLite writer lock before reading any accounting.
-	tx, e := s.db.BeginTx(ctx, nil)
+	scope, scoped := ScopeFromContext(ctx)
+	pool := s.db
+	if scope.ReadOnly {
+		pool = s.reads
+	}
+	tx, e := pool.BeginTx(ctx, &sql.TxOptions{ReadOnly: scope.ReadOnly})
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback()
-	if _, e = tx.ExecContext(ctx, "UPDATE folders SET id=id WHERE 0"); e != nil {
-		return e
+	if !scope.ReadOnly {
+		if _, e = tx.ExecContext(ctx, "UPDATE folders SET id=id WHERE 0"); e != nil {
+			return e
+		}
 	}
 	if scope, ok := ScopeFromContext(ctx); ok && scope.Folder != "" && scope.Principal.valid() {
 		if _, e := sqlRole(ctx, tx, scope.Principal, scope.Folder, false); e != nil {
@@ -157,7 +199,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		}
 		var args []any
 		if scope, ok := ctx.Value(scopeKey{}).(Scope); ok {
-			m.filesLoaded = !scope.NoFiles && !scope.GC
+			m.filesLoaded = !scope.NoFiles && !scope.GC && scope.Paths == nil
 			filter := "id=?"
 			args = []any{scope.Folder}
 			if scope.Folder == "" {
@@ -181,6 +223,16 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 				q += " WHERE " + filter
 			} else if table == "files" {
 				q += " WHERE folder IN (SELECT id FROM folders WHERE " + filter + ")"
+				if scope.Paths != nil {
+					if len(scope.Paths) == 0 {
+						q += " AND 0"
+					} else {
+						q += " AND path IN (" + strings.TrimSuffix(strings.Repeat("?,", len(scope.Paths)), ",") + ")"
+						for _, p := range scope.Paths {
+							args = append(args, p)
+						}
+					}
+				}
 			} else {
 				q += ` WHERE folder IN (SELECT id FROM folders WHERE ` + filter + ")"
 			}
@@ -253,6 +305,10 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		}
 
 	}
+	if scoped && scope.ReadOnly {
+		m.ctx = ctx
+		return fn(m)
+	}
 	keys := map[string]bool{}
 	if scope, ok := ctx.Value(scopeKey{}).(Scope); ok && scope.Folder == "" && scope.Principal.valid() {
 		keys[principalKey(scope.Principal)] = true
@@ -263,19 +319,44 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 	for _, g := range m.Garbage {
 		keys[principalKey(g.Owner)] = true
 	}
-	for key := range keys {
-		var data []byte
-		e = tx.QueryRowContext(ctx, "SELECT data FROM accounts WHERE id=?", key).Scan(&data)
-		if e != nil && !errors.Is(e, sql.ErrNoRows) {
-			return e
+	if scoped && scope.GC {
+		rows, qe := tx.QueryContext(ctx, "SELECT id,data FROM accounts")
+		if qe != nil {
+			return qe
 		}
-		var a Account
-		if len(data) > 0 {
-			if e = json.Unmarshal(data, &a); e != nil {
+		for rows.Next() {
+			var key string
+			var data []byte
+			var a Account
+			if qe = rows.Scan(&key, &data); qe == nil {
+				qe = json.Unmarshal(data, &a)
+			}
+			if qe != nil {
+				rows.Close()
+				return qe
+			}
+			m.Accounts[key] = a
+		}
+		qe = rows.Err()
+		rows.Close()
+		if qe != nil {
+			return qe
+		}
+	} else {
+		for key := range keys {
+			var data []byte
+			e = tx.QueryRowContext(ctx, "SELECT data FROM accounts WHERE id=?", key).Scan(&data)
+			if e != nil && !errors.Is(e, sql.ErrNoRows) {
 				return e
 			}
+			var a Account
+			if len(data) > 0 {
+				if e = json.Unmarshal(data, &a); e != nil {
+					return e
+				}
+			}
+			m.Accounts[key] = a
 		}
-		m.Accounts[key] = a
 	}
 	beforeAccounts := make(map[string]Account, len(m.Accounts))
 	for k, a := range m.Accounts {
@@ -337,52 +418,72 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		next["tickets"][id] = b
 	}
 	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
+		var upsert, remove *sql.Stmt
+		defer func() {
+			if upsert != nil {
+				upsert.Close()
+			}
+			if remove != nil {
+				remove.Close()
+			}
+		}()
 		for id, b := range next[table] {
 			if bytes.Equal(b, old[table][id]) {
 				continue
 			}
-			if table == "files" {
-				if _, e = tx.ExecContext(ctx, "INSERT INTO files(folder,path,data) VALUES(?,?,?) ON CONFLICT(folder,path) DO UPDATE SET data=excluded.data", id[:32], id[33:], b); e != nil {
+			query := "INSERT INTO " + table + "(id,folder,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
+			folder := ""
+			if table == "tickets" {
+				folder = m.Tickets[id].FolderID
+			}
+			if table == "garbage" {
+				folder = m.Garbage[id].FolderID
+			}
+			args := []any{id, folder, b}
+			switch table {
+			case "files":
+				query = "INSERT INTO files(folder,path,data) VALUES(?,?,?) ON CONFLICT(folder,path) DO UPDATE SET data=excluded.data"
+				args = []any{id[:32], id[33:], b}
+			case "folders":
+				query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
+				args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
+			case "grants":
+				query = "INSERT INTO grants(folder,principal,data) VALUES(?,?,?) ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
+				args = []any{id[:32], id[33:], b}
+			}
+			if upsert == nil {
+				upsert, e = tx.PrepareContext(ctx, query)
+				if e != nil {
 					return e
 				}
-			} else {
-				query := "INSERT INTO " + table + "(id,folder,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
-				folder := ""
-				if table == "tickets" {
-					folder = m.Tickets[id].FolderID
+			}
+			if _, e = upsert.ExecContext(ctx, args...); e != nil {
+				if table == "folders" && strings.Contains(e.Error(), "UNIQUE constraint failed") {
+					return ErrConflict
 				}
-				if table == "garbage" {
-					folder = m.Garbage[id].FolderID
-				}
-				args := []any{id, folder, b}
-				if table == "folders" {
-					query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
-					args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
-				}
-				if table == "grants" {
-					query = "INSERT INTO grants(folder,principal,data) VALUES(?,?,?) ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
-					args = []any{id[:32], id[33:], b}
-				}
-				if _, e = tx.ExecContext(ctx, query, args...); e != nil {
-					if table == "folders" && strings.Contains(e.Error(), "UNIQUE constraint failed") {
-						return ErrConflict
-					}
-					return e
-				}
+				return e
 			}
 		}
 		for id := range old[table] {
 			if _, ok := next[table][id]; ok {
 				continue
 			}
+			query := "DELETE FROM " + table + " WHERE id=?"
+			args := []any{id}
 			if table == "files" {
-				_, e = tx.ExecContext(ctx, "DELETE FROM files WHERE folder=? AND path=?", id[:32], id[33:])
+				query = "DELETE FROM files WHERE folder=? AND path=?"
+				args = []any{id[:32], id[33:]}
 			} else if table == "grants" {
-				_, e = tx.ExecContext(ctx, "DELETE FROM grants WHERE folder=? AND principal=?", id[:32], id[33:])
-			} else {
-				_, e = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", id)
+				query = "DELETE FROM grants WHERE folder=? AND principal=?"
+				args = []any{id[:32], id[33:]}
 			}
-			if e != nil {
+			if remove == nil {
+				remove, e = tx.PrepareContext(ctx, query)
+				if e != nil {
+					return e
+				}
+			}
+			if _, e = remove.ExecContext(ctx, args...); e != nil {
 				return e
 			}
 		}
@@ -620,7 +721,7 @@ func (s *SQLiteMetaStore) authorize(ctx context.Context, p Principal, id string,
 		query += ` AND EXISTS(SELECT 1 FROM files r WHERE r.folder=f.id AND json_extract(r.data,'$.BlobID')=? AND json_extract(r.data,'$.Deleted')=0)`
 		args = append(args, blob)
 	}
-	if e := s.db.QueryRowContext(ctx, query, args...).Scan(&roleJSON, &ticketJSON); e != nil {
+	if e := s.reads.QueryRowContext(ctx, query, args...).Scan(&roleJSON, &ticketJSON); e != nil {
 		if errors.Is(e, sql.ErrNoRows) {
 			return Ticket{}, ErrDenied
 		}
@@ -657,7 +758,7 @@ func (s *SQLiteMetaStore) folderVersion(ctx context.Context, p Principal, id str
 		return 0, ErrDenied
 	}
 	var version uint64
-	e := s.db.QueryRowContext(ctx, `SELECT json_extract(f.data,'$.Folder.Version') FROM grants g JOIN folders f ON f.id=g.folder WHERE g.folder=? AND g.principal=? AND json_extract(g.data,'$') IN ('owner','writer','reader')`, id, principalKey(p)).Scan(&version)
+	e := s.reads.QueryRowContext(ctx, `SELECT json_extract(f.data,'$.Folder.Version') FROM grants g JOIN folders f ON f.id=g.folder WHERE g.folder=? AND g.principal=? AND json_extract(g.data,'$') IN ('owner','writer','reader')`, id, principalKey(p)).Scan(&version)
 	if errors.Is(e, sql.ErrNoRows) {
 		return 0, ErrDenied
 	}
@@ -696,12 +797,8 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 		return Delta{}, e
 	}
 	var horizon uint64
-	if e = s.db.QueryRowContext(ctx, "SELECT json_extract(data,'$.Folder.Horizon') FROM folders WHERE id=?", id).Scan(&horizon); e != nil {
+	if e = s.reads.QueryRowContext(ctx, "SELECT json_extract(data,'$.Folder.Horizon') FROM folders WHERE id=?", id).Scan(&horizon); e != nil {
 		return Delta{}, e
-	}
-	full := after < horizon
-	if full {
-		after = 0
 	}
 	if after > version {
 		return Delta{}, ErrInvalid
@@ -712,16 +809,22 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 	if until < after || until > version {
 		return Delta{}, ErrInvalid
 	}
-	cv, cp, e := parsePage(page, after, until)
+	mode, e := pageMode(page, after, until, horizon)
 	if e != nil {
 		return Delta{}, e
 	}
-	rows, e := s.db.QueryContext(ctx, `SELECT data FROM files WHERE folder=? AND json_extract(data,'$.Version')>? AND json_extract(data,'$.Version')<=? AND (json_extract(data,'$.Version')>? OR (json_extract(data,'$.Version')=? AND path>?)) ORDER BY json_extract(data,'$.Version'),path LIMIT 513`, id, after, until, cv, cv, cp)
+	query := `SELECT data FROM files WHERE folder=? AND json_extract(data,'$.Version')>? AND json_extract(data,'$.Version')<=? AND (json_extract(data,'$.Version')>? OR (json_extract(data,'$.Version')=? AND path>?)) ORDER BY json_extract(data,'$.Version'),path LIMIT 513`
+	args := []any{id, after, until, mode.version, mode.version, mode.path}
+	if mode.full {
+		query = `SELECT data FROM files WHERE folder=? AND path>? ORDER BY path LIMIT 513`
+		args = []any{id, mode.path}
+	}
+	rows, e := s.reads.QueryContext(ctx, query, args...)
 	if e != nil {
 		return Delta{}, e
 	}
 	defer rows.Close()
-	out := Delta{Version: until, Horizon: horizon, Full: full}
+	out := Delta{Version: until, Horizon: mode.horizon, Full: mode.full}
 	for rows.Next() {
 		var data []byte
 		var row Row
@@ -733,7 +836,7 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 		}
 		if len(out.Rows) == 512 {
 			last := out.Rows[len(out.Rows)-1]
-			out.Next = fmt.Sprintf("%d/%s", last.Version, last.PathID)
+			out.Next = mode.next(last)
 			break
 		}
 		out.Rows = append(out.Rows, row)

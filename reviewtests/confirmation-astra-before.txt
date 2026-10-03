@@ -1,0 +1,35 @@
+=== RUN   TestAllocatedDeleteRemainsFullyCharged
+=== RUN   TestAllocatedDeleteRemainsFullyCharged/inprocess
+    invariants_test.go:78: delete left usage bytes=1536 rows=2 but owner charged bytes=1308 rows=1; allocated cap bytes=1308 rows=1
+=== RUN   TestAllocatedDeleteRemainsFullyCharged/http
+    invariants_test.go:78: delete left usage bytes=1536 rows=2 but owner charged bytes=1308 rows=1; allocated cap bytes=1308 rows=1
+--- FAIL: TestAllocatedDeleteRemainsFullyCharged (0.09s)
+    --- FAIL: TestAllocatedDeleteRemainsFullyCharged/inprocess (0.05s)
+    --- FAIL: TestAllocatedDeleteRemainsFullyCharged/http (0.05s)
+=== RUN   TestCompactionBetweenFolderAndChanges
+=== RUN   TestCompactionBetweenFolderAndChanges/inprocess
+    invariants_test.go:127: deleted remote file survives compaction forever: files=map[gone.txt:original] status={Quarantined:[] PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Skipped:[] LastSync:2026-10-03 06:57:23.339593 -0400 EDT m=+0.220673126 Errors:[] Version:3 Watcher:manual}
+=== RUN   TestCompactionBetweenFolderAndChanges/http
+    invariants_test.go:127: deleted remote file survives compaction forever: files=map[gone.txt:original] status={Quarantined:[] PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Skipped:[] LastSync:2026-10-03 06:57:23.450977 -0400 EDT m=+0.332056209 Errors:[] Version:3 Watcher:manual}
+--- FAIL: TestCompactionBetweenFolderAndChanges (0.24s)
+    --- FAIL: TestCompactionBetweenFolderAndChanges/inprocess (0.12s)
+    --- FAIL: TestCompactionBetweenFolderAndChanges/http (0.11s)
+=== RUN   TestCompactionDropsObsoletePendingDownloads
+=== RUN   TestCompactionDropsObsoletePendingDownloads/inprocess
+    invariants_test.go:171: compacted remote row retried forever: not found or access denied; status={Quarantined:[] PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Skipped:[] LastSync:2026-10-03 06:57:23.564669 -0400 EDT m=+0.445748543 Errors:[remote d10bbeee74bc4aef5b1a8577fdaa524ac55021fa2fca882c543a9b087e3330ea: unexpected EOF unexpected EOF remote d10bbeee74bc4aef5b1a8577fdaa524ac55021fa2fca882c543a9b087e3330ea: not found or access denied not found or access denied remote d10bbeee74bc4aef5b1a8577fdaa524ac55021fa2fca882c543a9b087e3330ea: not found or access denied not found or access denied remote d10bbeee74bc4aef5b1a8577fdaa524ac55021fa2fca882c543a9b087e3330ea: not found or access denied not found or access denied remote d10bbeee74bc4aef5b1a8577fdaa524ac55021fa2fca882c543a9b087e3330ea: not found or access denied not found or access denied] Version:3 Watcher:manual}
+=== RUN   TestCompactionDropsObsoletePendingDownloads/http
+    invariants_test.go:171: compacted remote row retried forever: not found or access denied; status={Quarantined:[] PendingUpBytes:0 PendingDownBytes:0 Conflicts:[] Rejected:[] Skipped:[] LastSync:2026-10-03 06:57:23.690296 -0400 EDT m=+0.571375334 Errors:[remote 725e3b3dcbf9c20cd6034585780310a28995dfdbb5c6a860e7bce6cca0e8f876: unexpected EOF unexpected EOF remote 725e3b3dcbf9c20cd6034585780310a28995dfdbb5c6a860e7bce6cca0e8f876: not found or access denied not found or access denied remote 725e3b3dcbf9c20cd6034585780310a28995dfdbb5c6a860e7bce6cca0e8f876: not found or access denied not found or access denied remote 725e3b3dcbf9c20cd6034585780310a28995dfdbb5c6a860e7bce6cca0e8f876: not found or access denied not found or access denied remote 725e3b3dcbf9c20cd6034585780310a28995dfdbb5c6a860e7bce6cca0e8f876: not found or access denied not found or access denied] Version:3 Watcher:manual}
+--- FAIL: TestCompactionDropsObsoletePendingDownloads (0.24s)
+    --- FAIL: TestCompactionDropsObsoletePendingDownloads/inprocess (0.11s)
+    --- FAIL: TestCompactionDropsObsoletePendingDownloads/http (0.13s)
+=== RUN   TestTransportEOFErrorAfterFinalChunkIsRetried
+=== RUN   TestTransportEOFErrorAfterFinalChunkIsRetried/inprocess
+    invariants_test.go:221: unchanged good row never retried after transport failure: downloads=1 quarantine=[{c480d5b8ae06bc87a457aee4de7adb93c2d8a86efcf5003c4e995d0dee187469 1}]
+=== RUN   TestTransportEOFErrorAfterFinalChunkIsRetried/http
+    invariants_test.go:221: unchanged good row never retried after transport failure: downloads=1 quarantine=[{1299f89e97352e3dd273c5bb2e759a92b38c46709388eb78d50dfadf00b73339 1}]
+--- FAIL: TestTransportEOFErrorAfterFinalChunkIsRetried (0.18s)
+    --- FAIL: TestTransportEOFErrorAfterFinalChunkIsRetried/inprocess (0.09s)
+    --- FAIL: TestTransportEOFErrorAfterFinalChunkIsRetried/http (0.09s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/confirmastra	0.929s
+FAIL

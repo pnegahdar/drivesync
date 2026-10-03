@@ -1,7 +1,6 @@
 package drivesync
 
-// Account is a durable quota counter. MetaStore implementations must load it
-// alongside the selected folder and apply its contribution delta atomically.
+// Account is a durable quota counter, updated with the selected folder delta.
 type Account struct{ Bytes, Rows, Folders int64 }
 
 func fileUsage(rows map[string]Row) (u Usage) {
@@ -14,12 +13,48 @@ func fileUsage(rows map[string]Row) (u Usage) {
 	}
 	return
 }
+func (m *Metadata) fileTotals(id string) Usage {
+	next := fileUsage(m.Files[id])
+	if m.filesLoaded {
+		return next
+	}
+	old := m.selected[id]
+	u := m.Folders[id].FileUsage
+	u.Bytes = sat(max(0, u.Bytes-old.Bytes), next.Bytes)
+	u.Files = sat(max(0, u.Files-old.Files), next.Files)
+	u.Rows = sat(max(0, u.Rows-old.Rows), next.Rows)
+	return u
+}
+
+// allUsage groups reservations and garbage once, rather than rescanning them
+// for every folder. Runtime is linear in the selected records.
+func allUsage(m *Metadata) map[string]Usage {
+	out := make(map[string]Usage, len(m.Folders))
+	for id := range m.Folders {
+		out[id] = m.fileTotals(id)
+	}
+	for _, t := range m.Tickets {
+		u := out[t.FolderID]
+		u.Reserved = sat(u.Reserved, t.ReservedBytes)
+		u.ReservedFiles = sat(u.ReservedFiles, t.ReservedFiles)
+		u.ReservedRows = sat(u.ReservedRows, t.ReservedRows)
+		out[t.FolderID] = u
+	}
+	for _, g := range m.Garbage {
+		u := out[g.FolderID]
+		u.GarbageRows++
+		u.Bytes = sat(u.Bytes, g.Size)
+		out[g.FolderID] = u
+	}
+	return out
+}
 func contributions(m *Metadata) map[string]Account {
 	out := map[string]Account{}
+	totals := allUsage(m)
 	for id, f := range m.Folders {
 		key := principalKey(f.Folder.Owner)
 		a := out[key]
-		u := usage(m, id)
+		u := totals[id]
 		if f.Allocated {
 			a.Bytes = sat(a.Bytes, f.Folder.Limits.MaxTotalBytes)
 			a.Rows = sat(a.Rows, allocatedRows(f.Folder.Limits))
@@ -34,49 +69,45 @@ func contributions(m *Metadata) map[string]Account {
 	}
 	return out
 }
-func accountUsage(m *Metadata, key string) Account {
-	a := m.Accounts[key]
-	old := m.baseline[key]
-	next := contributions(m)[key]
+func accountDelta(a, old, next Account) Account {
 	return Account{sat(max(0, a.Bytes-old.Bytes), next.Bytes), sat(max(0, a.Rows-old.Rows), next.Rows), sat(max(0, a.Folders-old.Folders), next.Folders)}
+}
+func accountUsage(m *Metadata, key string) Account {
+	return accountDelta(m.Accounts[key], m.baseline[key], contributions(m)[key])
 }
 func ownerUsage(m *Metadata, p Principal) (int64, int64) {
 	a := accountUsage(m, principalKey(p))
 	return a.Bytes, a.Rows
 }
 
-// Prepare captures the selected folders' contribution before mutation. A store
-// which omits files must load each folder's FileUsage cache. Accounts use the
-// canonical json.Marshal(Principal) string as their key (including escaped NUL).
+// Prepare captures contributions before mutation. With partial/no file loading,
+// FileUsage must contain the full cache; Files holds just the selected rows.
 func (m *Metadata) Prepare(filesLoaded bool) {
 	m.filesLoaded = filesLoaded
+	m.selected = map[string]Usage{}
+	if !filesLoaded {
+		for id, rows := range m.Files {
+			m.selected[id] = fileUsage(rows)
+		}
+	}
 	m.baseline = contributions(m)
 }
 
-// Finish updates scoped file caches and owner counters. Call only after the
-// callback succeeds, then atomically persist the records and counters.
+// Finish computes contributions once and atomically updates caches/counters.
 func (m *Metadata) Finish() {
-	for id, f := range m.Folders {
-		if m.filesLoaded {
-			f.FileUsage = fileUsage(m.Files[id])
-		}
-		m.Folders[id] = f
-	}
-	keys := map[string]bool{}
-	for key := range m.baseline {
-		keys[key] = true
-	}
-	for key := range contributions(m) {
-		keys[key] = true
-	}
-	next := map[string]Account{}
-	for key := range keys {
-		next[key] = accountUsage(m, key)
-	}
+	next := contributions(m)
 	if m.Accounts == nil {
 		m.Accounts = map[string]Account{}
 	}
+	for key, old := range m.baseline {
+		m.Accounts[key] = accountDelta(m.Accounts[key], old, next[key])
+		delete(next, key)
+	}
 	for key, a := range next {
-		m.Accounts[key] = a
+		m.Accounts[key] = accountDelta(m.Accounts[key], Account{}, a)
+	}
+	for id, f := range m.Folders {
+		f.FileUsage = m.fileTotals(id)
+		m.Folders[id] = f
 	}
 }

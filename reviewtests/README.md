@@ -45,3 +45,17 @@ remaining identical tombstones once, and assert exact 30,720 / 20,480 row counts
 Measured operations still use the public API. This removes quadratic setup costs
 under the race detector without reducing scale, timing assertions or separate
 quota/CAS coverage. Original slow before-runs are retained.
+
+`confirmopus/` retains all 17 Opus confirmation proofs; `confirmastra/` retains
+all four Astra proofs, including both transports. The original failures on
+6420600 are in `confirmation-opus-before.txt` / `confirmation-astra-before.txt`.
+`confirmation-adapted-before.txt` reruns every current proof on that same detached
+commit: all 21 still fail. Bulk setup admits a representative folder/grant or
+256-row CAS publicly, seeds equivalent legal records transactionally, and
+asserts original counts: 6,000 / 4,000 owners, 3,000 sharers, 61,440 / 20,480
+rows. Runtime assertions and the 15-second GC contention test are unchanged.
+The coordinated sibling fixture signals rejected reservation attempts too and
+allows two seconds for the surviving upload to publish before releasing the
+barrier; it still fails on the old cancellation/livelock behavior. Root
+`confirmation_test.go` adds allocation/time scaling, selected-path loading,
+reads during a held writer, and future-base rejection controls.

@@ -14,7 +14,7 @@ func (s *Server) CompactTombstones(ctx context.Context) error {
 	cutoff := s.now().Add(-s.TombstoneTTL)
 	var folders []string
 	if m, ok := s.Meta.(*SQLiteMetaStore); ok {
-		rows, e := m.db.QueryContext(ctx, `SELECT DISTINCT folder FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.DeletedAt')<?`, cutoff.UnixNano())
+		rows, e := m.reads.QueryContext(ctx, `SELECT DISTINCT folder FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.BlobID')='' AND json_extract(data,'$.DeletedAt')<?`, cutoff.UnixNano())
 		if e != nil {
 			return e
 		}
@@ -50,7 +50,7 @@ func (s *Server) CompactTombstones(ctx context.Context) error {
 			}
 			changed := false
 			for pid, row := range m.Files[id] {
-				if row.Deleted && row.DeletedAt > 0 && row.DeletedAt < cutoff.UnixNano() {
+				if row.Deleted && row.BlobID == "" && row.DeletedAt > 0 && row.DeletedAt < cutoff.UnixNano() {
 					delete(m.Files[id], pid)
 					f.Folder.Horizon = max(f.Folder.Horizon, row.Version)
 					changed = true

@@ -59,7 +59,7 @@ Security takes priority over convenience:
   events across authorities; never poll SQLite per idle subscriber.
   Compact expired tombstones, reconcile cursors behind the horizon before writes,
   and adopt existing files matching authenticated remote hashes without copies.
-  Apply case-rename deletes before creates; isolate rename commit pairs and retry
+  Apply case-rename deletes before creates; batch indivisible rename pairs and retry
   a limit-failed independent batch one unit at a time. Early stream EOF is transient;
   authentication/framing failures are quarantined. Abort failed HTTP streams.
 - Revocation, downgrades, limit reductions and existing-row deletes never query
@@ -94,3 +94,20 @@ network failures, convergence and retained conflict contents. Real native watche
 integration must run on macOS. Record seeds and benchmark observations when
 reporting failures or performance changes. Do not claim coverage from cross-builds
 as if tests ran on that operating system.
+
+Confirmation-review invariants:
+
+- Group ticket/garbage contributions once per accounting pass; Finish computes
+  them once. Use independent read-only WAL snapshots for reads/authorization.
+  Write scopes load only touched file rows plus the durable FileUsage cache.
+- Decide Full on page one and carry its horizon/mode in continuations. Reconcile
+  every Full delta inside pull, including the index and all pending maps. Queue
+  apply failures; never wait for a stable folder version. Missing compacted paths
+  accept bases at/below the horizon.
+- Existing-row deletes retain blob cleanup and its existing charge on the tombstone.
+  Compact only physically collected tombstones; deletes must never overshoot caps.
+- Persist replica upload session IDs. Only an identical nonempty principal/session
+  may replace its stale ticket; siblings get ErrBusy.
+- Build rename hash/fold maps once per sync, batch pairs, remove ignored-only
+  directory contents and retry deletes while tracked children remain. Measure
+  scaling with unchanged record counts, including under the race detector.

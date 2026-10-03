@@ -1,3 +1,65 @@
+# Confirmation-review repairs
+
+Reviewed base: `6420600`. All 17 Opus and four Astra proofs were imported under
+`reviewtests/`; original and adapted runs fail on the reviewed base. Every proof
+now passes, including Astra's checks over both transports. No compatibility or
+schema migration paths were added.
+
+Net change: **+2,499 lines** (2,816 added, 317 removed), including proofs/logs;
+production Go source: **+361 lines**.
+
+| Decision / findings | Change and evidence |
+| --- | --- |
+| 1. Scaling and latency isolation (Opus 1, 3, 8) | Finish computes contributions once; tickets and garbage are grouped by folder in one pass. Separate read-only WAL connections serve reads and authorization. Folder writes select touched rows plus FileUsage; bulk statements are reused. GC surveys on the read pool, taking the writer only for changed folders. Rename hash/fold maps are built once; pairs are batched in bounded commits with paired CAS/limit fallback. Accounting allocations grow 8x with 8x records; held-writer and 10,000-row selected-path checks pass. Original owner/list/GC/write latency and directory-move proofs pass without reducing record counts. |
+| 2. Compaction and pull reconciliation (Opus 2, 4, 7, 9; Astra 2, 4) | Removed the stable-version retry loop. Each Full pull reconciles index, retry, ignored and quarantine maps, synthesizes missing deletes and queues apply failures without blocking unrelated work. Pagination carries the first page's Full decision/horizon; full pages use path order without filtering out concurrent updates. Matching existing content is adopted inside apply. Missing compacted paths accept bases at/below the horizon; future bases fail. Busy-folder, mid-pagination compaction, obsolete retries, offline delete and recreation proofs pass. |
+| 3. Deletes within allocations (Opus 10; Astra 1) | A tombstone retains its old blob, size and sealed metadata until physical deletion succeeds. No extra garbage row/charge is created by an existing-row delete. GC clears the row's cleanup only after successful deletion and rechecking that row; compaction skips uncollected tombstones. Failing-blob-store proofs remain within both byte/row capacities; deletes still bypass quota. |
+| 4. Transient transport failures (Astra 3) | The final EOF check returns transport errors unchanged; only actual extra bytes and authentication/framing failures are integrity errors. The unchanged valid row retries and publishes after a post-final-chunk UnexpectedEOF over both transports. |
+| 5. Sibling uploads (Opus 6) | UploadRequest/Ticket include SessionID, a random 128-bit hex ID persisted per replica state directory. Only an identical principal and nonempty session may retire a stale ticket. Other/absent sessions return ErrBusy. Same-principal in-flight upload and coordinated livelock proofs pass; same-session replacement/collection still passes. |
+| 6. Directory deletes (Opus 5) | Delete ignored-only descendants, sync parents, and keep nonempty tracked-directory tombstones pending. Defer case-equivalent creates while their replaced directory delete is pending. Ignored Finder contents no longer resurrect markers, and partial case-only directory renames converge to exact names without aliases. |
+
+The complete adapted proof suite still fails on a detached `6420600` checkout;
+see `reviewtests/confirmation-adapted-before.txt`. Bulk fixture setup keeps
+6,000 / 4,000 owners, 3,000 sharers and 61,440 / 20,480 rows, and admits a
+representative publicly before seeding equivalent records transactionally.
+The first race attempt timed out during original repeated fixture creation;
+after setup optimization and statement reuse, all packages fit the required
+180-second timeout. The 15-second GC contention test and latency assertions
+are unchanged. The sibling barrier signals failed reservation attempts too and
+waits for the surviving upload to publish before releasing the barrier; the
+adapted test still fails on the old implementation.
+
+No requested repair is deferred. Remaining prototype limits are full-tree local
+hash scans, bounded external pricing/size hooks inside the writer transaction,
+exclusive restart coordination for RecoverUploads, and externally forwarded
+notifications for separate processes. No stable historical snapshot or malicious
+server rollback/deletion detection is provided. Fresh databases are required.
+
+Verification on macOS arm64 / Go 1.27.1 (Apple M6):
+
+```sh
+go test -race ./... -count=1 -timeout 180s
+CGO_ENABLED=0 go test ./... -count=1 -timeout 120s
+CGO_ENABLED=0 GOOS=linux go vet ./...
+CGO_ENABLED=0 GOOS=linux go test -c -o /tmp/drivesync-linux.test .
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/drivesync-linux ./cmd/drivesync
+for target in FuzzNormalizePath FuzzWireDecode FuzzOpenContent; do
+  go test -run '^$' -fuzz="^${target}$" -fuzztime=3s -parallel=2 .
+done
+go test -run '^TestWatcherPropagation$' -count=1 -v .
+go test -run '^$' -bench 'Benchmark(SmallFilePropagation|Scan10K|IndexedScan10K)$' -benchtime=3x .
+```
+
+All pass. Race: root 58.730 s, confirmation Opus 140.229 s, Opus2 29.420 s;
+pure-Go: root 22.294 s, confirmation Opus 28.764 s. Seeds 42, 9817, 20261003
+converge and retain local writes/conflicts. Fuzz runs execute 1,913 / 4,204 /
+82,440 cases, respectively. Native FSEvents propagation is 350 ms. Benchmarks:
+small-file propagation 278.8 ms, initial 10k scan 356.7 ms, indexed scan 358.3 ms.
+Accounting grows from 1,059 to 8,249 allocations and 0.99 to 4.99 ms for 8x
+records. With race instrumentation: GC with 4,000 owners takes 316 ms while a
+victim read takes 3.45 ms; 6,000-owner background GC yields zero victim failures
+and worst write 49 ms; 3,000-folder listing takes 737 ms, bystander read 3.55 ms.
+Linux was vetted/cross-built, not executed. No remote or push.
+
 # Final-review repairs
 
 Reviewed base: `c584e8d`. All original proofs were imported and run before
@@ -130,12 +192,12 @@ per-read authorization; the eliminated cost is durable renewal writes.
 
 - Pricing and stored-size hooks remain inside the SQLite writer transaction,
   bounded to two seconds each and the transaction's five-second deadline.
-  Folder write operations still materialize that folder's current rows; they do
-  not materialize the account's other rows. Replicas still hash the whole tree.
+  Writes now select touched file rows plus cached usage; read-only WAL
+  connections avoid the writer lock. Replicas still hash the whole tree.
 - Allocation persists until deletion/cleanup. Allocation and cap changes now
   reject capacity below folder usage (including tickets/garbage); see the final
-  review repairs below. Existing-row deletes may temporarily add garbage/tombstone
-  bookkeeping until background collection and compaction.
+  review repairs above. Existing-row deletes now retain cleanup on the tombstone
+  without extra charge; collection frees its blob bytes before compaction.
 - `RecoverUploads` requires exclusive restart coordination: all prior writers
   using the stores must have stopped. Ordinary GC never assumes a writer stopped
   merely because its ticket expired. Directory fsync checks inject failures and

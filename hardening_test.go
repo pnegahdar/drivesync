@@ -246,7 +246,7 @@ func TestBusyAndOwnReservationReplacement(t *testing.T) {
 	p := Principal{owner.Tenant, "other"}
 	_ = c.Grant(context.Background(), f.ID, p, Writer)
 	pid, _ := PathID(k, f.ID, "x")
-	req := UploadRequest{PathID: pid, SealedSize: 1}
+	req := UploadRequest{SessionID: randomID(), PathID: pid, SealedSize: 1}
 	first, e := c.Reserve(context.Background(), f.ID, req)
 	if e != nil {
 		t.Fatal(e)

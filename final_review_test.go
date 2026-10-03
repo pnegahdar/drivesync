@@ -28,6 +28,9 @@ func TestCapFloorIncludesPendingAndGarbage(t *testing.T) {
 					t.Fatal(e)
 				}
 			}
+			if kind == "rows" {
+				put(t, c, f, k, "another", 0, []byte("bytes"))
+			}
 			got, _ := c.GetFolder(ctx, f.ID)
 			bytes, rows := sat(got.Usage.Bytes, got.Usage.Reserved), sat(sat(got.Usage.Rows, got.Usage.GarbageRows), got.Usage.ReservedRows)
 			l := Limits{MaxTotalBytes: bytes, MaxRows: rows, MaxFileBytes: bytes}

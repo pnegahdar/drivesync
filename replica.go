@@ -67,6 +67,7 @@ type pendingRow struct {
 type Replica struct {
 	client       Client
 	folder       string
+	session      string
 	key          FolderKey
 	dir          string
 	opts         Options
@@ -186,8 +187,21 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 		cleanup()
 		return nil, e
 	}
+	var session string
+	e = db.QueryRow("SELECT value FROM config WHERE key='session'").Scan(&session)
+	if e != nil && !errors.Is(e, sql.ErrNoRows) {
+		cleanup()
+		return nil, e
+	}
+	if session == "" {
+		session = randomID()
+		if _, e = db.Exec("INSERT INTO config(key,value) VALUES('session',?)", session); e != nil {
+			cleanup()
+			return nil, e
+		}
+	}
 	rctx, cancel := context.WithCancel(ctx)
-	r := &Replica{quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]indexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
+	r := &Replica{session: session, quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]indexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
 	rows, e := db.Query("SELECT data FROM entries")
 	if e != nil {
 		cancel()
@@ -656,18 +670,18 @@ func (r *Replica) sync(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	if r.version == 0 || r.version < folder.Horizon {
-		if e = r.reconcile(ctx, local, r.version < folder.Horizon); e != nil {
-			return e
-		}
-		local, e = r.scan()
-		if e != nil {
-			return e
-		}
+	record(r.pull(ctx, local))
+	local, e = r.scan()
+	if e != nil {
+		return e
 	}
 	paths := make([]string, 0, len(local))
 	var up int64
 	for p, v := range local {
+		pid, _ := PathID(r.key, r.folder, p)
+		if _, pending := r.retryRows[pid]; pending {
+			continue
+		}
 		if i, ok := r.index[p]; !ok || !sameFile(v, i) {
 			paths = append(paths, p)
 			up += SealedSize(v.Size)
@@ -684,27 +698,55 @@ func (r *Replica) sync(ctx context.Context) error {
 	r.mu.Unlock()
 	renames := map[string]string{}
 	heldDeletes := map[string]bool{}
+	// Build candidate indexes once. Scan contains exact on-disk spelling and
+	// already excludes unreadable trees, so no per-candidate directory listing.
+	hashes := map[string][]string{}
+	folded := map[string][]string{}
+	presentLocal := map[string]bool{}
+	for _, v := range local {
+		presentLocal[v.Local] = true
+	}
+	for old, i := range r.index {
+		if i.Deleted || i.Awaiting || r.localBlocked(old) || presentLocal[i.Local] {
+			continue
+		}
+		hashes[i.Hash] = append(hashes[i.Hash], old)
+		folded[foldPath(i.Local)] = append(folded[foldPath(i.Local)], old)
+	}
+	takeCandidate := func(candidates map[string][]string, key string, directory bool) string {
+		for len(candidates[key]) > 0 {
+			list := candidates[key]
+			old := list[len(list)-1]
+			candidates[key] = list[:len(list)-1]
+			if !heldDeletes[old] && r.index[old].Directory == directory {
+				return old
+			}
+		}
+		return ""
+	}
 	for _, p := range paths {
 		v := local[p]
 		if i, known := r.index[p]; known && !i.Deleted {
 			continue
 		}
-		for old, i := range r.index {
-			if i.Deleted || i.Awaiting || i.Directory != v.Directory || heldDeletes[old] || r.localBlocked(old) {
-				continue
-			}
-			if _, present := local[old]; present {
-				continue
-			}
-			if !r.exactExists(i.Local) && (i.Hash == v.Hash || foldPath(i.Local) == foldPath(v.Local)) {
-				renames[p] = old
-				heldDeletes[old] = true
-				break
-			}
+		old := takeCandidate(hashes, v.Hash, v.Directory)
+		if old == "" {
+			old = takeCandidate(folded, foldPath(v.Local), v.Directory)
+		}
+		if old != "" {
+			renames[p] = old
+			heldDeletes[old] = true
 		}
 	}
 	// Independent uploads get their headroom before pending atomic renames.
 	sort.SliceStable(paths, func(i, j int) bool { _, a := renames[paths[i]]; _, b := renames[paths[j]]; return !a && b })
+	pairs := map[string]string{}
+	for next, old := range renames {
+		a, _ := PathID(r.key, r.folder, next)
+		b, _ := PathID(r.key, r.folder, old)
+		pairs[a] = b
+		pairs[b] = a
+	}
 	batch := []Mutation{}
 	snapshots := map[string]localFile{}
 	tickets := []Ticket{}
@@ -724,12 +766,11 @@ func (r *Replica) sync(ctx context.Context) error {
 					bad[pid] = true
 				}
 			}
-			for next, previous := range renames {
-				a, _ := PathID(r.key, r.folder, next)
-				b, _ := PathID(r.key, r.folder, previous)
-				if bad[a] || bad[b] {
-					bad[a] = true
-					bad[b] = true
+			for _, m := range batch {
+				if bad[m.PathID] {
+					if other := pairs[m.PathID]; other != "" {
+						bad[other] = true
+					}
 				}
 			}
 			remaining := []Mutation{}
@@ -770,27 +811,43 @@ func (r *Replica) sync(ctx context.Context) error {
 			}
 		}
 		if isLimit(e) && len(batch) > 1 {
-			independent := true
+			units := [][]Mutation{}
+			used := map[string]bool{}
+			byPath := map[string]Mutation{}
 			for _, m := range batch {
-				if m.Deleted {
-					independent = false
-				}
+				byPath[m.PathID] = m
 			}
-			if independent {
-				pending, saved, uploaded := batch, snapshots, tickets
-				for _, m := range pending {
-					batch = []Mutation{m}
+			for _, m := range batch {
+				if used[m.PathID] {
+					continue
+				}
+				unit := []Mutation{m}
+				used[m.PathID] = true
+				if peer, ok := byPath[pairs[m.PathID]]; ok {
+					unit = append(unit, peer)
+					used[peer.PathID] = true
+				}
+				units = append(units, unit)
+			}
+			if len(units) > 1 {
+				saved, uploaded := snapshots, tickets
+				for _, unit := range units {
+					batch = unit
 					snapshots = map[string]localFile{}
 					tickets = nil
+					ids := map[string]bool{}
+					for _, m := range unit {
+						ids[m.PathID] = true
+					}
 					for p, v := range saved {
 						pid, _ := PathID(r.key, r.folder, p)
-						if pid == m.PathID {
+						if ids[pid] {
 							snapshots[p] = v
 						}
 					}
 					for _, t := range uploaded {
-						if t.ID == m.TicketID {
-							tickets = []Ticket{t}
+						if ids[t.PathID] {
+							tickets = append(tickets, t)
 						}
 					}
 					if fe := flush(); fe != nil {
@@ -847,8 +904,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		v := local[p]
 		// Do not let a slow next transfer expire already-uploaded batch members.
 		// Renewal protects the stream currently flowing, not idle sibling tickets.
-		_, isRename := renames[p]
-		if len(batch) > 0 && (isRename || v.Size > ChunkSize || time.Now().Add(time.Second).After(tickets[0].Expires)) {
+		if len(batch) > 0 && (v.Size > ChunkSize || time.Now().Add(time.Second).After(tickets[0].Expires)) {
 			if e = flush(); e != nil {
 				return e
 			}
@@ -863,6 +919,12 @@ func (r *Replica) sync(ctx context.Context) error {
 			r.reject(p, v.Hash, ErrDenied)
 			continue
 		}
+		if v.Directory {
+			if e = durableMkdirAll(r.root, v.Local); e != nil {
+				record(e)
+				continue
+			}
+		}
 		base := r.index[p].Version
 		pid, _ := PathID(r.key, r.folder, p)
 		renameDelete := []Mutation{}
@@ -872,7 +934,7 @@ func (r *Replica) sync(ctx context.Context) error {
 			renameDelete = append(renameDelete, Mutation{PathID: oldpid, BaseVersion: i.Version, Deleted: true})
 		}
 		preview, _ := SealMetadata(r.key, r.folder, pid, FileMetadata{Path: p, BlobID: strings.Repeat("0", 32), Size: v.Size, Mode: v.Mode, Directory: v.Directory, Hash: v.Hash})
-		request := UploadRequest{PathID: pid, BaseVersion: base, SealedSize: SealedSize(v.Size), MetadataBytes: int64(len(preview))}
+		request := UploadRequest{SessionID: r.session, PathID: pid, BaseVersion: base, SealedSize: SealedSize(v.Size), MetadataBytes: int64(len(preview))}
 		t, e := r.client.Reserve(ctx, r.folder, request)
 		if errors.Is(e, ErrConflict) {
 			if i, known := r.index[p]; !known || i.Deleted {
@@ -984,7 +1046,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		r.mu.Lock()
 		delete(r.rejected, p)
 		r.mu.Unlock()
-		if len(batch) >= 64 || v.Size > ChunkSize || isRename {
+		if len(batch) >= 16 || v.Size > ChunkSize {
 			if e = flush(); e != nil {
 				return e
 			}
@@ -1025,9 +1087,20 @@ func (r *Replica) sync(ctx context.Context) error {
 			}
 		}
 	}
+	record(r.pull(ctx, local))
+	return firstError
+}
+
+// pull reconciles exactly the delta supplied by the authority, including Full
+// deltas that arrive after the preliminary GetFolder. No stability retry loop.
+func (r *Replica) pull(ctx context.Context, local map[string]localFile) error {
+	var firstError error
 	delta, e := r.client.Changes(ctx, r.folder, r.version)
 	if e != nil {
 		return e
+	}
+	if delta.Full {
+		r.reconcileFull(&delta)
 	}
 	for _, row := range delta.Rows {
 		if old, ok := r.quarantine[row.PathID]; ok && old.Version != row.Version {
@@ -1295,6 +1368,15 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 				if !v.Directory {
 					return e
 				}
+				if e = r.removeIgnored(i.Local, r.patterns()); e != nil {
+					return e
+				}
+				if e = r.root.Remove(i.Local); e != nil {
+					return e
+				}
+				if e = r.syncParent(i.Local); e != nil {
+					return e
+				}
 			} else {
 				if e = r.syncParent(i.Local); e != nil {
 					return e
@@ -1313,6 +1395,14 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 		return e
 	}
 	p = m.Path
+	for parent := p; parent != "."; parent = path.Dir(parent) {
+		if old, ok := r.byFold[foldPath(parent)]; ok && old != parent {
+			pid, _ := PathID(r.key, r.folder, old)
+			if pending, ok := r.retryRows[pid]; ok && pending.Deleted {
+				return ErrBusy
+			}
+		}
+	}
 	local := r.localPath(p, row.PathID)
 	if _, e = NormalizePath(local); e != nil {
 		return e
@@ -1329,6 +1419,26 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	if r.ignore(m.Path, m.Directory, patterns) || r.ignore(local, m.Directory, patterns) {
 		r.ignoredRows[row.PathID] = row
 		return nil
+	}
+	if !m.Directory {
+		if v, ve := r.inspect(p, local); ve == nil && !v.Directory && v.Hash == m.Hash && v.Size == m.Size {
+			if e = durableMkdirAll(r.root, path.Dir(local)); e != nil {
+				return e
+			}
+			f, oe := openLocal(r.root, local)
+			if oe != nil {
+				return oe
+			}
+			e = f.Sync()
+			f.Close()
+			if e != nil {
+				return e
+			}
+			if e = r.syncParent(local); e != nil {
+				return e
+			}
+			return r.save(indexEntry{Path: p, Local: local, Hash: m.Hash, Version: row.Version, Mode: v.Mode})
+		}
 	}
 	if m.Directory {
 		if m.Size != 0 || m.Hash != "directory" {

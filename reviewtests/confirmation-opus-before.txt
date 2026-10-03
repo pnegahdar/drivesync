@@ -1,0 +1,73 @@
+=== RUN   TestFreshAttachNeverSyncsBusyFolder
+    busy_test.go:51: fresh replica made no progress after 5 syncs: last=path has an active upload files=0 status.Version=0
+--- FAIL: TestFreshAttachNeverSyncsBusyFolder (0.09s)
+=== RUN   TestFreshAttachBusyFolderHTTP
+    busyhttp_test.go:53: 5 syncs in 16.98497425s, 79 concurrent commits, last error=path has an active upload
+    busyhttp_test.go:55: fresh HTTP replica made no progress on a busy 60k-row folder: path has an active upload
+--- FAIL: TestFreshAttachBusyFolderHTTP (32.15s)
+=== RUN   TestCaseOnlyDirectoryRenameObservedMidway
+    caserename_test.go:88: case-only directory rename did not converge: mac top-level=[Docs docs (case conflict d4aa3d6c8bc4f9fda482619e210f7db5)] files=map[docs (case conflict d4aa3d6c8bc4f9fda482619e210f7db5)/x.txt:payload] remote live=[docs docs/x.txt Docs]
+--- FAIL: TestCaseOnlyDirectoryRenameObservedMidway (0.08s)
+=== RUN   TestExistingRowDeletesExceedAllocatedCharge
+    deleteovershoot_test.go:53: cap bytes=16000 rows=40 (charged rows=40); full: bytes=15510 rows=30; after deleting all + failed GC: bytes=17250 rows=60
+    deleteovershoot_test.go:55: stored bytes/rows exceed the owner's allocated charge: bytes 17250 > 16000 or rows 60 > 40
+--- FAIL: TestExistingRowDeletesExceedAllocatedCharge (0.04s)
+=== RUN   TestDeletedDirectoryResurrectedByIgnoredFile
+    dirdelete_test.go:33: directory deleted on a was resurrected from b's ignored .DS_Store
+--- FAIL: TestDeletedDirectoryResurrectedByIgnoredFile (0.09s)
+=== RUN   TestDirectoryMoveRenameDetectionIsQuadratic
+    dirmove_test.go:44: files=1000 initial upload sync=4.119187792s sync after directory rename=18.998325s
+    dirmove_test.go:46: renaming a 1000-file directory took 18.998325s to sync vs 4.119187792s to upload it
+--- FAIL: TestDirectoryMoveRenameDetectionIsQuadratic (23.22s)
+=== RUN   TestHTTPChangesFullFlipsMidPagination
+    fullflip_test.go:79: Changes returned Full=true (horizon 2) with 610 rows but without live row live.txt
+--- FAIL: TestHTTPChangesFullFlipsMidPagination (0.02s)
+=== RUN   TestPullIgnoresFullDelta
+=== RUN   TestPullIgnoresFullDelta/inprocess
+    fullpull_test.go:70: b kept a remotely deleted file after compaction during sync: b=map[gone.txt:deleted elsewhere keep.txt:keep] a=map[keep.txt:keep] horizon=2 b.version=3
+=== RUN   TestPullIgnoresFullDelta/http
+    fullpull_test.go:70: b kept a remotely deleted file after compaction during sync: b=map[gone.txt:deleted elsewhere keep.txt:keep] a=map[keep.txt:keep] horizon=2 b.version=3
+--- FAIL: TestPullIgnoresFullDelta (0.15s)
+    --- FAIL: TestPullIgnoresFullDelta/inprocess (0.08s)
+    --- FAIL: TestPullIgnoresFullDelta/http (0.07s)
+=== RUN   TestGCNeverCompletesWithSixThousandOwners
+    gcpasses_test.go:25: GC pass 0 failed after 6.667006208s: sql: transaction has already been committed or rolled back
+--- FAIL: TestGCNeverCompletesWithSixThousandOwners (7.81s)
+=== RUN   TestGCScalesQuadraticallyWithOwners
+    gcscale_test.go:70: garbage=0 owners=4000 gc=3.586533333s victimGetFolderDuringGC=3.384926583s garbageRows before=1 after=0
+    gcscale_test.go:75: unrelated tenants' folder count made a victim request wait 3.384926583s
+--- FAIL: TestGCScalesQuadraticallyWithOwners (4.41s)
+=== RUN   TestRunGCStallsServerAtModestOwnerCount
+    gcstall_test.go:52: owners=6000 victim puts=1006 failed=2 worst=5.001818083s garbageRows=1
+    gcstall_test.go:54: background GC with 6000 unrelated owners stalled the victim: 2/1006 failed, worst 5.001818083s, garbage left 1
+--- FAIL: TestRunGCStallsServerAtModestOwnerCount (17.82s)
+=== RUN   TestListFoldersQuadraticInSharingOwners
+    listscale_test.go:50: sharers=3000 victimList=1.674516166s err=<nil> bystanderGetFolder=1.573981916s
+    listscale_test.go:52: listing 3000 shared folders took 1.674516166s (err <nil>); unrelated bystander waited 1.573981916s
+--- FAIL: TestListFoldersQuadraticInSharingOwners (2.79s)
+=== RUN   TestReconcileDeleteFailureBlocksAllSync
+    reconcilestuck_test.go:53: one undeletable path stalled all sync: last=removeat ro/old.txt: permission denied b=map[mine.txt:new local file on b ro/old.txt:old] a=map[fresh.txt:new remote file]
+--- FAIL: TestReconcileDeleteFailureBlocksAllSync (0.10s)
+=== RUN   TestRecreateAfterCompactionOnCurrentReplica
+=== RUN   TestRecreateAfterCompactionOnCurrentReplica/inprocess
+    recreate_test.go:48: replica a cannot recreate a compacted path; local files=map[notes (conflict from a 20261003T105850.429133000Z-b812050d811f8967c943c5a4e435eadf).txt:recreated notes (conflict from a 20261003T105850.443133000Z-ab51fa9aa8ca98477029c30ef3a7071e).txt:recreated] conflicts=[notes (conflict from a 20261003T105850.429133000Z-b812050d811f8967c943c5a4e435eadf).txt notes (conflict from a 20261003T105850.443133000Z-ab51fa9aa8ca98477029c30ef3a7071e).txt]
+=== RUN   TestRecreateAfterCompactionOnCurrentReplica/http
+    recreate_test.go:48: replica a cannot recreate a compacted path; local files=map[notes (conflict from a 20261003T105850.573161000Z-11dc00c0e901aa508ffcd2320d08334b).txt:recreated notes (conflict from a 20261003T105850.586120000Z-b51bdf5ef1f070eb3d9f3f7e8014b621).txt:recreated] conflicts=[notes (conflict from a 20261003T105850.573161000Z-11dc00c0e901aa508ffcd2320d08334b).txt notes (conflict from a 20261003T105850.586120000Z-b51bdf5ef1f070eb3d9f3f7e8014b621).txt]
+--- FAIL: TestRecreateAfterCompactionOnCurrentReplica (0.30s)
+    --- FAIL: TestRecreateAfterCompactionOnCurrentReplica/inprocess (0.15s)
+    --- FAIL: TestRecreateAfterCompactionOnCurrentReplica/http (0.15s)
+=== RUN   TestSamePrincipalReserveCancelsSiblingUpload
+    sameprincipal_test.go:46: same principal=false: second Reserve err=path has an active upload; first in-flight upload err=<nil>
+    sameprincipal_test.go:46: same principal=true: second Reserve err=<nil>; first in-flight upload err=not found or access denied
+    sameprincipal_test.go:48: a sibling replica's Reserve cancelled an in-flight upload (not found or access denied) instead of returning ErrBusy (<nil>)
+--- FAIL: TestSamePrincipalReserveCancelsSiblingUpload (0.02s)
+=== RUN   TestSamePrincipalReplicasLivelockOnLargeUpload
+    sameprincipal_test.go:132: overlapping syncs of two same-principal replicas published neither edit; laptop errors=[not found or access denied not found or access denied not found or access denied not found or access denied]
+--- FAIL: TestSamePrincipalReplicasLivelockOnLargeUpload (0.09s)
+=== RUN   TestVictimLatencyGrowsWithOtherTenantRows
+    writelock_test.go:76: other-tenant rows=20480 victim GetFolder p90: small=774.416µs big=35.888417ms; other tenant commit worst: small=1.07225ms big=45.016166ms
+    writelock_test.go:78: victim p90 latency grew from 774.416µs to 35.888417ms with another tenant's 20480 rows
+--- FAIL: TestVictimLatencyGrowsWithOtherTenantRows (3.55s)
+FAIL
+FAIL	github.com/pnegahdar/drivesync/reviewtests/confirmopus	92.933s
+FAIL

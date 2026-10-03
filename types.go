@@ -83,12 +83,17 @@ type Row struct {
 	DeletedAt                int64
 }
 type UploadRequest struct {
+	// SessionID identifies one replica state directory (random 128-bit hex).
+	// Only the same principal/session can replace its previous ticket; empty or
+	// different sessions get ErrBusy. This is contention control, not a grant.
+	SessionID     string
 	PathID        string
 	BaseVersion   uint64
 	SealedSize    int64
 	MetadataBytes int64
 }
 type Ticket struct {
+	SessionID                                string
 	ID, FolderID, BlobID, PathID             string
 	Principal                                Principal
 	BaseVersion                              uint64

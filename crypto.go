@@ -255,7 +255,7 @@ func OpenContent(w io.Writer, r io.Reader, k FolderKey, folder, blob, pid string
 					return nil
 				}
 				if e != nil {
-					return ErrIntegrity
+					return e
 				}
 			}
 			return io.ErrNoProgress

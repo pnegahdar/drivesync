@@ -73,8 +73,11 @@ afterward. Persist records and counters in the same transaction. SQLite folder
 operations never load the owner's other folders or rows. Listing reads cached
 folder usage; streaming authorization and paginated changes use targeted queries.
 Indexed owner/grant and ticket/garbage folder columns avoid unrelated-tenant scans.
-Maintenance may visit all definitions, reservations and garbage; compaction loads
-only folders with expired tombstones. Replicas
+Read-only WAL connections serve folder reads, changes and authorization without
+acquiring the writer. Writes select touched file rows and use a durable usage cache.
+Accounting groups tickets/garbage by folder in one pass. Maintenance surveys
+records on the read pool, then writes only folders needing cleanup; compaction
+loads only folders with expired, physically collected tombstones. Replicas
 currently hash the full local tree on each sync; incremental dirty-path scans
 remain future performance work. `BlobStore` creates immutable objects, opens
 streams, reports actual sizes and deletes objects. Memory and local-directory
@@ -116,14 +119,20 @@ Security and behavior:
 - CAS conflicts keep a durable local `name (conflict from replica timestamp-id).ext`
   copy before taking the winner. Conflict copies sync as regular files. Renames
   use atomic CAS-bound create-plus-delete commits without credit. If the new
-  path cannot fit, both halves remain pending and the old remote path survives;
-  empty directories use encrypted directory markers. Busy upload paths retry
+  path cannot fit, both halves remain pending and the old remote path survives.
+  Rename pairs are batched but remain indivisible when retrying limits or CAS;
+  detection indexes hashes and folded paths once per sync.
+  Empty directories use encrypted directory markers. Busy upload paths retry
   without conflict copies; batches preserve only paths whose versions lost.
   Tombstones retain versions until the retention horizon (`Server.TombstoneTTL`,
-  30 days by default, zero disables compaction). Maintenance removes expired
-  tombstones and their charges. `Folder.Horizon` / `Delta.Full` instruct older
-  cursors to reconcile the full current set before writes, preserving unsynced
-  contents. Files already matching authenticated remote hashes are adopted in
+  30 days by default, zero disables compaction). Deletes keep the old blob's
+  cleanup responsibility and charge on their row, adding no bytes or rows.
+  Collection clears that charge only after successful deletion; compaction
+  then removes expired tombstones. Full/incremental mode is pinned in page
+  continuations. A Full pull reconciles the index and all pending maps against
+  the current set before writes, preserving unsynced content. Failed local deletes
+  retry independently. Missing compacted paths accept bases at/below the horizon.
+  Files already matching authenticated remote hashes are adopted in
   sync when attaching an existing directory; no duplicate conflict copies.
 - Downloads use authenticated staging, fsync, rename and directory fsync. An
   `os.Root` confines filesystem operations, including when parents change. Paths
@@ -138,7 +147,11 @@ Security and behavior:
   Skipped remote rows persist outside the cursor and reappear after unignoring,
   including after restart. Undecryptable or unapplicable rows are quarantined
   in durable state and `Status.Quarantined`, without re-downloading unchanged
-  versions. Network and filesystem failures retry separately; `RetryRejected`
+  versions. Truncated streams and transport errors, including at the final EOF
+  check, retry separately; only authentication/framing failures or actual trailing
+  bytes are integrity failures. Ignored-only contents are removed on directory
+  deletion; remaining tracked children keep its tombstone pending. Network and filesystem
+  failures retry separately; `RetryRejected`
   also explicitly retries quarantined rows. Unreadable local files are
   reported in `Status.Skipped`. Other uploads and downloads continue.
   State stays outside the attachment and is locked against a second attachment.
@@ -148,10 +161,15 @@ Security and behavior:
   live entries, including directory markers. `Limits.MaxRows` caps all current
   rows and garbage records; zero selects a safety budget of 16 times `MaxFiles`,
   capped at one million (one million when `MaxFiles` is unlimited). Tombstones
-  retain their row charge. `Quota.MaxFiles` bounds rows across the owner's folders.
+  retain their row charge and any pending blob cleanup. `Quota.MaxFiles` bounds
+  rows across the owner's folders.
   Other zero limits mean unlimited. Individual uploads are capped at 2^50 bytes,
   and accounting saturates instead of overflowing.
-- Reservations bind principal, folder, path and base version. Renewals write only
+- Reservations bind principal, folder, path and base version. Set
+  `UploadRequest.SessionID` to a random 128-bit hex ID per replica/state directory
+  to replace your session's stale ticket. A different or absent session gets
+  `ErrBusy` while a sibling ticket exists, including for the same principal.
+  Replicas persist their session ID outside the shared directory. Renewals write only
   after more than half the TTL has elapsed, while every read still checks access.
   `UploadRequest.MetadataBytes` reserves metadata space; commit checks the actual
   length even if understated. Uploads reserve a complete additional copy, with

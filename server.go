@@ -77,28 +77,9 @@ func sat(a, b int64) int64 {
 	}
 	return a + b
 }
-func rowBytes(r Row) int64 { return sat(RowCost, sat(r.SealedSize, int64(len(r.Metadata)))) }
-func usage(m *Metadata, id string) Usage {
-	u := m.Folders[id].FileUsage
-	if m.filesLoaded {
-		u = fileUsage(m.Files[id])
-	}
-	for _, t := range m.Tickets {
-		if t.FolderID == id {
-			u.Reserved = sat(u.Reserved, t.ReservedBytes)
-			u.ReservedFiles = sat(u.ReservedFiles, t.ReservedFiles)
-			u.ReservedRows = sat(u.ReservedRows, t.ReservedRows)
-		}
-	}
-	for _, g := range m.Garbage {
-		if g.FolderID == id {
-			u.GarbageRows++
-			u.Bytes = sat(u.Bytes, g.Size)
-		}
-	}
-	return u
-}
-func allocatedRows(l Limits) int64 { return min(l.MaxTotalBytes/RowCost, l.MaxRows) }
+func rowBytes(r Row) int64               { return sat(RowCost, sat(r.SealedSize, int64(len(r.Metadata)))) }
+func usage(m *Metadata, id string) Usage { return allUsage(m)[id] }
+func allocatedRows(l Limits) int64       { return min(l.MaxTotalBytes/RowCost, l.MaxRows) }
 func ownerLimit(p Principal, f FolderRecord, name string, max, n int64) error {
 	if e := limit(name, max, n); e != nil {
 		if p != f.Folder.Owner {
@@ -159,14 +140,14 @@ func limit(name string, max, requested int64) error {
 	}
 	return nil
 }
-func (s *Server) folder(ctx context.Context, m *Metadata, p Principal, f FolderRecord) (Folder, error) {
+func visibleFolder(p Principal, f FolderRecord, u Usage) Folder {
 	v := f.Folder
-	v.Usage = usage(m, v.ID)
+	v.Usage = u
 	v.Role = f.Grants[principalKey(p)]
 	if v.Owner == p {
 		v.Role = Owner
 	}
-	return v, nil
+	return v
 }
 func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec) (Folder, error) {
 	var f Folder
@@ -193,6 +174,7 @@ func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec)
 	return f, e
 }
 func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Principal, role Role) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
@@ -223,6 +205,7 @@ func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Prin
 	return e
 }
 func (s *Server) Revoke(ctx context.Context, p Principal, id string, grantee Principal) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
@@ -273,6 +256,7 @@ func (s *Server) DeleteFolder(ctx context.Context, p Principal, id string) error
 	return e
 }
 func (s *Server) SetLimits(ctx context.Context, p Principal, id string, l Limits) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	return s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, false, true)
 		if e != nil {
@@ -295,15 +279,12 @@ func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error)
 	if !p.valid() {
 		return nil, ErrDenied
 	}
-	e := s.transaction(ctx, p, "", false, func(m *Metadata) error {
+	e := s.read(ctx, p, "", func(m *Metadata) error {
 		s.expire(m)
+		totals := allUsage(m)
 		for id, f := range m.Folders {
 			if _, e := access(m, p, id, false, false); e == nil {
-				v, e := s.folder(m.ctx, m, p, f)
-				if e != nil {
-					return e
-				}
-				out = append(out, v)
+				out = append(out, visibleFolder(p, f, totals[id]))
 			}
 		}
 		return nil
@@ -314,21 +295,22 @@ func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error)
 func (s *Server) GetFolder(ctx context.Context, p Principal, id string) (Folder, error) {
 	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	var out Folder
-	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
+	e := s.read(ctx, p, id, func(m *Metadata) error {
 		f, e := access(m, p, id, false, false)
 		if e != nil {
 			return e
 		}
 		s.expire(m)
-		out, e = s.folder(m.ctx, m, p, f)
-		return e
+		out = visibleFolder(p, f, usage(m, id))
+		return nil
 	})
 	return out, e
 }
 func (s *Server) Reserve(ctx context.Context, p Principal, id string, r UploadRequest) (Ticket, error) {
+	ctx = context.WithValue(ctx, pathsKey{}, []string{r.PathID})
 	var t Ticket
-	// Retire our own stale ticket in a separate durable transaction, then collect
-	// its object before reserving replacement capacity. Busy peers are left alone.
+	// Retire this session's stale ticket durably before attempting a replacement.
+	// Physical cleanup remains charged for background GC. Siblings are left alone.
 	pre := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
@@ -337,11 +319,11 @@ func (s *Server) Reserve(ctx context.Context, p Principal, id string, r UploadRe
 		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > MaxRequestBytes {
 			return ErrInvalid
 		}
-		if m.Files[id][r.PathID].Version != r.BaseVersion {
+		if !baseMatches(m.Folders[id].Folder, m.Files[id][r.PathID], r.BaseVersion) {
 			return &ConflictError{[]string{r.PathID}}
 		}
 		for tid, v := range m.Tickets {
-			if v.FolderID == id && v.PathID == r.PathID && v.Principal == p {
+			if v.FolderID == id && v.PathID == r.PathID && v.Principal == p && r.SessionID != "" && v.SessionID == r.SessionID {
 				s.retireTicket(m, v)
 				delete(m.Tickets, tid)
 			}
@@ -357,16 +339,16 @@ func (s *Server) Reserve(ctx context.Context, p Principal, id string, r UploadRe
 			return e
 		}
 		s.expire(m)
-		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > MaxRequestBytes || r.MetadataBytes < 0 || r.MetadataBytes > 16384 {
+		if !validPathID(r.PathID) || r.SealedSize < 0 || r.SealedSize > MaxRequestBytes || r.MetadataBytes < 0 || r.MetadataBytes > 16384 || (r.SessionID != "" && !validID(r.SessionID)) {
 			return ErrInvalid
 		}
 		old := m.Files[id][r.PathID]
-		if old.Version != r.BaseVersion {
+		if !baseMatches(f.Folder, old, r.BaseVersion) {
 			return &ConflictError{[]string{r.PathID}}
 		}
 		for tid, v := range m.Tickets {
 			if v.FolderID == id && v.PathID == r.PathID {
-				if v.Principal != p {
+				if v.Principal != p || r.SessionID == "" || v.SessionID != r.SessionID {
 					return ErrBusy
 				}
 				s.retireTicket(m, v)
@@ -415,7 +397,7 @@ func (s *Server) Reserve(ctx context.Context, p Principal, id string, r UploadRe
 		if ttl <= 0 {
 			ttl = 5 * time.Minute
 		}
-		t = Ticket{ID: randomID(), FolderID: id, BlobID: randomID(), PathID: r.PathID, Principal: p, BaseVersion: r.BaseVersion, SealedSize: r.SealedSize, ReservedBytes: delta, ReservedFiles: max(files, 0), ReservedRows: rows, Expires: s.now().Add(ttl)}
+		t = Ticket{SessionID: r.SessionID, ID: randomID(), FolderID: id, BlobID: randomID(), PathID: r.PathID, Principal: p, BaseVersion: r.BaseVersion, SealedSize: r.SealedSize, ReservedBytes: delta, ReservedFiles: max(files, 0), ReservedRows: rows, Expires: s.now().Add(ttl)}
 		m.Tickets[t.ID] = t
 		return nil
 	})
@@ -427,7 +409,7 @@ func (s *Server) ticket(ctx context.Context, p Principal, id, tid string) (Ticke
 		return reader.authorize(ctx, p, id, true, tid, "", s.now())
 	}
 	var t Ticket
-	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
+	e := s.read(ctx, p, id, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
 		}
@@ -444,6 +426,7 @@ func (s *Server) ticket(ctx context.Context, p Principal, id, tid string) (Ticke
 	return t, e
 }
 func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ticket, r io.Reader) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	t, e := s.ticket(ctx, p, id, provided.ID)
 	if e != nil {
 		return e
@@ -513,6 +496,7 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 }
 
 func (s *Server) CancelUpload(ctx context.Context, p Principal, id, tid string) error {
+	ctx = context.WithValue(ctx, noFilesKey{}, true)
 	return s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		if _, e := access(m, p, id, true, false); e != nil {
 			return e
@@ -526,7 +510,15 @@ func (s *Server) CancelUpload(ctx context.Context, p Principal, id, tid string) 
 		return nil
 	})
 }
+func baseMatches(f Folder, r Row, base uint64) bool {
+	return r.Version == base || r.Version == 0 && base <= f.Horizon
+}
 func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutation) (Delta, error) {
+	paths := make([]string, 0, len(mut))
+	for _, v := range mut {
+		paths = append(paths, v.PathID)
+	}
+	ctx = context.WithValue(ctx, pathsKey{}, paths)
 	var out Delta
 	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, true, false)
@@ -552,7 +544,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 				return ErrInvalid
 			}
 			seen[v.PathID] = v
-			if m.Files[id][v.PathID].Version != v.BaseVersion {
+			if !baseMatches(f.Folder, m.Files[id][v.PathID], v.BaseVersion) {
 				conflicts = append(conflicts, v.PathID)
 			}
 		}
@@ -584,6 +576,9 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 			row := Row{FolderID: id, PathID: v.PathID, Version: f.Folder.Version, Deleted: v.Deleted}
 			if v.Deleted {
 				row.DeletedAt = s.now().UnixNano()
+				row.BlobID = old.BlobID
+				row.SealedSize = old.SealedSize
+				row.Metadata = old.Metadata
 				if v.TicketID != "" || len(v.Metadata) != 0 {
 					return ErrInvalid
 				}
@@ -620,7 +615,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 				row.Metadata = append([]byte(nil), v.Metadata...)
 				delete(m.Tickets, t.ID)
 			}
-			if old.BlobID != "" {
+			if old.BlobID != "" && !v.Deleted {
 				retired = append(retired, old)
 			}
 			m.Files[id][v.PathID] = row
@@ -660,8 +655,30 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 	return out, e
 }
 func (s *Server) Changes(ctx context.Context, p Principal, id string, after uint64) (Delta, error) {
+	if _, ok := s.Meta.(interface {
+		changesPage(context.Context, Principal, string, uint64, uint64, string) (Delta, error)
+	}); ok {
+		var out Delta
+		page := ""
+		until := uint64(0)
+		for {
+			d, e := s.ChangesPage(ctx, p, id, after, until, page)
+			if e != nil {
+				return Delta{}, e
+			}
+			out.Rows = append(out.Rows, d.Rows...)
+			out.Version = d.Version
+			out.Horizon = d.Horizon
+			out.Full = d.Full
+			if d.Next == "" {
+				return out, nil
+			}
+			page = d.Next
+			until = d.Version
+		}
+	}
 	var out Delta
-	e := s.transaction(ctx, p, id, false, func(m *Metadata) error {
+	e := s.read(ctx, p, id, func(m *Metadata) error {
 		f, e := access(m, p, id, false, false)
 		if e != nil {
 			return e
@@ -671,7 +688,7 @@ func (s *Server) Changes(ctx context.Context, p Principal, id string, after uint
 		}
 		out.Version = f.Folder.Version
 		out.Horizon = f.Folder.Horizon
-		out.Full = after < out.Horizon
+		out.Full = after == 0 || after < out.Horizon
 		if out.Full {
 			after = 0
 		}
@@ -696,7 +713,7 @@ func (s *Server) blobAccess(ctx context.Context, p Principal, id, blob string) e
 		_, e := reader.authorize(ctx, p, id, false, "", blob, s.now())
 		return e
 	}
-	return s.transaction(ctx, p, id, false, func(m *Metadata) error {
+	return s.read(ctx, p, id, func(m *Metadata) error {
 		if _, e := access(m, p, id, false, false); e != nil {
 			return e
 		}
