@@ -41,6 +41,7 @@ func main() {
 	maxFile := flags.Int64("max-file", 0, "maximum sealed bytes per entry, 0 unlimited")
 	maxTotal := flags.Int64("max-total", 0, "maximum sealed bytes in folder, 0 unlimited")
 	maxFiles := flags.Int64("max-files", 0, "maximum entries, 0 unlimited")
+	maxRows := flags.Int64("max-rows", 0, "maximum rows including tombstones and garbage; required for sharing")
 	_ = flags.Parse(os.Args[2:])
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -134,7 +135,7 @@ func main() {
 	}
 	switch command {
 	case "create":
-		f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: *name, Description: *description, Limits: ds.Limits{MaxFileBytes: *maxFile, MaxTotalBytes: *maxTotal, MaxFiles: *maxFiles}, KeyCheck: ds.KeyCheck(key)})
+		f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: *name, Description: *description, Limits: ds.Limits{MaxFileBytes: *maxFile, MaxTotalBytes: *maxTotal, MaxFiles: *maxFiles, MaxRows: *maxRows}, KeyCheck: ds.KeyCheck(key)})
 		if e != nil {
 			log.Fatal(e)
 		}

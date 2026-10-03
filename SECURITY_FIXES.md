@@ -1,4 +1,70 @@
-# Round-2 security repairs
+# Final-review repairs
+
+Reviewed base: `c584e8d`. All original proofs were imported and run before
+production edits. Adapted/strengthened versions also fail on a detached copy of
+that base; see [reviewtests/README.md](reviewtests/README.md) and the three final
+before logs. All ten findings and both requested design changes are addressed.
+There are no legacy-schema migrations or compatibility paths.
+Net change: **+1,996 lines** (2,128 added, 132 removed), including proofs/logs.
+
+| Item | Change and evidence |
+| --- | --- |
+| 1. Undercharged allocations / reduced caps | Allocation and limit changes check folder bytes plus garbage/reservations and the complete row budget before pricing. Caps below usage are refused. Both transport storage attacks and separate ticket/garbage/row-floor regressions pass. Reductions still never call pricing. |
+| 2 and 7. Unrelated-tenant scans / denied timing | Real indexed `owner`, ticket/garbage `folder` columns and a `grants(folder, principal)` table replace JSON grant searches. Listing starts from the principal index. Streaming checks and folder-version reads authorize through one indexed query; a missing grant never decodes the folder's grant set. Scale/timing proofs and EXPLAIN plans pass. |
+| 3. Truncated downloads | Early EOF returns `io.ErrUnexpectedEOF`, a transient retry; authenticated/framing corruption still returns `ErrIntegrity`. HTTP aborts the connection when copying a stream fails. The one-abort proof subsequently downloads the unchanged row. |
+| 4. Pending rename holds other uploads | Ordinary files go first, each rename pair commits separately, and independent batches failing limits retry one mutation at a time. CAS pairs remain indivisible. The row-ceiling wedge and its controls pass. |
+| 5. Rename onto tombstoned name | Rename discovery skips only nondeleted known targets; failed target reservations hold the source deletion. Both full-folder rename proofs pass. |
+| 6. Pricing outage stops sync | GetFolder/ListFolders return stored limits with no pricing call. The outage proof propagates an existing-row delete and continues listing. |
+| 8. Idle long-poll amplification | Per-folder idle wake channels and 32 waits per principal replace global broadcasts and the 250 ms query loop. Hubs are shared by same-process SQLite authorities, including canonicalized database paths. Wait admission, idle query counts, cross-authority changes and revocation/deletion pass. |
+| 9. Plan per-file cap exposure | Sharing requires an explicit positive MaxFileBytes within the plan. No pricing value is copied into visible folder limits. The missing-cap proof is refused at allocation. |
+| 10. Case-only aliases | Pull applies replaced deletes before creates, children before deleted parents, then directories before live children. The strengthened APFS proof requires the exact renamed path without aliases. |
+| Tombstone retention | Default 30-day TombstoneTTL, disabled with zero. Background collection compacts expired rows, updates the horizon and frees usage. Old cursors reconcile a stable full current set before writes; local dirty files survive as conflicts. Both transport offline/recreate proofs pass. |
+| Existing-directory attachment | Matching authenticated hashes/types/sizes are adopted and fsynced before saving the index. Both transports attach identical files without changing the authority version or creating copies, then propagate edits. |
+
+The before logs show the original assertions, followed by strengthened case,
+wait-admission and denial assertions and the two new design tests. Setup for
+large fixtures now uses one public admission and one bulk storage transaction,
+with the same 20,000 folders, 3,000 tickets and 30,720/20,480 tombstones. Measured
+requests and assertions are unchanged. The optimized folder/ticket proofs still
+fail on c584e8d. Opus2's full race package is **50.677 s**, versus the preceding
+round's **137.334 s**, without reducing cardinalities or quota/CAS coverage.
+An intermediate race run timed out in the original per-folder setup; another
+hit the five-second request deadline while checking all fixture folders. Those
+setup operations were replaced; the final complete suite passes.
+
+Executed on macOS arm64, Go 1.27.1:
+
+```sh
+go test -race ./... -count=1 -timeout 180s
+CGO_ENABLED=0 go test ./... -count=1 -timeout 120s
+CGO_ENABLED=0 GOOS=linux go vet ./...
+CGO_ENABLED=0 GOOS=linux go test -c -o /tmp/drivesync-linux.test .
+CGO_ENABLED=0 GOOS=linux go build -o /tmp/drivesync-linux ./cmd/drivesync
+for target in FuzzNormalizePath FuzzWireDecode FuzzOpenContent; do
+  go test -run '^$' -fuzz="^${target}$" -fuzztime=3s -parallel=2 .
+done
+go test -run '^TestWatcherPropagation$' -count=1 -v .
+go test -run '^$' -bench 'Benchmark(SmallFilePropagation|Scan10K|IndexedScan10K)$' -benchtime=3x
+```
+
+All pass. Main race package: 57.183 s; final-review race package: 30.828 s.
+Pure-Go main package: 20.660 s. Fuzz executions: path 21,894; wire 2,411;
+content 56,718. Seeded simulations (42, 9817, 20261003) pass. Native FSEvents
+propagation: 358 ms. Three-iteration benchmarks: propagation 274 ms/op, initial
+10k scan 359 ms/op, indexed scan 357 ms/op. These are short local observations.
+Linux was vetted/cross-built; its runtime tests were not executed here.
+
+No requested item was deferred. Fresh databases are required. Multi-process
+embedders must distribute durable folder/grant events through NotificationSource
+and Notifications.Notify; SQLite hubs alone cover same-process authorities.
+Existing constraints remain: bounded pricing/blob-size hooks hold the writer
+transaction; full local scans and folder-local write scans remain; no historical
+recovery or malicious-server freshness guarantee; exclusive restart coordination
+is required for RecoverUploads. An existing-row delete can briefly add
+bookkeeping charges until background GC/compaction, but cap changes can never
+hide those charges. No remote or push.
+
+## Earlier round-2 repairs
 
 Reviewed base: `2b29848`. Original proofs were run before production edits and
 imported under `reviewtests/`; adapted proofs were also run against a detached
@@ -66,12 +132,10 @@ per-read authorization; the eliminated cost is durable renewal writes.
   bounded to two seconds each and the transaction's five-second deadline.
   Folder write operations still materialize that folder's current rows; they do
   not materialize the account's other rows. Replicas still hash the whole tree.
-- Allocation persists until deletion/cleanup. Lowering allocated limits below
-  stored usage keeps existing content and blocks that folder's new writes. Exact
-  cap accounting can then reserve less than physical grandfathered storage;
-  this follows the requested exact-cap/reduction model. Existing-row deletes can
-  also temporarily increase tombstone/garbage charges. Future hard physical
-  billing needs an explicit policy for grandfathered capacity.
+- Allocation persists until deletion/cleanup. Allocation and cap changes now
+  reject capacity below folder usage (including tickets/garbage); see the final
+  review repairs below. Existing-row deletes may temporarily add garbage/tombstone
+  bookkeeping until background collection and compaction.
 - `RecoverUploads` requires exclusive restart coordination: all prior writers
   using the stores must have stopped. Ordinary GC never assumes a writer stopped
   merely because its ticket expired. Directory fsync checks inject failures and

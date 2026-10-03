@@ -40,7 +40,7 @@ func TestReviewRevokeAfterPlanDecrease(t *testing.T) {
 			})
 			k := ds.NewFolderKey()
 			f := folder(t, c, "shared", k)
-			if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+			if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxFileBytes: 5000, MaxRows: 1000}); e != nil {
 				t.Fatal(e)
 			}
 			a := ds.Principal{Tenant: "outside", Subject: "a"}
@@ -72,7 +72,7 @@ func TestReviewRenameCreditReusable(t *testing.T) {
 	}
 	budget := got.Usage.Bytes
 	s.Quotas = ds.QuotaFunc(func(context.Context, ds.Principal) (ds.Quota, error) { return ds.Quota{MaxTotalBytes: budget}, nil })
-	if e = c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: budget, MaxRows: 20}); e != nil {
+	if e = c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: budget, MaxFileBytes: budget, MaxRows: 20}); e != nil {
 		t.Fatal(e)
 	}
 	physical := old.SealedSize
@@ -120,7 +120,7 @@ func TestReviewSharedGarbageExceedsAllocation(t *testing.T) {
 	k := ds.NewFolderKey()
 	shared := folder(t, c, "shared", k)
 	private := folder(t, c, "private", k)
-	if e := c.SetLimits(ctx, shared.ID, ds.Limits{MaxTotalBytes: 2000, MaxRows: 1000}); e != nil {
+	if e := c.SetLimits(ctx, shared.ID, ds.Limits{MaxTotalBytes: 2000, MaxFileBytes: 2000, MaxRows: 1000}); e != nil {
 		t.Fatal(e)
 	}
 	p := ds.Principal{Tenant: "outside", Subject: "writer"}
@@ -260,7 +260,7 @@ func TestReviewSharedReservedRowsExceedAllocation(t *testing.T) {
 	k := ds.NewFolderKey()
 	f := folder(t, c, "shared", k)
 	private := folder(t, c, "private", k)
-	if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 2000, MaxRows: 100}); e != nil {
+	if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 2000, MaxFileBytes: 2000, MaxRows: 100}); e != nil {
 		t.Fatal(e)
 	}
 	p := ds.Principal{Tenant: "foreign", Subject: "writer"}
@@ -342,7 +342,7 @@ func TestReviewRawJSONVariants(t *testing.T) {
 	s, c := setup(t)
 	k := ds.NewFolderKey()
 	f := folder(t, c, "raw", k)
-	if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+	if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxFileBytes: 5000, MaxRows: 1000}); e != nil {
 		t.Fatal(e)
 	}
 	h := s.Handler(func(*http.Request) (ds.Principal, error) { return owner, nil })

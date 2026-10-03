@@ -50,6 +50,18 @@ Security takes priority over convenience:
   re-download an unchanged quarantined row; retry transient transfers separately.
   Lstat before opening and use nonblocking/no-follow opens against replacement.
   Renew tickets only after more than half their TTL has elapsed.
+- Require an explicit folder file cap within the plan; never copy plan values
+  into visible limits. Reject allocation/limit changes below folder byte/row usage,
+  including garbage and reservations, without querying pricing for reductions.
+  GetFolder/ListFolders return stored limits without pricing calls. Keep real
+  indexed folder columns for tickets/garbage and indexed owner/grant lookups.
+  Wait only on that folder's events, cap waits per principal, and propagate
+  events across authorities; never poll SQLite per idle subscriber.
+  Compact expired tombstones, reconcile cursors behind the horizon before writes,
+  and adopt existing files matching authenticated remote hashes without copies.
+  Apply case-rename deletes before creates; isolate rename commit pairs and retry
+  a limit-failed independent batch one unit at a time. Early stream EOF is transient;
+  authentication/framing failures are quarantined. Abort failed HTTP streams.
 - Revocation, downgrades, limit reductions and existing-row deletes never query
   quota. Only allocation growth queries pricing policy. Allocations persist until
   deletion and cleanup, including when the last grant is revoked.

@@ -30,16 +30,35 @@ func TestTombstoneSpamSlowsOtherTenants(t *testing.T) {
 	attacker := s.Client(ds.Principal{Tenant: "attacker", Subject: "a"})
 	af, _ := mkFolder(t, attacker, ds.Limits{})
 	start := time.Now()
-	for round := 0; round < 120; round++ {
-		var del []ds.Mutation
-		for i := 0; i < 256; i++ {
-			var b [32]byte
-			rand.Read(b[:])
-			del = append(del, ds.Mutation{PathID: hex.EncodeToString(b[:]), Deleted: true})
+	// Admit the first batch through the public API; seed the remaining identical
+	// legal tombstones in one storage transaction. Preserve all 30,720 rows.
+	var first []ds.Mutation
+	for i := 0; i < 256; i++ {
+		var b [32]byte
+		rand.Read(b[:])
+		first = append(first, ds.Mutation{PathID: hex.EncodeToString(b[:]), Deleted: true})
+	}
+	if _, e := attacker.Commit(bg, af.ID, first); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Meta.Transaction(bg, func(m *ds.Metadata) error {
+		f := m.Folders[af.ID]
+		for round := 1; round < 120; round++ {
+			f.Folder.Version++
+			for i := 0; i < 256; i++ {
+				var b [32]byte
+				rand.Read(b[:])
+				pid := hex.EncodeToString(b[:])
+				m.Files[af.ID][pid] = ds.Row{FolderID: af.ID, PathID: pid, Version: f.Folder.Version, Deleted: true}
+			}
 		}
-		if _, e := attacker.Commit(bg, af.ID, del); e != nil {
-			t.Fatal(e)
-		}
+		m.Folders[af.ID] = f
+		return nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	if got, e := attacker.GetFolder(bg, af.ID); e != nil || got.Usage.Rows != 30720 {
+		t.Fatal("scale fixture cardinality", got.Usage, e)
 	}
 	t.Logf("attacker wrote %d tombstones in %v under MaxFiles=1/MaxTotalBytes=1", 120*256, time.Since(start))
 	after := measure()

@@ -34,7 +34,7 @@ func setup(t *testing.T) (*ds.Server, ds.Client) {
 }
 func folder(t *testing.T, c ds.Client, name string, k ds.FolderKey) ds.Folder {
 	t.Helper()
-	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, Limits: ds.Limits{MaxTotalBytes: 4000, MaxRows: 1000}, KeyCheck: ds.KeyCheck(k)})
+	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, Limits: ds.Limits{MaxTotalBytes: 4000, MaxFileBytes: 4000, MaxRows: 1000}, KeyCheck: ds.KeyCheck(k)})
 	if e != nil {
 		t.Fatal(e)
 	}

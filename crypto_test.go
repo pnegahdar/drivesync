@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/zeebo/blake3"
+	"io"
 	"strings"
 	"testing"
 )
@@ -37,7 +38,11 @@ func TestCryptoIntegrity(t *testing.T) {
 	tamper[30] ^= 1
 	for name, blob := range map[string][]byte{"tampered": tamper, "truncated": orig[:len(orig)-21], "reordered": reordered, "extended": append(append([]byte(nil), orig...), 0)} {
 		t.Run(name, func(t *testing.T) {
-			if e := OpenContent(&bytes.Buffer{}, bytes.NewReader(blob), k, f, b, pid); e != ErrIntegrity {
+			expected := ErrIntegrity
+			if name == "truncated" {
+				expected = io.ErrUnexpectedEOF
+			}
+			if e := OpenContent(&bytes.Buffer{}, bytes.NewReader(blob), k, f, b, pid); e != expected {
 				t.Fatal(e)
 			}
 		})

@@ -4,7 +4,7 @@
 round-2 test; `astra2/` imports Astra's second tests and their original helpers.
 All runnable tests use the current prototype API:
 
-- Shared fixtures declare byte and row caps. The same-tenant probe lowers the
+- Shared fixtures declare explicit byte, row and file caps. The same-tenant probe lowers the
   plan after allocating, then observes a legitimate private delete; this makes
   the old owner-headroom oracle reachable without allocating huge test blobs.
 - Removed `Deletes` fields are supplied through JSON in the credit attack. The
@@ -28,3 +28,20 @@ failed-tombstone adaptations fail on that commit as well. `../round2_test.go`
 adds deterministic structural checks for renewal transaction counts, unrelated
 private row decoding, policy-free revocation/deletion, quarantine/restart,
 background GC, unused-ticket charges and full-folder pending renames.
+
+`final/` imports every c584e8d final-review proof. `final-before.txt` records the
+original run before edits; `final-adapted-before.txt` records the runnable tests
+against a detached c584e8d checkout, including assertions strengthened for case
+aliases, denied timing and wait admission. All ten findings fail there (2 and 7
+share indexed-access fixes). The two added design tests fail there too. Cap
+attacks accept a correct folder-local LimitError; the missing-file-cap test
+accepts refusal to allocate. Neither adaptation masks the original vulnerability.
+
+The folder-list fixture retains all 20,000 folders after one public creation.
+The ticket timing fixture admits one ticket through Reserve and seeds the other
+2,999 equivalent legal tickets in one transaction; the old scan still fails.
+Opus2's two scale fixtures likewise admit one 256-row CAS batch publicly, seed
+remaining identical tombstones once, and assert exact 30,720 / 20,480 row counts.
+Measured operations still use the public API. This removes quadratic setup costs
+under the race detector without reducing scale, timing assertions or separate
+quota/CAS coverage. Original slow before-runs are retained.

@@ -119,7 +119,7 @@ func TestAuthorizationChangesDoNotCallQuota(t *testing.T) {
 	if e := s.Client(admin).Revoke(ctx, f.ID, admin); e != nil {
 		t.Fatal("last grant cannot be revoked", e)
 	}
-	if e := c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: 512, MaxRows: 1}); e != nil {
+	if e := c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: 1024, MaxRows: 2, MaxFileBytes: 1024}); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}}); e != nil {
@@ -165,11 +165,11 @@ func TestQuarantineDoesNotRedownloadUnchangedBlob(t *testing.T) {
 	base := s.Client(owner)
 	f, k := folderFor(t, base, Limits{})
 	pid, _ := PathID(k, f.ID, "malformed")
-	ticket, e := base.Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 1})
+	ticket, e := base.Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 20})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e = base.Upload(context.Background(), f.ID, ticket, strings.NewReader("x")); e != nil {
+	if e = base.Upload(context.Background(), f.ID, ticket, strings.NewReader(strings.Repeat("x", 20))); e != nil {
 		t.Fatal(e)
 	}
 	meta, _ := SealMetadata(k, f.ID, pid, FileMetadata{Path: "malformed", BlobID: ticket.BlobID, Mode: 0600})
@@ -283,15 +283,15 @@ func TestAllocatedFileCapCannotBeRemoved(t *testing.T) {
 	s, _ := testServer(t)
 	s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) { return Quota{MaxFileBytes: 100}, nil })
 	c := s.Client(owner)
-	f, k := folderFor(t, c, Limits{MaxTotalBytes: 8192, MaxRows: 16})
+	f, k := folderFor(t, c, Limits{MaxTotalBytes: 8192, MaxRows: 16, MaxFileBytes: 100})
 	if e := c.Grant(context.Background(), f.ID, Principal{owner.Tenant, "guest"}, Writer); e != nil {
 		t.Fatal(e)
 	}
-	if e := c.SetLimits(context.Background(), f.ID, Limits{MaxTotalBytes: 8192, MaxRows: 16}); e != nil {
+	if e := c.SetLimits(context.Background(), f.ID, Limits{MaxTotalBytes: 8192, MaxRows: 16}); !errors.Is(e, ErrInvalid) {
 		t.Fatal(e)
 	}
 	pid, _ := PathID(k, f.ID, "large")
-	_, e := c.Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 101})
+	_, e := c.Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 2001})
 	var le *LimitError
 	if !errors.As(e, &le) || le.Maximum != 100 {
 		t.Fatal(e)

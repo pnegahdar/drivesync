@@ -65,7 +65,7 @@ func (s *Server) retireRow(m *Metadata, r Row) {
 // Run periodically even when no clients are active. Failed deletions remain charged.
 func (s *Server) CollectGarbage(ctx context.Context) error {
 	gcctx := context.WithValue(ctx, scopeKey{}, Scope{GC: true})
-	return s.collect(gcctx)
+	return errors.Join(s.collect(gcctx), s.CompactTombstones(ctx))
 }
 
 // RunGC runs maintenance in a background worker owned by the embedder. Start

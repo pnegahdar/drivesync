@@ -656,6 +656,15 @@ func (r *Replica) sync(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
+	if r.version == 0 || r.version < folder.Horizon {
+		if e = r.reconcile(ctx, local, r.version < folder.Horizon); e != nil {
+			return e
+		}
+		local, e = r.scan()
+		if e != nil {
+			return e
+		}
+	}
 	paths := make([]string, 0, len(local))
 	var up int64
 	for p, v := range local {
@@ -677,7 +686,7 @@ func (r *Replica) sync(ctx context.Context) error {
 	heldDeletes := map[string]bool{}
 	for _, p := range paths {
 		v := local[p]
-		if _, known := r.index[p]; known {
+		if i, known := r.index[p]; known && !i.Deleted {
 			continue
 		}
 		for old, i := range r.index {
@@ -694,10 +703,13 @@ func (r *Replica) sync(ctx context.Context) error {
 			}
 		}
 	}
+	// Independent uploads get their headroom before pending atomic renames.
+	sort.SliceStable(paths, func(i, j int) bool { _, a := renames[paths[i]]; _, b := renames[paths[j]]; return !a && b })
 	batch := []Mutation{}
 	snapshots := map[string]localFile{}
 	tickets := []Ticket{}
-	flush := func() error {
+	var flush func() error
+	flush = func() error {
 		if len(batch) == 0 {
 			return nil
 		}
@@ -757,6 +769,37 @@ func (r *Replica) sync(ctx context.Context) error {
 				d = Delta{}
 			}
 		}
+		if isLimit(e) && len(batch) > 1 {
+			independent := true
+			for _, m := range batch {
+				if m.Deleted {
+					independent = false
+				}
+			}
+			if independent {
+				pending, saved, uploaded := batch, snapshots, tickets
+				for _, m := range pending {
+					batch = []Mutation{m}
+					snapshots = map[string]localFile{}
+					tickets = nil
+					for p, v := range saved {
+						pid, _ := PathID(r.key, r.folder, p)
+						if pid == m.PathID {
+							snapshots[p] = v
+						}
+					}
+					for _, t := range uploaded {
+						if t.ID == m.TicketID {
+							tickets = []Ticket{t}
+						}
+					}
+					if fe := flush(); fe != nil {
+						return fe
+					}
+				}
+				return nil
+			}
+		}
 		if e != nil {
 			for _, t := range tickets {
 				_ = r.client.CancelUpload(ctx, r.folder, t.ID)
@@ -804,7 +847,8 @@ func (r *Replica) sync(ctx context.Context) error {
 		v := local[p]
 		// Do not let a slow next transfer expire already-uploaded batch members.
 		// Renewal protects the stream currently flowing, not idle sibling tickets.
-		if len(batch) > 0 && (v.Size > ChunkSize || time.Now().Add(time.Second).After(tickets[0].Expires)) {
+		_, isRename := renames[p]
+		if len(batch) > 0 && (isRename || v.Size > ChunkSize || time.Now().Add(time.Second).After(tickets[0].Expires)) {
 			if e = flush(); e != nil {
 				return e
 			}
@@ -940,7 +984,7 @@ func (r *Replica) sync(ctx context.Context) error {
 		r.mu.Lock()
 		delete(r.rejected, p)
 		r.mu.Unlock()
-		if len(batch) >= 64 || v.Size > ChunkSize {
+		if len(batch) >= 64 || v.Size > ChunkSize || isRename {
 			if e = flush(); e != nil {
 				return e
 			}
@@ -1035,7 +1079,7 @@ func (r *Replica) sync(ctx context.Context) error {
 	sort.SliceStable(delta.Rows, func(i, j int) bool {
 		a, b := delta.Rows[i], delta.Rows[j]
 		if a.Deleted != b.Deleted {
-			return !a.Deleted
+			return a.Deleted
 		}
 		if a.Deleted {
 			return len(r.byID[a.PathID]) > len(r.byID[b.PathID])
@@ -1356,7 +1400,7 @@ func (r *Replica) apply(ctx context.Context, row Row) error {
 	// Inspect immediately before publishing: edits during download are preserved too.
 	v, ve := r.inspect(p, local)
 	if ve == nil {
-		dirty := !known || !sameFile(v, i)
+		dirty := (!known || !sameFile(v, i)) && (v.Directory || v.Hash != m.Hash || v.Size != m.Size)
 		if dirty || v.Directory {
 			if _, e = r.preserve(local); e != nil {
 				return e

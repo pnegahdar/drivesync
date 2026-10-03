@@ -19,10 +19,9 @@ import (
 
 type FolderRecord struct {
 	Folder    Folder
-	Grants    map[string]Role
+	Grants    map[string]Role `json:"-"`
 	Allocated bool
 	Deleted   bool
-	OwnerKey  string
 	FileUsage Usage
 }
 type Garbage struct {
@@ -56,7 +55,14 @@ type MetaStore interface {
 }
 
 // SQLiteMetaStore stores one durable SQL row per folder, file and reservation.
-type SQLiteMetaStore struct{ db *sql.DB }
+type SQLiteMetaStore struct {
+	db        *sql.DB
+	wakes     *notifications
+	release   func()
+	closeOnce sync.Once
+}
+
+func (s *SQLiteMetaStore) Notifications() *Notifications { return s.wakes }
 
 func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 	db, e := sql.Open("sqlite", name)
@@ -64,15 +70,45 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL", `CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`, `CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE INDEX IF NOT EXISTS folders_owner ON folders(json_extract(data,'$.OwnerKey'))`, `CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(json_extract(data,'$.OwnerKey'),json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`, `CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(json_extract(data,'$.FolderID'))`, `CREATE INDEX IF NOT EXISTS files_version ON files(folder,json_extract(data,'$.Version'),path)`, `CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(json_extract(data,'$.FolderID'))`, `CREATE INDEX IF NOT EXISTS files_blob ON files(folder,json_extract(data,'$.BlobID'))`} {
+	for _, q := range []string{
+		"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL",
+		`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS grants (folder TEXT NOT NULL, principal TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,principal))`,
+		`CREATE INDEX IF NOT EXISTS grants_principal ON grants(principal,folder)`,
+		`CREATE INDEX IF NOT EXISTS folders_owner ON folders(owner)`,
+		`CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`,
+		`CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner,json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`,
+		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder)`,
+		`CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(folder)`,
+		`CREATE INDEX IF NOT EXISTS files_version ON files(folder,json_extract(data,'$.Version'),path)`,
+		`CREATE INDEX IF NOT EXISTS files_tombstones ON files(json_extract(data,'$.DeletedAt'),folder) WHERE json_extract(data,'$.Deleted')=1`,
+		`CREATE INDEX IF NOT EXISTS files_blob ON files(folder,json_extract(data,'$.BlobID'))`,
+	} {
 		if _, e = db.Exec(q); e != nil {
 			db.Close()
 			return nil, e
 		}
 	}
-	return &SQLiteMetaStore{db: db}, nil
+	hubName := ":memory:"
+	var seq int
+	var databaseName, file string
+	if e = db.QueryRow("PRAGMA database_list").Scan(&seq, &databaseName, &file); e != nil {
+		db.Close()
+		return nil, e
+	}
+	if file != "" {
+		hubName = file
+		if canonical, e := filepath.EvalSymlinks(file); e == nil {
+			hubName = canonical
+		}
+	}
+	wakes, release := sqliteNotifications(hubName)
+	return &SQLiteMetaStore{db: db, wakes: wakes, release: release}, nil
 }
-func (s *SQLiteMetaStore) Close() error { return s.db.Close() }
+func (s *SQLiteMetaStore) Close() error { e := s.db.Close(); s.closeOnce.Do(s.release); return e }
 
 // Scope describes the records needed by a metadata transaction. Folder operations
 // select only Folder and its primary owner counter; an empty Folder lists visible
@@ -103,13 +139,21 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 	if _, e = tx.ExecContext(ctx, "UPDATE folders SET id=id WHERE 0"); e != nil {
 		return e
 	}
+	if scope, ok := ScopeFromContext(ctx); ok && scope.Folder != "" && scope.Principal.valid() {
+		if _, e := sqlRole(ctx, tx, scope.Principal, scope.Folder, false); e != nil {
+			return e
+		}
+	}
 	m := newMetadata()
 	old := map[string]map[string][]byte{}
-	for _, table := range []string{"folders", "files", "tickets", "garbage"} {
+	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
 		old[table] = map[string][]byte{}
 		q := "SELECT id,data FROM " + table
 		if table == "files" {
 			q = "SELECT folder || '/' || path,data FROM files"
+		}
+		if table == "grants" {
+			q = "SELECT folder || '/' || principal,data FROM grants"
 		}
 		var args []any
 		if scope, ok := ctx.Value(scopeKey{}).(Scope); ok {
@@ -121,8 +165,8 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 					filter = "0"
 					args = nil
 				} else {
-					filter = `json_extract(data,'$.OwnerKey')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(data,'$.Grants')) WHERE key=?)`
-					args = []any{principalKey(scope.Principal), principalKey(scope.Principal)}
+					filter = `id IN (SELECT folder FROM grants WHERE principal=?)`
+					args = []any{principalKey(scope.Principal)}
 				}
 			}
 			if scope.GC {
@@ -138,7 +182,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			} else if table == "files" {
 				q += " WHERE folder IN (SELECT id FROM folders WHERE " + filter + ")"
 			} else {
-				q += ` WHERE json_extract(data,'$.FolderID') IN (SELECT id FROM folders WHERE ` + filter + ")"
+				q += ` WHERE folder IN (SELECT id FROM folders WHERE ` + filter + ")"
 			}
 		}
 		rs, e := tx.QueryContext(ctx, q, args...)
@@ -154,6 +198,14 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			}
 			old[table][id] = data
 			switch table {
+			case "grants":
+				var role Role
+				e = json.Unmarshal(data, &role)
+				f := m.Folders[id[:32]]
+				if id[33:] != principalKey(f.Folder.Owner) {
+					f.Grants[id[33:]] = role
+				}
+				m.Folders[id[:32]] = f
 			case "garbage":
 				var v Garbage
 				if e = json.Unmarshal(data, &v); e == nil {
@@ -162,6 +214,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			case "folders":
 				var v FolderRecord
 				if e = json.Unmarshal(data, &v); e == nil {
+					v.Grants = map[string]Role{}
 					m.Folders[id] = v
 					if m.Files[id] == nil {
 						m.Files[id] = map[string]Row{}
@@ -191,7 +244,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		if e != nil {
 			return e
 		}
-		if table == "folders" {
+		if table == "grants" {
 			if scope, ok := ScopeFromContext(ctx); ok && scope.Folder != "" && scope.Principal.valid() {
 				if _, e = access(m, scope.Principal, scope.Folder, false, false); e != nil {
 					return e
@@ -246,13 +299,19 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		}
 	}
 
-	next := map[string]map[string][]byte{"folders": {}, "files": {}, "tickets": {}, "garbage": {}}
+	next := map[string]map[string][]byte{"folders": {}, "grants": {}, "files": {}, "tickets": {}, "garbage": {}}
 	for id, v := range m.Folders {
 		b, e := json.Marshal(v)
 		if e != nil {
 			return e
 		}
 		next["folders"][id] = b
+		if !v.Deleted {
+			next["grants"][id+"/"+principalKey(v.Folder.Owner)], _ = json.Marshal(Owner)
+			for key, role := range v.Grants {
+				next["grants"][id+"/"+key], _ = json.Marshal(role)
+			}
+		}
 	}
 	for f, rows := range m.Files {
 		for p, v := range rows {
@@ -277,7 +336,7 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		}
 		next["tickets"][id] = b
 	}
-	for _, table := range []string{"folders", "files", "tickets", "garbage"} {
+	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
 		for id, b := range next[table] {
 			if bytes.Equal(b, old[table][id]) {
 				continue
@@ -287,7 +346,24 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 					return e
 				}
 			} else {
-				if _, e = tx.ExecContext(ctx, "INSERT INTO "+table+"(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", id, b); e != nil {
+				query := "INSERT INTO " + table + "(id,folder,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
+				folder := ""
+				if table == "tickets" {
+					folder = m.Tickets[id].FolderID
+				}
+				if table == "garbage" {
+					folder = m.Garbage[id].FolderID
+				}
+				args := []any{id, folder, b}
+				if table == "folders" {
+					query = "INSERT INTO folders(id,owner,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
+					args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
+				}
+				if table == "grants" {
+					query = "INSERT INTO grants(folder,principal,data) VALUES(?,?,?) ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
+					args = []any{id[:32], id[33:], b}
+				}
+				if _, e = tx.ExecContext(ctx, query, args...); e != nil {
 					if table == "folders" && strings.Contains(e.Error(), "UNIQUE constraint failed") {
 						return ErrConflict
 					}
@@ -301,6 +377,8 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			}
 			if table == "files" {
 				_, e = tx.ExecContext(ctx, "DELETE FROM files WHERE folder=? AND path=?", id[:32], id[33:])
+			} else if table == "grants" {
+				_, e = tx.ExecContext(ctx, "DELETE FROM grants WHERE folder=? AND principal=?", id[:32], id[33:])
 			} else {
 				_, e = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id=?", id)
 			}
@@ -309,7 +387,32 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			}
 		}
 	}
-	return tx.Commit()
+	if e = tx.Commit(); e != nil {
+		return e
+	}
+	changed := map[string]bool{}
+	for _, table := range []string{"folders", "grants"} {
+		for id, b := range next[table] {
+			if !bytes.Equal(b, old[table][id]) {
+				if table == "grants" {
+					id = id[:32]
+				}
+				changed[id] = true
+			}
+		}
+		for id := range old[table] {
+			if _, ok := next[table][id]; !ok {
+				if table == "grants" {
+					id = id[:32]
+				}
+				changed[id] = true
+			}
+		}
+	}
+	for id := range changed {
+		s.wakes.notify(id)
+	}
+	return nil
 }
 
 // BlobStore must create immutable objects, report actual stored sizes, and honor
@@ -504,9 +607,12 @@ type authorizationReader interface {
 }
 
 func (s *SQLiteMetaStore) authorize(ctx context.Context, p Principal, id string, write bool, ticket, blob string, now time.Time) (Ticket, error) {
-	var folderJSON, ticketJSON []byte
-	query := `SELECT f.data, COALESCE(t.data,'null') FROM folders f LEFT JOIN tickets t ON t.id=? AND json_extract(t.data,'$.FolderID')=f.id WHERE f.id=?`
-	args := []any{ticket, id}
+	if !p.valid() {
+		return Ticket{}, ErrDenied
+	}
+	var roleJSON, ticketJSON []byte
+	query := `SELECT g.data, COALESCE(t.data,'null') FROM grants g JOIN folders f ON f.id=g.folder LEFT JOIN tickets t ON t.id=? AND t.folder=g.folder WHERE g.folder=? AND g.principal=?`
+	args := []any{ticket, id, principalKey(p)}
 	if ticket != "" {
 		query += ` AND t.id IS NOT NULL`
 	}
@@ -514,19 +620,18 @@ func (s *SQLiteMetaStore) authorize(ctx context.Context, p Principal, id string,
 		query += ` AND EXISTS(SELECT 1 FROM files r WHERE r.folder=f.id AND json_extract(r.data,'$.BlobID')=? AND json_extract(r.data,'$.Deleted')=0)`
 		args = append(args, blob)
 	}
-	if e := s.db.QueryRowContext(ctx, query, args...).Scan(&folderJSON, &ticketJSON); e != nil {
+	if e := s.db.QueryRowContext(ctx, query, args...).Scan(&roleJSON, &ticketJSON); e != nil {
 		if errors.Is(e, sql.ErrNoRows) {
 			return Ticket{}, ErrDenied
 		}
 		return Ticket{}, e
 	}
-	var f FolderRecord
-	if e := json.Unmarshal(folderJSON, &f); e != nil {
+	var role Role
+	if e := json.Unmarshal(roleJSON, &role); e != nil {
 		return Ticket{}, e
 	}
-	m := &Metadata{Folders: map[string]FolderRecord{id: f}}
-	if _, e := access(m, p, id, write, false); e != nil {
-		return Ticket{}, e
+	if role != Owner && role != Writer && role != Reader || write && role == Reader {
+		return Ticket{}, ErrDenied
 	}
 	var t Ticket
 	if ticket != "" {
@@ -548,27 +653,55 @@ type versionReader interface {
 }
 
 func (s *SQLiteMetaStore) folderVersion(ctx context.Context, p Principal, id string) (uint64, error) {
+	if !p.valid() {
+		return 0, ErrDenied
+	}
+	var version uint64
+	e := s.db.QueryRowContext(ctx, `SELECT json_extract(f.data,'$.Folder.Version') FROM grants g JOIN folders f ON f.id=g.folder WHERE g.folder=? AND g.principal=? AND json_extract(g.data,'$') IN ('owner','writer','reader')`, id, principalKey(p)).Scan(&version)
+	if errors.Is(e, sql.ErrNoRows) {
+		return 0, ErrDenied
+	}
+	return version, e
+}
+
+type sqlQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func sqlRole(ctx context.Context, q sqlQueryer, p Principal, id string, write bool) (Role, error) {
+	if !p.valid() {
+		return "", ErrDenied
+	}
 	var data []byte
-	if e := s.db.QueryRowContext(ctx, "SELECT data FROM folders WHERE id=?", id).Scan(&data); e != nil {
-		if errors.Is(e, sql.ErrNoRows) {
-			return 0, ErrDenied
-		}
-		return 0, e
+	e := q.QueryRowContext(ctx, "SELECT data FROM grants WHERE folder=? AND principal=?", id, principalKey(p)).Scan(&data)
+	if errors.Is(e, sql.ErrNoRows) {
+		return "", ErrDenied
 	}
-	var f FolderRecord
-	if e := json.Unmarshal(data, &f); e != nil {
-		return 0, e
+	if e != nil {
+		return "", e
 	}
-	if _, e := access(&Metadata{Folders: map[string]FolderRecord{id: f}}, p, id, false, false); e != nil {
-		return 0, e
+	var role Role
+	if e = json.Unmarshal(data, &role); e != nil {
+		return "", e
 	}
-	return f.Folder.Version, nil
+	if role != Owner && role != Writer && role != Reader || write && role == Reader {
+		return "", ErrDenied
+	}
+	return role, nil
 }
 
 func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id string, after, until uint64, page string) (Delta, error) {
 	version, e := s.folderVersion(ctx, p, id)
 	if e != nil {
 		return Delta{}, e
+	}
+	var horizon uint64
+	if e = s.db.QueryRowContext(ctx, "SELECT json_extract(data,'$.Folder.Horizon') FROM folders WHERE id=?", id).Scan(&horizon); e != nil {
+		return Delta{}, e
+	}
+	full := after < horizon
+	if full {
+		after = 0
 	}
 	if after > version {
 		return Delta{}, ErrInvalid
@@ -588,7 +721,7 @@ func (s *SQLiteMetaStore) changesPage(ctx context.Context, p Principal, id strin
 		return Delta{}, e
 	}
 	defer rows.Close()
-	out := Delta{Version: until}
+	out := Delta{Version: until, Horizon: horizon, Full: full}
 	for rows.Next() {
 		var data []byte
 		var row Row

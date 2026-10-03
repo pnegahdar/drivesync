@@ -32,6 +32,9 @@ func folderFor(t testing.TB, c Client, l Limits) (Folder, FolderKey) {
 	if l.MaxTotalBytes > 0 && l.MaxRows == 0 {
 		l.MaxRows = max(1, l.MaxTotalBytes/RowCost)
 	}
+	if l.MaxTotalBytes > 0 && l.MaxFileBytes == 0 {
+		l.MaxFileBytes = l.MaxTotalBytes
+	}
 	k := NewFolderKey()
 	f, e := c.CreateFolder(context.Background(), FolderSpec{Name: randomID(), Limits: l, KeyCheck: KeyCheck(k)})
 	if e != nil {

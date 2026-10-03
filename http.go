@@ -216,7 +216,9 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 				}
 				defer stream.Close()
 				w.Header().Set("Content-Type", "application/octet-stream")
-				_, _ = io.Copy(w, stream)
+				if _, e = io.Copy(w, stream); e != nil {
+					panic(http.ErrAbortHandler)
+				}
 				return
 			}
 		}
@@ -335,6 +337,8 @@ func (c *HTTPClient) Changes(x context.Context, id string, v uint64) (Delta, err
 		}
 		out.Rows = append(out.Rows, r.Delta.Rows...)
 		out.Version = r.Delta.Version
+		out.Horizon = r.Delta.Horizon
+		out.Full = r.Delta.Full
 		until = out.Version
 		if r.Delta.Next == "" {
 			return out, nil

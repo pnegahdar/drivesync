@@ -38,16 +38,35 @@ func TestCrossTenantTimingTracksPrivateRows(t *testing.T) {
 		return ds_[4]
 	}
 	base := probe()
-	for round := 0; round < 80; round++ { // alice's private activity: 20,480 rows
-		var del []ds.Mutation
-		for i := 0; i < 256; i++ {
-			var b [32]byte
-			rand.Read(b[:])
-			del = append(del, ds.Mutation{PathID: hex.EncodeToString(b[:]), Deleted: true})
+	// Admit the first batch through the public API; seed the remaining identical
+	// legal tombstones in one storage transaction. Preserve all 20,480 rows.
+	var first []ds.Mutation
+	for i := 0; i < 256; i++ {
+		var b [32]byte
+		rand.Read(b[:])
+		first = append(first, ds.Mutation{PathID: hex.EncodeToString(b[:]), Deleted: true})
+	}
+	if _, e := ac.Commit(bg, private.ID, first); e != nil {
+		t.Fatal(e)
+	}
+	if e := s.Meta.Transaction(bg, func(m *ds.Metadata) error {
+		f := m.Folders[private.ID]
+		for round := 1; round < 80; round++ {
+			f.Folder.Version++
+			for i := 0; i < 256; i++ {
+				var b [32]byte
+				rand.Read(b[:])
+				pid := hex.EncodeToString(b[:])
+				m.Files[private.ID][pid] = ds.Row{FolderID: private.ID, PathID: pid, Version: f.Folder.Version, Deleted: true}
+			}
 		}
-		if _, e := ac.Commit(bg, private.ID, del); e != nil {
-			t.Fatal(e)
-		}
+		m.Folders[private.ID] = f
+		return nil
+	}); e != nil {
+		t.Fatal(e)
+	}
+	if got, e := ac.GetFolder(bg, private.ID); e != nil || got.Usage.Rows != 20480 {
+		t.Fatal("scale fixture cardinality", got.Usage, e)
 	}
 	after := probe()
 	t.Logf("bob's median reserve+cancel: %v before, %v after alice wrote 20,480 rows to a folder bob cannot see (x%.0f)", base, after, float64(after)/float64(base))

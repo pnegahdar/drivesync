@@ -45,7 +45,7 @@ The authenticated `Client` interface exposes `CreateFolder`, `GetFolder`,
 `CancelUpload`, `Commit`, `Changes`, `Download`, and long-poll `Wait`.
 `Changes` aggregates bounded pages over HTTP; `Server.ChangesPage` exposes a
 512-row continuation for integrations. `Server.RunGC(ctx, interval)` runs maintenance in a background worker;
-`CollectGarbage(ctx)` runs one explicit pass. Requests never collect garbage. Every server
+`CollectGarbage(ctx)` runs one explicit pass, including tombstone compaction. Requests never collect garbage. Every server
 operation also accepts an explicit principal. `Server.Subscribe` supplies an
 in-process event channel with a terminal error on revocation or deletion.
 `Attach` starts automatic sync; `Options.Manual` and `Replica.Sync(ctx)` allow
@@ -58,7 +58,11 @@ principal from trusted credentials; identity fields in a request cannot choose
 the caller. Use HTTPS outside localhost. RPC requests are limited to 1 MiB;
 HTTP clients default to a 64 MiB metadata response limit, configurable through
 `MaxResponseBytes` (negative disables it). Blob bodies stream independently.
-The HTTP subscription transport is long polling rather than SSE.
+The HTTP subscription transport is long polling rather than SSE. Waits are idle
+until that folder changes, with at most 32 concurrent waits per principal.
+SQLite authorities in the same process share notifications. A multi-process
+embedder must distribute durable folder/grant events through `NotificationSource`
+and `Notifications.Notify`; there is no polling fallback for external mutations.
 
 `MetaStore.Transaction` is the embedding seam for durable, atomic metadata
 storage. Its callback sees folder records, current file rows, reservations, a
@@ -68,8 +72,9 @@ counter, then call `Metadata.Prepare` before the callback and `Metadata.Finish`
 afterward. Persist records and counters in the same transaction. SQLite folder
 operations never load the owner's other folders or rows. Listing reads cached
 folder usage; streaming authorization and paginated changes use targeted queries.
-Maintenance may visit all definitions, reservations and garbage, but omits file
-payloads. Replicas
+Indexed owner/grant and ticket/garbage folder columns avoid unrelated-tenant scans.
+Maintenance may visit all definitions, reservations and garbage; compaction loads
+only folders with expired tombstones. Replicas
 currently hash the full local tree on each sync; incremental dirty-path scans
 remain future performance work. `BlobStore` creates immutable objects, opens
 streams, reports actual sizes and deletes objects. Memory and local-directory
@@ -114,7 +119,12 @@ Security and behavior:
   path cannot fit, both halves remain pending and the old remote path survives;
   empty directories use encrypted directory markers. Busy upload paths retry
   without conflict copies; batches preserve only paths whose versions lost.
-  Tombstones retain versions, including when a path is recreated.
+  Tombstones retain versions until the retention horizon (`Server.TombstoneTTL`,
+  30 days by default, zero disables compaction). Maintenance removes expired
+  tombstones and their charges. `Folder.Horizon` / `Delta.Full` instruct older
+  cursors to reconcile the full current set before writes, preserving unsynced
+  contents. Files already matching authenticated remote hashes are adopted in
+  sync when attaching an existing directory; no duplicate conflict copies.
 - Downloads use authenticated staging, fsync, rename and directory fsync. An
   `os.Root` confines filesystem operations, including when parents change. Paths
   are validated after decryption; symlinks are skipped/rejected. Case collisions
@@ -154,20 +164,24 @@ Security and behavior:
   have stopped, then let GC remove interrupted staging/publications. A generic
   BlobStore cannot prove that a different process has stopped publishing.
 - **Every shared folder is allocated**, including grants within the same tenant.
-  The first grant requires explicit `MaxTotalBytes` and `MaxRows`. The owner's
+  The first grant requires explicit `MaxTotalBytes`, `MaxRows`, and
+  `MaxFileBytes` within the owner's plan. The owner's
   quota reserves exactly the byte cap and `min(MaxRows, MaxTotalBytes / RowCost)`
   rows, never a maximum of that capacity and current usage. Garbage, reservations
   and rows consume only that folder's headroom; grantee activity cannot block
-  private writes or probe private usage. A plan's file cap is captured in the
-  folder's file limit when allocating/growing capacity. Later plan decreases
+  private writes or probe private usage. Allocation and limit changes reject byte
+  or row caps below actual folder usage, including garbage and reservations.
+  File ceilings are explicit folder choices, never copied from plan values.
+  `GetFolder` / `ListFolders` return stored limits without calling pricing.
+  Later plan decreases
   grandfather existing shared capacity; private writes obey the current quota.
 - Only the primary owner may grow or change allocated limits. Delegated owners
   can manage grants, including revoking themselves or the last grantee. Allocation
   remains until folder deletion and physical cleanup, so revoking the last grant
   does not consult pricing policy. Quota is checked only when capacity grows.
   Revocation, downgrades, reductions and existing-row deletes never consult quota.
-  Deletes remain legal above reduced limits; retained tombstones and garbage can
-  keep that folder above its reduced cap and block new writes until collection.
+  Limit reductions check only folder usage and reject caps below it. Existing-row
+  deletes remain legal during plan outages and over-plan usage.
   Creating new tombstones still consumes quota. Deleted folders disappear from
   access/listing immediately; queued cleanup remains durable and charged.
 - Rejected files stay locally and appear in `Status`. Automatic retries wait at

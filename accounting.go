@@ -57,7 +57,6 @@ func (m *Metadata) Prepare(filesLoaded bool) {
 // callback succeeds, then atomically persist the records and counters.
 func (m *Metadata) Finish() {
 	for id, f := range m.Folders {
-		f.OwnerKey = principalKey(f.Folder.Owner)
 		if m.filesLoaded {
 			f.FileUsage = fileUsage(m.Files[id])
 		}

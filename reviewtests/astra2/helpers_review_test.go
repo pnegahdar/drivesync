@@ -74,7 +74,7 @@ func TestRawJSONPrincipalAlias(t *testing.T) {
 			s, c := setup(t)
 			k := ds.NewFolderKey()
 			f := folder(t, c, "folder", k)
-			if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+			if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxFileBytes: 5000, MaxRows: 1000}); e != nil {
 				t.Fatal(e)
 			}
 			p := ds.Principal{Tenant: "guest", Subject: "\uFFFD"}
@@ -99,7 +99,7 @@ func TestWriterOwnerUsageLeak(t *testing.T) {
 	k := ds.NewFolderKey()
 	shared := folder(t, c, "shared", k)
 	private := folder(t, c, "ungranted", k)
-	if e := c.SetLimits(ctx, shared.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+	if e := c.SetLimits(ctx, shared.ID, ds.Limits{MaxTotalBytes: 5000, MaxFileBytes: 5000, MaxRows: 1000}); e != nil {
 		t.Fatal(e)
 	}
 	outsider := ds.Principal{Tenant: "other-tenant", Subject: "collaborator"}

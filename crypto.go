@@ -280,7 +280,7 @@ func writeAll(w io.Writer, p []byte) error {
 
 func contentReadError(e error) error {
 	if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
-		return ErrIntegrity
+		return io.ErrUnexpectedEOF
 	}
 	return e
 }

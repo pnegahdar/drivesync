@@ -20,6 +20,9 @@ func (s *Server) ChangesPage(ctx context.Context, p Principal, id string, after,
 	if e != nil {
 		return Delta{}, e
 	}
+	if d.Full {
+		after = 0
+	}
 	if until == 0 {
 		until = d.Version
 	}
@@ -39,7 +42,7 @@ func (s *Server) ChangesPage(ctx context.Context, p Principal, id string, after,
 		}
 		cp = parts[1]
 	}
-	out := Delta{Version: until}
+	out := Delta{Version: until, Horizon: d.Horizon, Full: d.Full}
 	for _, r := range d.Rows {
 		if r.Version > until || r.Version < cv || (r.Version == cv && r.PathID <= cp) {
 			continue

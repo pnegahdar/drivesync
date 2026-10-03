@@ -6,7 +6,6 @@ import (
 	"io"
 	"math"
 	"sort"
-	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -17,12 +16,16 @@ type Server struct {
 	Quotas         QuotaPolicy
 	ReservationTTL time.Duration
 	Now            func() time.Time
-	mu             sync.Mutex
-	signal         chan struct{}
+	wakes          *notifications
+	TombstoneTTL   time.Duration
 }
 
 func NewServer(meta MetaStore, blobs BlobStore) *Server {
-	return &Server{Meta: meta, Blobs: blobs, ReservationTTL: 5 * time.Minute, Now: time.Now, signal: make(chan struct{})}
+	s := &Server{Meta: meta, Blobs: blobs, ReservationTTL: 5 * time.Minute, Now: time.Now, wakes: newNotifications(), TombstoneTTL: 30 * 24 * time.Hour}
+	if source, ok := meta.(NotificationSource); ok {
+		s.wakes = source.Notifications()
+	}
+	return s
 }
 func principalKey(p Principal) string { b, _ := json.Marshal(p); return string(b) }
 func access(m *Metadata, p Principal, id string, write, owner bool) (FolderRecord, error) {
@@ -48,12 +51,7 @@ func (s *Server) now() time.Time {
 	}
 	return time.Now()
 }
-func (s *Server) notify() {
-	s.mu.Lock()
-	close(s.signal)
-	s.signal = make(chan struct{})
-	s.mu.Unlock()
-}
+func (s *Server) notify(id string) { s.wakes.notify(id) }
 func (s *Server) expire(m *Metadata) {
 	for id, t := range m.Tickets {
 		if !t.Expires.After(s.now()) {
@@ -114,11 +112,23 @@ func ownerLimit(p Principal, f FolderRecord, name string, max, n int64) error {
 // Allocations are sticky until folder deletion. Revocations and downgrades
 // change authorization only, so they never query the owner's pricing policy.
 func (s *Server) allocation(ctx context.Context, m *Metadata, p Principal, f, old FolderRecord) error {
+	if (!old.Allocated && len(f.Grants) > 0) || f.Folder.Limits != old.Folder.Limits {
+		u := usage(m, f.Folder.ID)
+		if e := limit("folder bytes", f.Folder.Limits.MaxTotalBytes, sat(u.Bytes, u.Reserved)); e != nil {
+			return e
+		}
+		if e := limit("folder rows", rowBudget(f.Folder.Limits), sat(sat(u.Rows, u.GarbageRows), u.ReservedRows)); e != nil {
+			return e
+		}
+		if e := limit("folder files", f.Folder.Limits.MaxFiles, sat(u.Files, u.ReservedFiles)); e != nil {
+			return e
+		}
+	}
 	if !f.Allocated && len(f.Grants) == 0 {
 		m.Folders[f.Folder.ID] = f
 		return nil
 	}
-	if f.Folder.Limits.MaxTotalBytes <= 0 || f.Folder.Limits.MaxRows <= 0 {
+	if f.Folder.Limits.MaxTotalBytes <= 0 || f.Folder.Limits.MaxRows <= 0 || f.Folder.Limits.MaxFileBytes <= 0 {
 		return ErrInvalid
 	}
 	grows := !old.Allocated || f.Folder.Limits.MaxTotalBytes > old.Folder.Limits.MaxTotalBytes || allocatedRows(f.Folder.Limits) > allocatedRows(old.Folder.Limits) || (old.Folder.Limits.MaxFileBytes > 0 && (f.Folder.Limits.MaxFileBytes == 0 || f.Folder.Limits.MaxFileBytes > old.Folder.Limits.MaxFileBytes))
@@ -134,8 +144,9 @@ func (s *Server) allocation(ctx context.Context, m *Metadata, p Principal, f, ol
 	if e != nil {
 		return e
 	}
-	f.Folder.Limits.MaxFileBytes = minimum(f.Folder.Limits.MaxFileBytes, q.MaxFileBytes)
-	m.Folders[f.Folder.ID] = f
+	if e = limit("owner file bytes", q.MaxFileBytes, f.Folder.Limits.MaxFileBytes); e != nil {
+		return e
+	}
 	bytes, rows := ownerUsage(m, f.Folder.Owner)
 	if e = ownerLimit(p, f, "owner bytes", q.MaxTotalBytes, bytes); e != nil {
 		return e
@@ -150,15 +161,6 @@ func limit(name string, max, requested int64) error {
 }
 func (s *Server) folder(ctx context.Context, m *Metadata, p Principal, f FolderRecord) (Folder, error) {
 	v := f.Folder
-	if p == v.Owner && !f.Allocated {
-		q, e := s.quota(m.ctx, v.Owner)
-		if e != nil {
-			return v, e
-		}
-		v.Limits.MaxFileBytes = minimum(v.Limits.MaxFileBytes, q.MaxFileBytes)
-		v.Limits.MaxTotalBytes = minimum(v.Limits.MaxTotalBytes, q.MaxTotalBytes)
-		v.Limits.MaxFiles = minimum(v.Limits.MaxFiles, q.MaxFiles)
-	}
 	v.Usage = usage(m, v.ID)
 	v.Role = f.Grants[principalKey(p)]
 	if v.Owner == p {
@@ -184,7 +186,7 @@ func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec)
 			return e
 		}
 		f = Folder{ID: randomID(), Owner: p, Name: spec.Name, Description: spec.Description, Limits: spec.Limits, KeyCheck: append([]byte(nil), spec.KeyCheck...)}
-		m.Folders[f.ID] = FolderRecord{Folder: f, Grants: map[string]Role{}, OwnerKey: principalKey(p)}
+		m.Folders[f.ID] = FolderRecord{Folder: f, Grants: map[string]Role{}}
 		m.Files[f.ID] = map[string]Row{}
 		return nil
 	})
@@ -216,7 +218,7 @@ func (s *Server) Grant(ctx context.Context, p Principal, id string, grantee Prin
 		return s.allocation(m.ctx, m, p, f, old)
 	})
 	if e == nil {
-		s.notify()
+		s.notify(id)
 	}
 	return e
 }
@@ -240,7 +242,7 @@ func (s *Server) Revoke(ctx context.Context, p Principal, id string, grantee Pri
 		return nil
 	})
 	if e == nil {
-		s.notify()
+		s.notify(id)
 	}
 	return e
 }
@@ -266,7 +268,7 @@ func (s *Server) DeleteFolder(ctx context.Context, p Principal, id string) error
 		return nil
 	})
 	if e == nil {
-		s.notify()
+		s.notify(id)
 	}
 	return e
 }
@@ -581,6 +583,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 			old := m.Files[id][v.PathID]
 			row := Row{FolderID: id, PathID: v.PathID, Version: f.Folder.Version, Deleted: v.Deleted}
 			if v.Deleted {
+				row.DeletedAt = s.now().UnixNano()
 				if v.TicketID != "" || len(v.Metadata) != 0 {
 					return ErrInvalid
 				}
@@ -652,7 +655,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 		return nil
 	})
 	if e == nil {
-		s.notify()
+		s.notify(id)
 	}
 	return out, e
 }
@@ -667,6 +670,11 @@ func (s *Server) Changes(ctx context.Context, p Principal, id string, after uint
 			return ErrInvalid
 		}
 		out.Version = f.Folder.Version
+		out.Horizon = f.Folder.Horizon
+		out.Full = after < out.Horizon
+		if out.Full {
+			after = 0
+		}
 		for _, r := range m.Files[id] {
 			if r.Version > after {
 				r.Metadata = append([]byte(nil), r.Metadata...)
@@ -730,12 +738,16 @@ type checkedReadCloser struct {
 
 func (r *checkedReadCloser) Close() error { return r.closer.Close() }
 func (s *Server) Wait(ctx context.Context, p Principal, id string, after uint64) (uint64, error) {
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
+	if !p.valid() {
+		return 0, ErrDenied
+	}
+	release, e := s.wakes.acquire(p, id)
+	if e != nil {
+		return 0, e
+	}
+	defer release()
 	for {
-		s.mu.Lock()
-		ch := s.signal
-		s.mu.Unlock()
+		ch := s.wakes.channel(id)
 		var version uint64
 		var e error
 		if reader, ok := s.Meta.(versionReader); ok {
@@ -758,7 +770,6 @@ func (s *Server) Wait(ctx context.Context, p Principal, id string, after uint64)
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		case <-ch:
-		case <-ticker.C:
 		}
 	}
 }

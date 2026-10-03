@@ -70,6 +70,7 @@ type Folder struct {
 	Limits            Limits
 	KeyCheck          []byte
 	Version           uint64
+	Horizon           uint64
 	Usage             Usage
 	Role              Role
 }
@@ -79,6 +80,7 @@ type Row struct {
 	SealedSize               int64
 	Metadata                 []byte
 	Deleted                  bool
+	DeletedAt                int64
 }
 type UploadRequest struct {
 	PathID        string
@@ -104,6 +106,8 @@ type Mutation struct {
 	Deleted     bool
 }
 type Delta struct {
+	Full    bool
+	Horizon uint64
 	Next    string `json:",omitempty"`
 	Version uint64
 	Rows    []Row
