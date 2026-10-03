@@ -20,5 +20,5 @@ func lockState(path string) (*os.File, error) {
 }
 
 func openLocal(root *os.Root, p string) (*os.File, error) {
-	return root.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	return root.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 }

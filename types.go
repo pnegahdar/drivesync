@@ -85,8 +85,6 @@ type UploadRequest struct {
 	BaseVersion   uint64
 	SealedSize    int64
 	MetadataBytes int64
-	// Deletes are CAS-bound rename credits, committed atomically with this upload.
-	Deletes []Mutation
 }
 type Ticket struct {
 	ID, FolderID, BlobID, PathID             string
@@ -97,7 +95,6 @@ type Ticket struct {
 	Expires                                  time.Time
 	Uploaded                                 bool
 	Writing                                  bool
-	Deletes                                  []Mutation
 }
 type Mutation struct {
 	PathID      string

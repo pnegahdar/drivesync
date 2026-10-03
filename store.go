@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,25 +21,36 @@ type FolderRecord struct {
 	Folder    Folder
 	Grants    map[string]Role
 	Allocated bool
+	Deleted   bool
+	OwnerKey  string
+	FileUsage Usage
 }
 type Garbage struct {
 	FolderID, BlobID string
 	Owner            Principal
 	Size             int64
+	Writing          bool
 }
 type Metadata struct {
-	Folders map[string]FolderRecord
-	Files   map[string]map[string]Row
-	Tickets map[string]Ticket
-	Garbage map[string]Garbage
+	Folders     map[string]FolderRecord
+	Files       map[string]map[string]Row
+	Tickets     map[string]Ticket
+	Garbage     map[string]Garbage
+	Accounts    map[string]Account
+	baseline    map[string]Account
+	filesLoaded bool
+	ctx         context.Context
 }
 
 func newMetadata() *Metadata {
-	return &Metadata{Folders: map[string]FolderRecord{}, Files: map[string]map[string]Row{}, Tickets: map[string]Ticket{}, Garbage: map[string]Garbage{}}
+	return &Metadata{Folders: map[string]FolderRecord{}, Files: map[string]map[string]Row{}, Tickets: map[string]Ticket{}, Garbage: map[string]Garbage{}, Accounts: map[string]Account{}, baseline: map[string]Account{}, filesLoaded: true}
 }
 
 // MetaStore serializes transactions across all server instances sharing it. A callback's
 // error rolls back every change. Implementations must never expose state after a callback.
+// Load the scoped records and their owner Accounts, call Metadata.Prepare before
+// the callback, then Metadata.Finish and persist all changed records/counters in
+// the same transaction. Private account totals must not require account-wide rows.
 type MetaStore interface {
 	Transaction(context.Context, func(*Metadata) error) error
 }
@@ -52,7 +64,7 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL", `CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`, `CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE INDEX IF NOT EXISTS folders_owner ON folders(json_extract(data,'$.Folder.Owner.Tenant'),json_extract(data,'$.Folder.Owner.Subject'))`, `CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(json_extract(data,'$.FolderID'))`, `CREATE INDEX IF NOT EXISTS files_version ON files(folder,json_extract(data,'$.Version'),path)`, `CREATE INDEX IF NOT EXISTS garbage_owner ON garbage(json_extract(data,'$.Owner.Tenant'),json_extract(data,'$.Owner.Subject'))`, `CREATE INDEX IF NOT EXISTS files_blob ON files(folder,json_extract(data,'$.BlobID'))`} {
+	for _, q := range []string{"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL", `CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS files (folder TEXT NOT NULL, path TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,path))`, `CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE INDEX IF NOT EXISTS folders_owner ON folders(json_extract(data,'$.OwnerKey'))`, `CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`, `CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(json_extract(data,'$.OwnerKey'),json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`, `CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(json_extract(data,'$.FolderID'))`, `CREATE INDEX IF NOT EXISTS files_version ON files(folder,json_extract(data,'$.Version'),path)`, `CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(json_extract(data,'$.FolderID'))`, `CREATE INDEX IF NOT EXISTS files_blob ON files(folder,json_extract(data,'$.BlobID'))`} {
 		if _, e = db.Exec(q); e != nil {
 			db.Close()
 			return nil, e
@@ -62,14 +74,24 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 }
 func (s *SQLiteMetaStore) Close() error { return s.db.Close() }
 
-type transactionScope struct {
+// Scope describes the records needed by a metadata transaction. Folder operations
+// select only Folder and its primary owner counter; an empty Folder lists visible
+// definitions or creates one. GC is an explicit maintenance scope.
+type Scope struct {
 	Principal Principal
 	Folder    string
-	Owner     bool
+	Create    bool
 	GC        bool
 	NoFiles   bool
 }
 type scopeKey struct{}
+
+// ScopeFromContext lets alternate MetaStore implementations select the same
+// records as SQLite. An unscoped transaction is an administrative full view.
+func ScopeFromContext(ctx context.Context) (Scope, bool) {
+	v, ok := ctx.Value(scopeKey{}).(Scope)
+	return v, ok
+}
 
 func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) error) error {
 	// BEGIN's first write acquires the SQLite writer lock before reading any accounting.
@@ -90,49 +112,33 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			q = "SELECT folder || '/' || path,data FROM files"
 		}
 		var args []any
-		if scope, ok := ctx.Value(scopeKey{}).(transactionScope); ok {
+		if scope, ok := ctx.Value(scopeKey{}).(Scope); ok {
+			m.filesLoaded = !scope.NoFiles && !scope.GC
 			filter := "id=?"
 			args = []any{scope.Folder}
-			if scope.Owner {
-				filter = `json_extract(data,'$.Folder.Owner.Tenant')=(SELECT json_extract(data,'$.Folder.Owner.Tenant') FROM folders WHERE id=?) AND json_extract(data,'$.Folder.Owner.Subject')=(SELECT json_extract(data,'$.Folder.Owner.Subject') FROM folders WHERE id=?)`
-				args = append(args, scope.Folder)
-			}
 			if scope.Folder == "" {
-				filter = `json_extract(data,'$.Folder.Owner.Tenant')=? AND json_extract(data,'$.Folder.Owner.Subject')=?`
-				args = []any{scope.Principal.Tenant, scope.Principal.Subject}
-				if !scope.Owner {
-					filter += ` OR EXISTS(SELECT 1 FROM json_each(json_extract(data,'$.Grants')) WHERE key=?)`
-					args = append(args, principalKey(scope.Principal))
+				if scope.Create {
+					filter = "0"
+					args = nil
+				} else {
+					filter = `json_extract(data,'$.OwnerKey')=? OR EXISTS(SELECT 1 FROM json_each(json_extract(data,'$.Grants')) WHERE key=?)`
+					args = []any{principalKey(scope.Principal), principalKey(scope.Principal)}
 				}
 			}
-			if scope.NoFiles && table == "files" {
-				q += " WHERE 0"
+			if scope.GC {
 				args = nil
-			} else if scope.GC {
 				if table == "files" {
 					q += " WHERE 0"
 				}
+			} else if scope.NoFiles && table == "files" {
+				q += " WHERE 0"
 				args = nil
 			} else if table == "folders" {
 				q += " WHERE " + filter
 			} else if table == "files" {
 				q += " WHERE folder IN (SELECT id FROM folders WHERE " + filter + ")"
-			} else if table == "tickets" {
+			} else {
 				q += ` WHERE json_extract(data,'$.FolderID') IN (SELECT id FROM folders WHERE ` + filter + ")"
-			} else { // Deleted folders' garbage remains charged to its primary owner.
-				if scope.Folder == "" && scope.Owner {
-					q += ` WHERE json_extract(data,'$.Owner.Tenant')=? AND json_extract(data,'$.Owner.Subject')=?`
-					args = []any{scope.Principal.Tenant, scope.Principal.Subject}
-				} else {
-					q += ` WHERE json_extract(data,'$.Owner') IN (SELECT json_extract(data,'$.Folder.Owner') FROM folders WHERE ` + filter + ")"
-				}
-				if scope.NoFiles && table == "files" {
-					q += " WHERE 0"
-					args = nil
-				} else if scope.GC {
-					q = "SELECT id,data FROM garbage"
-					args = nil
-				}
 			}
 		}
 		rs, e := tx.QueryContext(ctx, q, args...)
@@ -185,10 +191,61 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 		if e != nil {
 			return e
 		}
+		if table == "folders" {
+			if scope, ok := ScopeFromContext(ctx); ok && scope.Folder != "" && scope.Principal.valid() {
+				if _, e = access(m, scope.Principal, scope.Folder, false, false); e != nil {
+					return e
+				}
+			}
+		}
+
 	}
+	keys := map[string]bool{}
+	if scope, ok := ctx.Value(scopeKey{}).(Scope); ok && scope.Folder == "" && scope.Principal.valid() {
+		keys[principalKey(scope.Principal)] = true
+	}
+	for _, f := range m.Folders {
+		keys[principalKey(f.Folder.Owner)] = true
+	}
+	for _, g := range m.Garbage {
+		keys[principalKey(g.Owner)] = true
+	}
+	for key := range keys {
+		var data []byte
+		e = tx.QueryRowContext(ctx, "SELECT data FROM accounts WHERE id=?", key).Scan(&data)
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return e
+		}
+		var a Account
+		if len(data) > 0 {
+			if e = json.Unmarshal(data, &a); e != nil {
+				return e
+			}
+		}
+		m.Accounts[key] = a
+	}
+	beforeAccounts := make(map[string]Account, len(m.Accounts))
+	for k, a := range m.Accounts {
+		beforeAccounts[k] = a
+	}
+	m.Prepare(m.filesLoaded)
 	if e = fn(m); e != nil {
 		return e
 	}
+	m.Finish()
+	for key, a := range m.Accounts {
+		if a == beforeAccounts[key] {
+			continue
+		}
+		b, e := json.Marshal(a)
+		if e != nil {
+			return e
+		}
+		if _, e = tx.ExecContext(ctx, "INSERT INTO accounts(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", key, b); e != nil {
+			return e
+		}
+	}
+
 	next := map[string]map[string][]byte{"folders": {}, "files": {}, "tickets": {}, "garbage": {}}
 	for id, v := range m.Folders {
 		b, e := json.Marshal(v)
@@ -231,6 +288,9 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 				}
 			} else {
 				if _, e = tx.ExecContext(ctx, "INSERT INTO "+table+"(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data", id, b); e != nil {
+					if table == "folders" && strings.Contains(e.Error(), "UNIQUE constraint failed") {
+						return ErrConflict
+					}
 					return e
 				}
 			}

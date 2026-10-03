@@ -88,6 +88,13 @@ func main() {
 		}
 		defer blobs.Close()
 		server := ds.NewServer(meta, blobs)
+		if e = server.RecoverUploads(ctx); e != nil {
+			log.Fatal(e)
+		}
+		gcCtx, stopGC := context.WithCancel(ctx)
+		gcDone := make(chan struct{})
+		go func() { defer close(gcDone); server.RunGC(gcCtx, time.Second) }()
+		defer func() { stopGC(); <-gcDone }()
 		httpServer := &http.Server{Addr: *addr, Handler: server.Handler(func(r *http.Request) (ds.Principal, error) {
 			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+token)) != 1 {
 				return ds.Principal{}, ds.ErrDenied

@@ -15,7 +15,7 @@ func TestRenameInFullFolderRemovesFileFromOtherReplicas(t *testing.T) {
 	s := newServer(t)
 	oc := s.Client(ds.Principal{Tenant: "t", Subject: "o"})
 	content := strings.Repeat("r", 1000)
-	f, k := mkFolder(t, oc, ds.Limits{MaxTotalBytes: ds.SealedSize(1000) + 256 + 600})
+	f, k := mkFolder(t, oc, ds.Limits{MaxTotalBytes: ds.SealedSize(1000) + 256 + 600, MaxRows: 1000})
 	a, adir := attach(t, oc, f, k, "a")
 	b, bdir := attach(t, oc, f, k, "b")
 	write(t, adir, "report.pdf", content)

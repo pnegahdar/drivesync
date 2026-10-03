@@ -31,7 +31,7 @@ func TestOwnerUsageLeakThroughLimitError(t *testing.T) {
 		t.Error("uncapped shared folder exposes private-usage probing")
 	}
 	private, pk := mkFolder(t, ac, ds.Limits{}) // bob has no access
-	shared, _ := mkFolder(t, ac, ds.Limits{MaxTotalBytes: 2 << 20})
+	shared, _ := mkFolder(t, ac, ds.Limits{MaxTotalBytes: 2 << 20, MaxRows: 1000})
 	if e := ac.Grant(bg, shared.ID, bob, ds.Writer); e != nil {
 		t.Fatal(e)
 	}

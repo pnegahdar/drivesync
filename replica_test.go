@@ -508,7 +508,7 @@ func BenchmarkScan10K(b *testing.B) {
 func TestReaderReplica(t *testing.T) {
 	s, _ := testServer(t)
 	base := s.Client(owner)
-	f, k := folderFor(t, base, Limits{})
+	f, k := sharedFor(t, base)
 	p := Principal{"tenant", "reader"}
 	_ = base.Grant(context.Background(), f.ID, p, Reader)
 	row := put(t, base, f, k, "file", 0, []byte("server"))

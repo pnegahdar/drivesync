@@ -208,7 +208,7 @@ func TestExactReservationBoundaries(t *testing.T) {
 func TestOutstandingTicketsAfterDeletionAndDowngrade(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
-	f, k := folderFor(t, c, Limits{})
+	f, k := sharedFor(t, c)
 	p := Principal{"tenant", "writer"}
 	ctx := context.Background()
 	_ = c.Grant(ctx, f.ID, p, Writer)

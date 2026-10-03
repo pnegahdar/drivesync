@@ -13,11 +13,17 @@ blobs, err := drivesync.OpenDirectoryBlobStore("blob-data")
 if err != nil { panic(err) }
 defer blobs.Close()
 server := drivesync.NewServer(meta, blobs)
+// After a process restart, first stop all old writers using these stores:
+if err := server.RecoverUploads(ctx); err != nil { panic(err) }
+gcCtx, stopGC := context.WithCancel(ctx)
+gcDone := make(chan struct{})
+go func() { defer close(gcDone); server.RunGC(gcCtx, time.Second) }()
+defer func() { stopGC(); <-gcDone }() // before closing stores
 client := server.Client(drivesync.Principal{Tenant: "acme", Subject: "alice"})
 key := drivesync.NewFolderKey() // distribute securely to authorized replicas
 folder, err := client.CreateFolder(ctx, drivesync.FolderSpec{
     Name: "reference", Description: "Shared reference files",
-    Limits: drivesync.Limits{MaxFileBytes: 20 << 20, MaxTotalBytes: 100 << 20, MaxFiles: 10000},
+    Limits: drivesync.Limits{MaxFileBytes: 20 << 20, MaxTotalBytes: 100 << 20, MaxFiles: 10000, MaxRows: 20000},
     KeyCheck: drivesync.KeyCheck(key),
 })
 if err != nil { panic(err) }
@@ -32,14 +38,14 @@ _ = status
 
 Import `github.com/pnegahdar/drivesync`. Go 1.27.1 or newer is required by the
 pinned dependency set. Direct dependencies are fsnotify, purego, blake3, and
-modernc SQLite; remaining module requirements are their transitive dependencies.
+modernc SQLite, and golang.org/x/text; remaining module requirements are their transitive dependencies.
 
 The authenticated `Client` interface exposes `CreateFolder`, `GetFolder`,
 `ListFolders`, `Grant`, `Revoke`, `SetLimits`, `DeleteFolder`, `Reserve`, `Upload`,
 `CancelUpload`, `Commit`, `Changes`, `Download`, and long-poll `Wait`.
 `Changes` aggregates bounded pages over HTTP; `Server.ChangesPage` exposes a
-512-row continuation for integrations. `Server.CollectGarbage(ctx)` is maintenance
-work and should also run periodically when clients are idle. Every server
+512-row continuation for integrations. `Server.RunGC(ctx, interval)` runs maintenance in a background worker;
+`CollectGarbage(ctx)` runs one explicit pass. Requests never collect garbage. Every server
 operation also accepts an explicit principal. `Server.Subscribe` supplies an
 in-process event channel with a terminal error on revocation or deletion.
 `Attach` starts automatic sync; `Options.Manual` and `Replica.Sync(ctx)` allow
@@ -55,12 +61,15 @@ HTTP clients default to a 64 MiB metadata response limit, configurable through
 The HTTP subscription transport is long polling rather than SSE.
 
 `MetaStore.Transaction` is the embedding seam for durable, atomic metadata
-storage. Its callback sees folder records, current file rows, reservations and a
-durable garbage queue; errors roll back changes. SQLite server operations query
-the requested folder or its primary owner's account, rather than decoding other
-tenants' rows. Streaming checks and paginated changes use targeted queries.
-Owner write transactions still materialize that owner's rows: this backend is
-intended for modest authorities, rather than unlimited account sizes. Replicas
+storage. Its callback sees folder records, current file rows, reservations, a
+durable garbage queue and primary-owner counters; errors roll back all changes.
+Alternate stores read `ScopeFromContext`, load just that folder and its owner
+counter, then call `Metadata.Prepare` before the callback and `Metadata.Finish`
+afterward. Persist records and counters in the same transaction. SQLite folder
+operations never load the owner's other folders or rows. Listing reads cached
+folder usage; streaming authorization and paginated changes use targeted queries.
+Maintenance may visit all definitions, reservations and garbage, but omits file
+payloads. Replicas
 currently hash the full local tree on each sync; incremental dirty-path scans
 remain future performance work. `BlobStore` creates immutable objects, opens
 streams, reports actual sizes and deletes objects. Memory and local-directory
@@ -101,7 +110,8 @@ Security and behavior:
   cannot be revoked; removing a principal does not rotate the shared key.
 - CAS conflicts keep a durable local `name (conflict from replica timestamp-id).ext`
   copy before taking the winner. Conflict copies sync as regular files. Renames
-  use CAS-bound create-plus-delete commits with byte credit for the old file;
+  use atomic CAS-bound create-plus-delete commits without credit. If the new
+  path cannot fit, both halves remain pending and the old remote path survives;
   empty directories use encrypted directory markers. Busy upload paths retry
   without conflict copies; batches preserve only paths whose versions lost.
   Tombstones retain versions, including when a path is recreated.
@@ -117,7 +127,9 @@ Security and behavior:
   all platforms, so rules remain safe when moving to a case-insensitive volume.
   Skipped remote rows persist outside the cursor and reappear after unignoring,
   including after restart. Undecryptable or unapplicable rows are quarantined
-  in durable retry state and `Status.Quarantined`; unreadable local files are
+  in durable state and `Status.Quarantined`, without re-downloading unchanged
+  versions. Network and filesystem failures retry separately; `RetryRejected`
+  also explicitly retries quarantined rows. Unreadable local files are
   reported in `Status.Skipped`. Other uploads and downloads continue.
   State stays outside the attachment and is locked against a second attachment.
 - Byte limits count sealed blob bytes, sealed metadata length, and `RowCost`
@@ -129,33 +141,40 @@ Security and behavior:
   retain their row charge. `Quota.MaxFiles` bounds rows across the owner's folders.
   Other zero limits mean unlimited. Individual uploads are capped at 2^50 bytes,
   and accounting saturates instead of overflowing.
-- Reservations bind principal, folder, path and base version, expire, and renew
-  while upload bytes flow. `UploadRequest.MetadataBytes` reserves metadata space;
-  commit checks the actual length even if omitted or understated. Replacements
-  reserve growth; `UploadRequest.Deletes` supplies CAS-bound rename credits that
-  must appear in the same atomic commit. Active staging can temporarily require
-  another copy of each replaced blob. Once retired, old blobs and their queue
-  records remain charged until collection succeeds, blocking further writes if
-  necessary. Cancels, expiry, revocation and deletion durably queue cleanup;
-  local staging names bind to blob IDs for crash cleanup. Run `CollectGarbage`
-  periodically. Lowered quotas block new writes while existing-row deletes remain
-  legal; creating new tombstones still consumes quota.
-- A cross-tenant grant requires `MaxTotalBytes` on the shared folder. The **entire
-  cap** is allocated against the primary owner's quota when the first such grant
-  is made, and reallocated when limits change. Allocation also reserves the row
-  capacity allowed by that cap. If a plan limits file size, the folder must have
-  an explicit `MaxFileBytes` no larger than that plan limit. Cross-tenant writes
-  then depend only on the folder's headroom, so private activity cannot affect
-  reservation probes. Same-tenant grantees remain inside the quota-sharing trust
-  boundary: their write outcomes still depend on aggregate owner headroom. Allocated capacity is grandfathered when a plan is lowered;
-  new private writes still respect the lowered owner quota. Legacy cross-tenant
-  grants without an allocation are write-blocked until the primary owner sets
-  capped limits. Revoking the last
-  cross-tenant grant releases allocation. Only the primary owner may change an
-  allocation or its limits; delegated owners can manage grants within an existing
-  allocation. This prevents allocation-change probes of private owner usage.
+- Reservations bind principal, folder, path and base version. Renewals write only
+  after more than half the TTL has elapsed, while every read still checks access.
+  `UploadRequest.MetadataBytes` reserves metadata space; commit checks the actual
+  length even if understated. Uploads reserve a complete additional copy, with
+  no replacement or rename credits. Replaced blobs, queued records and staging
+  remain charged until collection succeeds. Cancels that never started uploading
+  charge nothing. An in-flight `Put` remains durably charged after cancellation
+  until publication finishes; failed cleanup stays queued. Start `RunGC` in a
+  background worker and cancel/join it before closing stores. After a process
+  restart, call `RecoverUploads` only after all old writers using those stores
+  have stopped, then let GC remove interrupted staging/publications. A generic
+  BlobStore cannot prove that a different process has stopped publishing.
+- **Every shared folder is allocated**, including grants within the same tenant.
+  The first grant requires explicit `MaxTotalBytes` and `MaxRows`. The owner's
+  quota reserves exactly the byte cap and `min(MaxRows, MaxTotalBytes / RowCost)`
+  rows, never a maximum of that capacity and current usage. Garbage, reservations
+  and rows consume only that folder's headroom; grantee activity cannot block
+  private writes or probe private usage. A plan's file cap is captured in the
+  folder's file limit when allocating/growing capacity. Later plan decreases
+  grandfather existing shared capacity; private writes obey the current quota.
+- Only the primary owner may grow or change allocated limits. Delegated owners
+  can manage grants, including revoking themselves or the last grantee. Allocation
+  remains until folder deletion and physical cleanup, so revoking the last grant
+  does not consult pricing policy. Quota is checked only when capacity grows.
+  Revocation, downgrades, reductions and existing-row deletes never consult quota.
+  Deletes remain legal above reduced limits; retained tombstones and garbage can
+  keep that folder above its reduced cap and block new writes until collection.
+  Creating new tombstones still consumes quota. Deleted folders disappear from
+  access/listing immediately; queued cleanup remains durable and charged.
 - Rejected files stay locally and appear in `Status`. Automatic retries wait at
   least a minute by default; a content change or `RetryRejected` retries sooner.
+
+This prototype requires fresh authority and replica databases; no migration or
+legacy-folder compatibility is provided.
 
 Deferred: chunking/dedup, snapshots/history, FUSE, key rotation, presigned URL
 issuance, and distributed push infrastructure. Encryption authenticates received

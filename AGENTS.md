@@ -1,7 +1,7 @@
 # Contributor rules
 
 This is a standalone generic Go library. Do not depend on product/application
-code. Keep direct dependencies to fsnotify, purego, blake3, modernc SQLite and the
+code. Keep direct dependencies to fsnotify, purego, blake3, modernc SQLite, golang.org/x/text and the
 standard library. Support pure-Go Linux and macOS builds.
 
 Security takes priority over convenience:
@@ -32,17 +32,29 @@ Security takes priority over convenience:
   trust uploaded size claims; inspect stored bytes at commit. Reservations expire.
   Recheck changed limits at commit, and allow deletes even above lowered quota.
   Keep rejected files locally, with reasons and backoff in replica status.
-- Keep cross-tenant folder capacity allocated against the primary owner quota.
+- Allocate every folder with a grantee besides its primary owner, including same-tenant
+  grantees. Require byte and row caps and charge exactly those capacities to the
+  primary owner; folder garbage and tickets never consume private headroom.
   Only the primary owner may change allocations; other principals see folder
   limits and generic owner-quota failures. Never expose owner activity through
   reservation or allocation probes. Saturate accounting and cap request sizes.
 - Charge sealed metadata, fixed row costs, tombstones and queued garbage. Enforce
-  owner row budgets and scoped SQLite queries. Persist cleanup before freeing
+  owner row budgets, folder-scoped SQLite queries and transactional owner counters.
+  Run GC in the background; keep in-flight publication charged until it finishes.
+  Cancelling an unused ticket charges nothing. Persist cleanup before freeing
   physical blob charges; collect cancelled/expired uploads and staging files.
-- Preserve busy paths, retry only actual CAS losers, commit renames with credits,
+- Preserve busy paths, retry only actual CAS losers, commit renames atomically without credits,
   persist pending winner/retry state, and maintain a one-to-one local path map.
-  Quarantine bad peers/unreadable files without blocking unrelated sync.
-- Sync parents of newly created directories before index/authority acknowledgement.
+  Full-folder renames remain local and pending; do not delete the old remote path.
+  Quarantine bad peers/unreadable files without blocking unrelated sync. Never
+  re-download an unchanged quarantined row; retry transient transfers separately.
+  Lstat before opening and use nonblocking/no-follow opens against replacement.
+  Renew tickets only after more than half their TTL has elapsed.
+- Revocation, downgrades, limit reductions and existing-row deletes never query
+  quota. Only allocation growth queries pricing policy. Allocations persist until
+  deletion and cleanup, including when the last grant is revoked.
+- Sync parents of newly created directories before index/authority acknowledgement;
+  retry the parent barrier when a root survives a failed creation.
   Match ignores under NFC/case folding and revisit skipped rows after unignore.
 - Maintain native FSEvents on macOS through purego; kqueue's descriptor per file
   is unsuitable. Use inotify on Linux and keep periodic rescans as a safety net.

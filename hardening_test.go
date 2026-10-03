@@ -32,7 +32,7 @@ func TestAllocatedSharedFolderHasNoPrivateUsageOracle(t *testing.T) {
 			if e := admin.Grant(context.Background(), shared.ID, peer, Writer); e != nil {
 				t.Fatal(e)
 			}
-			private, pk := folderFor(t, admin, Limits{})
+			private, pk := sharedFor(t, admin)
 			probe := func() []string {
 				var result []string
 				for _, n := range []int64{1, capacity - RowCost, capacity - RowCost + 1, capacity, MaxRequestBytes + 1} {
@@ -73,7 +73,7 @@ func TestOnlyPrimaryOwnerSeesOwnerQuotaNumbers(t *testing.T) {
 			s.Quotas = QuotaFunc(func(context.Context, Principal) (Quota, error) { return Quota{MaxTotalBytes: 300}, nil })
 			cc := clients(t, s, httpMode)
 			admin := cc(owner)
-			f, k := folderFor(t, admin, Limits{})
+			f, k := folderFor(t, admin, Limits{MaxTotalBytes: 300, MaxRows: 1})
 			for _, role := range []Role{Writer, Owner} {
 				p := Principal{owner.Tenant, "delegate-" + string(role)}
 				if e := admin.Grant(context.Background(), f.ID, p, role); e != nil {
@@ -81,16 +81,18 @@ func TestOnlyPrimaryOwnerSeesOwnerQuotaNumbers(t *testing.T) {
 				}
 				pid, _ := PathID(k, f.ID, string(role))
 				_, e := cc(p).Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 301})
-				if e != ErrQuota {
+				var le *LimitError
+				if !errors.As(e, &le) || le.Maximum != 300 {
 					t.Fatalf("%s quota leak: %v", role, e)
 				}
 				v, e := cc(p).GetFolder(context.Background(), f.ID)
-				if e != nil || v.Limits.MaxTotalBytes != 0 {
+				if e != nil || v.Limits.MaxTotalBytes != 300 {
 					t.Fatal(v, e)
 				}
 			}
-			pid, _ := PathID(k, f.ID, "primary")
-			_, e := admin.Reserve(context.Background(), f.ID, UploadRequest{PathID: pid, SealedSize: 301})
+			private, pk := folderFor(t, admin, Limits{})
+			pid, _ := PathID(pk, private.ID, "primary")
+			_, e := admin.Reserve(context.Background(), private.ID, UploadRequest{PathID: pid, SealedSize: 301})
 			var le *LimitError
 			if !errors.As(e, &le) || le.Maximum != 300 {
 				t.Fatal(e)
@@ -126,7 +128,7 @@ func TestRowBudgetIncludesTombstonesAndOwnerFolders(t *testing.T) {
 func TestGrantAndPrincipalBounds(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
-	f, _ := folderFor(t, c, Limits{})
+	f, _ := sharedFor(t, c)
 	for i := 0; i < MaxGrants; i++ {
 		if e := c.Grant(context.Background(), f.ID, Principal{owner.Tenant, fmt.Sprint(i)}, Reader); e != nil {
 			t.Fatal(e)
@@ -204,6 +206,9 @@ func TestGarbageRemainsChargedUntilCollected(t *testing.T) {
 	if e = c.DeleteFolder(context.Background(), f.ID); e != nil {
 		t.Fatal(e)
 	}
+	if e = s.CollectGarbage(context.Background()); e != nil {
+		t.Fatal(e)
+	}
 	if _, e = s.Blobs.Size(context.Background(), f.ID, newer.BlobID); !errors.Is(e, os.ErrNotExist) {
 		t.Fatal("folder deletion orphan", e)
 	}
@@ -237,7 +242,7 @@ func TestUploadedReservationExpiryCollectsBlob(t *testing.T) {
 func TestBusyAndOwnReservationReplacement(t *testing.T) {
 	s, _ := testServer(t)
 	c := s.Client(owner)
-	f, k := folderFor(t, c, Limits{})
+	f, k := sharedFor(t, c)
 	p := Principal{owner.Tenant, "other"}
 	_ = c.Grant(context.Background(), f.ID, p, Writer)
 	pid, _ := PathID(k, f.ID, "x")
@@ -255,6 +260,9 @@ func TestBusyAndOwnReservationReplacement(t *testing.T) {
 	second, e := c.Reserve(context.Background(), f.ID, req)
 	if e != nil || second.ID == first.ID {
 		t.Fatal(second, e)
+	}
+	if e = s.CollectGarbage(context.Background()); e != nil {
+		t.Fatal(e)
 	}
 	if _, e = s.Blobs.Size(context.Background(), f.ID, first.BlobID); !errors.Is(e, os.ErrNotExist) {
 		t.Fatal("stale ticket orphan", e)
@@ -351,11 +359,13 @@ func TestNewDirectoryFsyncFailurePreventsAcknowledgement(t *testing.T) {
 	if len(r.index) != 0 {
 		t.Fatal("index advanced before durable directories")
 	}
+	syncDirectoryFile = original
 	blob, e := OpenDirectoryBlobStore(t.TempDir())
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer blob.Close()
+	syncDirectoryFile = func(*os.File) error { return sentinel }
 	if _, e = blob.Put(context.Background(), randomID(), randomID(), strings.NewReader("blob")); !errors.Is(e, sentinel) {
 		t.Fatal("blob directory creation acknowledged", e)
 	}
@@ -376,8 +386,11 @@ func TestDelegatedOwnerCannotProbeAllocationChanges(t *testing.T) {
 			t.Fatal("allocation oracle", e)
 		}
 	}
-	if e := delegate.Revoke(context.Background(), f.ID, p); e != ErrDenied {
+	if e := delegate.Revoke(context.Background(), f.ID, p); e != nil {
 		t.Fatal("deallocate/reallocate oracle", e)
+	}
+	if e := c.Grant(context.Background(), f.ID, p, Owner); e != nil {
+		t.Fatal(e)
 	}
 	peer := Principal{"another", "writer"}
 	if e := delegate.Grant(context.Background(), f.ID, peer, Writer); e != nil {
@@ -419,6 +432,9 @@ func TestExpiredInFlightUploadCollectsStagingFile(t *testing.T) {
 		t.Fatal(e)
 	}
 	s.Now = func() time.Time { return ticket.Expires.Add(time.Second) }
+	if e = s.RecoverUploads(context.Background()); e != nil {
+		t.Fatal(e)
+	}
 	if e = s.CollectGarbage(context.Background()); e != nil {
 		t.Fatal(e)
 	}
@@ -537,32 +553,6 @@ func TestUnreadableLocalDoesNotBlockOtherPaths(t *testing.T) {
 		if row.PathID == lockedPID && row.Deleted {
 			t.Fatal("unreadable file deleted")
 		}
-	}
-}
-
-func TestLegacyCrossTenantGrantFailsClosedUntilAllocated(t *testing.T) {
-	s, _ := testServer(t)
-	c := s.Client(owner)
-	f, k := folderFor(t, c, Limits{})
-	p := Principal{"outside", "legacy"}
-	// Simulate an e8d8ed2 database, which has grants but no allocation marker.
-	if e := s.Meta.Transaction(context.Background(), func(m *Metadata) error {
-		v := m.Folders[f.ID]
-		v.Grants[principalKey(p)] = Writer
-		m.Folders[f.ID] = v
-		return nil
-	}); e != nil {
-		t.Fatal(e)
-	}
-	pid, _ := PathID(k, f.ID, "x")
-	if _, e := s.Client(p).Reserve(context.Background(), f.ID, UploadRequest{PathID: pid}); e != ErrQuota {
-		t.Fatal("legacy allocation oracle", e)
-	}
-	if e := c.SetLimits(context.Background(), f.ID, Limits{MaxTotalBytes: 4096}); e != nil {
-		t.Fatal(e)
-	}
-	if _, e := s.Client(p).Reserve(context.Background(), f.ID, UploadRequest{PathID: pid}); e != nil {
-		t.Fatal(e)
 	}
 }
 

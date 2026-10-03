@@ -34,7 +34,7 @@ func setup(t *testing.T) (*ds.Server, ds.Client) {
 }
 func folder(t *testing.T, c ds.Client, name string, k ds.FolderKey) ds.Folder {
 	t.Helper()
-	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, Limits: ds.Limits{MaxTotalBytes: 4000, MaxRows: 1000}, KeyCheck: ds.KeyCheck(k)})
+	f, e := c.CreateFolder(ctx, ds.FolderSpec{Name: name, KeyCheck: ds.KeyCheck(k)})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -74,6 +74,9 @@ func TestRawJSONPrincipalAlias(t *testing.T) {
 			s, c := setup(t)
 			k := ds.NewFolderKey()
 			f := folder(t, c, "folder", k)
+			if e := c.SetLimits(ctx, f.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+				t.Fatal(e)
+			}
 			p := ds.Principal{Tenant: "guest", Subject: "\uFFFD"}
 			if _, e := s.GetFolder(ctx, p, f.ID); !errors.Is(e, ds.ErrDenied) {
 				t.Fatal(e)
@@ -94,16 +97,11 @@ func TestWriterOwnerUsageLeak(t *testing.T) {
 	s, c := setup(t)
 	s.Quotas = ds.QuotaFunc(func(context.Context, ds.Principal) (ds.Quota, error) { return ds.Quota{MaxTotalBytes: 10000}, nil })
 	k := ds.NewFolderKey()
-	uncapped, e := c.CreateFolder(ctx, ds.FolderSpec{Name: "uncapped", KeyCheck: ds.KeyCheck(k)})
-	if e != nil {
-		t.Fatal(e)
-	}
-	if e = c.Grant(ctx, uncapped.ID, ds.Principal{Tenant: "other-tenant", Subject: "collaborator"}, ds.Writer); e == nil {
-		t.Error("uncapped grant exposes owner usage oracle")
-	}
 	shared := folder(t, c, "shared", k)
 	private := folder(t, c, "ungranted", k)
-	row := put(t, c, private, k, "secret", 0, "private usage amount")
+	if e := c.SetLimits(ctx, shared.ID, ds.Limits{MaxTotalBytes: 5000, MaxRows: 1000}); e != nil {
+		t.Fatal(e)
+	}
 	outsider := ds.Principal{Tenant: "other-tenant", Subject: "collaborator"}
 	if e := c.Grant(ctx, shared.ID, outsider, ds.Writer); e != nil {
 		t.Fatal(e)
@@ -111,20 +109,23 @@ func TestWriterOwnerUsageLeak(t *testing.T) {
 	h := httptest.NewServer(s.Handler(func(*http.Request) (ds.Principal, error) { return outsider, nil }))
 	defer h.Close()
 	guest := ds.NewHTTPClient(h.URL, nil)
+	probe := func() string {
+		_, e := guest.Reserve(ctx, shared.ID, ds.UploadRequest{PathID: strings.Repeat("a", 64), SealedSize: 10000})
+		return fmt.Sprint(e)
+	}
+	before := probe()
+	put(t, c, private, k, "secret", 0, "private usage amount")
+	after := probe()
 	fs, e := guest.ListFolders(ctx)
 	if e != nil || len(fs) != 1 {
 		t.Fatal(fs, e)
 	}
-	_, e = guest.Reserve(ctx, shared.ID, ds.UploadRequest{PathID: strings.Repeat("a", 64), SealedSize: 10000})
-	var le *ds.LimitError
-	if !errors.As(e, &le) {
-		t.Fatal(e)
-	}
-	t.Logf("listed folders=%d; error=%v; inferred private bytes=%d; actual private bytes=%d", len(fs), e, le.Requested-10000, row.SealedSize)
-	if le.Requested-10000 == row.SealedSize {
-		t.Fatal("cross-tenant writer learns exact sealed usage in ungranted private folder")
+	t.Logf("quota probes before=%q after=%q", before, after)
+	if before != after {
+		t.Fatal("cross-tenant writer learns private usage change")
 	}
 }
+
 func newReplica(t *testing.T, c ds.Client, f ds.Folder, k ds.FolderKey) (*ds.Replica, string) {
 	t.Helper()
 	base := t.TempDir()

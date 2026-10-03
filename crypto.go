@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -214,7 +215,10 @@ func OpenContent(w io.Writer, r io.Reader, k FolderKey, folder, blob, pid string
 		return ErrIntegrity
 	}
 	header := make([]byte, 20)
-	if _, e := io.ReadFull(r, header); e != nil || !bytes.Equal(header[:4], []byte{'D', 'S', 'C', 1}) {
+	if _, e := io.ReadFull(r, header); e != nil {
+		return contentReadError(e)
+	}
+	if !bytes.Equal(header[:4], []byte{'D', 'S', 'C', 1}) {
 		return ErrIntegrity
 	}
 	a := contentAEAD(k, folder, blob, pid, header)
@@ -222,7 +226,7 @@ func OpenContent(w io.Writer, r io.Reader, k FolderKey, folder, blob, pid string
 	for {
 		frame := make([]byte, 5)
 		if _, e := io.ReadFull(r, frame); e != nil {
-			return ErrIntegrity
+			return contentReadError(e)
 		}
 		n := binary.BigEndian.Uint32(frame)
 		final := frame[4]
@@ -231,7 +235,7 @@ func OpenContent(w io.Writer, r io.Reader, k FolderKey, folder, blob, pid string
 		}
 		sealed := make([]byte, n)
 		if _, e := io.ReadFull(r, sealed); e != nil {
-			return ErrIntegrity
+			return contentReadError(e)
 		}
 		nonce := make([]byte, 12)
 		copy(nonce, header[4:])
@@ -272,4 +276,11 @@ func writeAll(w io.Writer, p []byte) error {
 		return io.ErrShortWrite
 	}
 	return nil
+}
+
+func contentReadError(e error) error {
+	if errors.Is(e, io.EOF) || errors.Is(e, io.ErrUnexpectedEOF) {
+		return ErrIntegrity
+	}
+	return e
 }

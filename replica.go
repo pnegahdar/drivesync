@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/zeebo/blake3"
@@ -61,6 +60,10 @@ type localFile struct {
 	Mode              uint32
 	Directory         bool
 }
+type pendingRow struct {
+	Row  Row
+	Kind string
+}
 type Replica struct {
 	client       Client
 	folder       string
@@ -80,6 +83,7 @@ type Replica struct {
 	status       Status
 	quarantine   map[string]Row
 	ignoredRows  map[string]Row
+	retryRows    map[string]Row
 	blockedLocal map[string]bool
 	rejected     map[string]Rejection
 	ctx          context.Context
@@ -183,7 +187,7 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 		return nil, e
 	}
 	rctx, cancel := context.WithCancel(ctx)
-	r := &Replica{quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]indexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
+	r := &Replica{quarantine: map[string]Row{}, ignoredRows: map[string]Row{}, retryRows: map[string]Row{}, blockedLocal: map[string]bool{}, client: c, folder: id, key: k, dir: dir, opts: o, root: root, db: db, lock: lock, index: map[string]indexEntry{}, byID: map[string]string{}, byLocal: map[string]string{}, byFold: map[string]string{}, rejected: map[string]Rejection{}, ctx: rctx, cancel: cancel, done: make(chan struct{}), wake: make(chan struct{}, 1)}
 	rows, e := db.Query("SELECT data FROM entries")
 	if e != nil {
 		cancel()
@@ -230,9 +234,9 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	for pendingRows.Next() {
 		var pid string
 		var data []byte
-		var row Row
+		var saved pendingRow
 		if pe = pendingRows.Scan(&pid, &data); pe == nil {
-			pe = json.Unmarshal(data, &row)
+			pe = json.Unmarshal(data, &saved)
 		}
 		if pe != nil {
 			pendingRows.Close()
@@ -240,7 +244,16 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 			cleanup()
 			return nil, pe
 		}
-		r.quarantine[pid] = row
+		switch saved.Kind {
+		case "ignored":
+			r.ignoredRows[pid] = saved.Row
+		case "retry":
+			r.retryRows[pid] = saved.Row
+		case "quarantine":
+			r.quarantine[pid] = saved.Row
+		default:
+			pe = ErrInvalid
+		}
 	}
 	pe = pendingRows.Err()
 	pendingRows.Close()
@@ -339,6 +352,12 @@ func (r *Replica) Close() error {
 	return e
 }
 func (r *Replica) RetryRejected() {
+	r.syncMu.Lock()
+	for pid, row := range r.quarantine {
+		r.retryRows[pid] = row
+		delete(r.quarantine, pid)
+	}
+	r.syncMu.Unlock()
 	r.mu.Lock()
 	r.rejected = map[string]Rejection{}
 	r.mu.Unlock()
@@ -562,6 +581,13 @@ func (r *Replica) inspect(p, local string) (localFile, error) {
 	if e := r.safe(local); e != nil {
 		return v, e
 	}
+	before, e := r.root.Lstat(local)
+	if e != nil {
+		return v, e
+	}
+	if !before.IsDir() && !before.Mode().IsRegular() {
+		return v, ErrInvalid
+	}
 	f, e := openLocal(r.root, local)
 	if e != nil {
 		return v, e
@@ -570,6 +596,9 @@ func (r *Replica) inspect(p, local string) (localFile, error) {
 	s, e := f.Stat()
 	if e != nil {
 		return v, e
+	}
+	if !os.SameFile(before, s) || (!s.IsDir() && !s.Mode().IsRegular()) {
+		return v, ErrInvalid
 	}
 	v.Mode = uint32(s.Mode().Perm())
 	v.Directory = s.IsDir()
@@ -652,7 +681,7 @@ func (r *Replica) sync(ctx context.Context) error {
 			continue
 		}
 		for old, i := range r.index {
-			if i.Deleted || i.Awaiting || i.Directory != v.Directory || heldDeletes[old] {
+			if i.Deleted || i.Awaiting || i.Directory != v.Directory || heldDeletes[old] || r.localBlocked(old) {
 				continue
 			}
 			if _, present := local[old]; present {
@@ -681,6 +710,14 @@ func (r *Replica) sync(ctx context.Context) error {
 			if errors.As(e, &ce) {
 				for _, pid := range ce.Paths {
 					bad[pid] = true
+				}
+			}
+			for next, previous := range renames {
+				a, _ := PathID(r.key, r.folder, next)
+				b, _ := PathID(r.key, r.folder, previous)
+				if bad[a] || bad[b] {
+					bad[a] = true
+					bad[b] = true
 				}
 			}
 			remaining := []Mutation{}
@@ -784,14 +821,14 @@ func (r *Replica) sync(ctx context.Context) error {
 		}
 		base := r.index[p].Version
 		pid, _ := PathID(r.key, r.folder, p)
-		credit := []Mutation{}
+		renameDelete := []Mutation{}
 		if old, ok := renames[p]; ok {
 			i := r.index[old]
 			oldpid, _ := PathID(r.key, r.folder, old)
-			credit = append(credit, Mutation{PathID: oldpid, BaseVersion: i.Version, Deleted: true})
+			renameDelete = append(renameDelete, Mutation{PathID: oldpid, BaseVersion: i.Version, Deleted: true})
 		}
 		preview, _ := SealMetadata(r.key, r.folder, pid, FileMetadata{Path: p, BlobID: strings.Repeat("0", 32), Size: v.Size, Mode: v.Mode, Directory: v.Directory, Hash: v.Hash})
-		request := UploadRequest{PathID: pid, BaseVersion: base, SealedSize: SealedSize(v.Size), MetadataBytes: int64(len(preview)), Deletes: credit}
+		request := UploadRequest{PathID: pid, BaseVersion: base, SealedSize: SealedSize(v.Size), MetadataBytes: int64(len(preview))}
 		t, e := r.client.Reserve(ctx, r.folder, request)
 		if errors.Is(e, ErrConflict) {
 			if i, known := r.index[p]; !known || i.Deleted {
@@ -897,7 +934,7 @@ func (r *Replica) sync(ctx context.Context) error {
 			return e
 		}
 		batch = append(batch, Mutation{PathID: pid, BaseVersion: base, TicketID: t.ID, Metadata: sealed})
-		batch = append(batch, credit...)
+		batch = append(batch, renameDelete...)
 		snapshots[p] = v
 		tickets = append(tickets, t)
 		r.mu.Lock()
@@ -932,7 +969,8 @@ func (r *Replica) sync(ctx context.Context) error {
 		var tombstone Delta
 		tombstone, e = r.client.Commit(ctx, r.folder, []Mutation{{PathID: pid, BaseVersion: i.Version, Deleted: true}})
 		if e != nil && !errors.Is(e, ErrConflict) {
-			return e
+			record(e)
+			continue
 		}
 		if e == nil {
 			i.Deleted = true
@@ -947,9 +985,14 @@ func (r *Replica) sync(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	for pid, row := range r.quarantine {
+	for _, row := range delta.Rows {
+		if old, ok := r.quarantine[row.PathID]; ok && old.Version != row.Version {
+			delete(r.quarantine, row.PathID)
+		}
+	}
+	for pid, row := range r.retryRows {
 		delta.Rows = append(delta.Rows, row)
-		delete(r.quarantine, pid)
+		delete(r.retryRows, pid)
 	}
 	for pid, row := range r.ignoredRows {
 		delta.Rows = append(delta.Rows, row)
@@ -1011,8 +1054,15 @@ func (r *Replica) sync(ctx context.Context) error {
 	for len(pending) > 0 {
 		row := pending[0]
 		pending = pending[1:]
+		if old, ok := r.quarantine[row.PathID]; ok && old.Version == row.Version {
+			continue
+		}
 		if e = r.apply(ctx, row); e != nil {
-			r.quarantine[row.PathID] = row
+			if errors.Is(e, ErrIntegrity) || errors.Is(e, ErrInvalid) {
+				r.quarantine[row.PathID] = row
+			} else {
+				r.retryRows[row.PathID] = row
+			}
 			r.addError(fmt.Errorf("remote %s: %w", row.PathID, e))
 			if firstError == nil {
 				firstError = e
@@ -1029,9 +1079,9 @@ func (r *Replica) sync(ctx context.Context) error {
 	if _, e = stateTx.Exec("DELETE FROM pending"); e != nil {
 		return e
 	}
-	for _, set := range []map[string]Row{r.quarantine, r.ignoredRows} {
+	for kind, set := range map[string]map[string]Row{"quarantine": r.quarantine, "ignored": r.ignoredRows, "retry": r.retryRows} {
 		for pid, row := range set {
-			b, me := json.Marshal(row)
+			b, me := json.Marshal(pendingRow{Row: row, Kind: kind})
 			if me != nil {
 				return me
 			}
@@ -1393,19 +1443,6 @@ func (r *Replica) persistStatus() error {
 	return os.Rename(f.Name(), filepath.Join(r.opts.StateDir, "status.json"))
 }
 
-func foldPath(p string) string {
-	var b strings.Builder
-	for _, c := range nfc(p) {
-		smallest := c
-		for next := unicode.SimpleFold(c); next != c; next = unicode.SimpleFold(next) {
-			if next < smallest {
-				smallest = next
-			}
-		}
-		b.WriteRune(smallest)
-	}
-	return b.String()
-}
 func (r *Replica) unremember(p string) {
 	if old, ok := r.index[p]; ok {
 		if r.byLocal[old.Local] == p {

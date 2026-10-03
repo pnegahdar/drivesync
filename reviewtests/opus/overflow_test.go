@@ -18,7 +18,7 @@ func TestHugeReservationsBlockOwnersOtherFolders(t *testing.T) {
 	ac, bc := s.Client(alice), s.Client(bob)
 	private, pk := mkFolder(t, ac, ds.Limits{})
 	putFile(t, ac, private, pk, "a", 0, []byte("existing"))
-	shared, _ := mkFolder(t, ac, ds.Limits{MaxTotalBytes: 1 << 40})
+	shared, _ := mkFolder(t, ac, ds.Limits{MaxTotalBytes: 1 << 40, MaxRows: 1000})
 	if e := ac.Grant(bg, shared.ID, bob, ds.Writer); e != nil {
 		t.Fatal(e)
 	}

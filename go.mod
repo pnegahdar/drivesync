@@ -6,6 +6,7 @@ require (
 	github.com/ebitengine/purego v0.11.1
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/zeebo/blake3 v0.2.4
+	golang.org/x/text v0.42.0
 	modernc.org/sqlite v1.60.1
 )
 

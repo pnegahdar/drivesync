@@ -16,7 +16,7 @@ func TestKeylessWriterWedgesAllReplicas(t *testing.T) {
 	owner := ds.Principal{Tenant: "t", Subject: "o"}
 	w := ds.Principal{Tenant: "t", Subject: "api-bot"} // writer by grant, no key
 	oc := s.Client(owner)
-	f, k := mkFolder(t, oc, ds.Limits{})
+	f, k := mkFolder(t, oc, ds.Limits{MaxTotalBytes: 1 << 20, MaxRows: 1000})
 	if e := oc.Grant(bg, f.ID, w, ds.Writer); e != nil {
 		t.Fatal(e)
 	}

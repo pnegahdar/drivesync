@@ -1,4 +1,4 @@
-package dsreview
+package dsreview2
 
 import (
 	"bytes"

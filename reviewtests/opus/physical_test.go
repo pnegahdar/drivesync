@@ -36,6 +36,9 @@ func TestCancelLeavesBlobsOutsideQuota(t *testing.T) {
 		if e = c.CancelUpload(bg, f.ID, tk.ID); e != nil {
 			t.Fatal(e)
 		}
+		if e = s.CollectGarbage(bg); e != nil {
+			t.Fatal(e)
+		}
 	}
 	var total int64
 	filepath.WalkDir(blobDir, func(p string, d fs.DirEntry, e error) error {

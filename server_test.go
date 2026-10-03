@@ -29,6 +29,9 @@ func testServer(t testing.TB) (*Server, *SQLiteMetaStore) {
 }
 func folderFor(t testing.TB, c Client, l Limits) (Folder, FolderKey) {
 	t.Helper()
+	if l.MaxTotalBytes > 0 && l.MaxRows == 0 {
+		l.MaxRows = max(1, l.MaxTotalBytes/RowCost)
+	}
 	k := NewFolderKey()
 	f, e := c.CreateFolder(context.Background(), FolderSpec{Name: randomID(), Limits: l, KeyCheck: KeyCheck(k)})
 	if e != nil {
@@ -92,7 +95,7 @@ func TestAccessMatrix(t *testing.T) {
 						s, _ := testServer(t)
 						makeClient := clients(t, s, httpMode)
 						admin := makeClient(owner)
-						f, k := folderFor(t, admin, Limits{})
+						f, k := sharedFor(t, admin)
 						ctx := context.Background()
 						if role.name == "writer" || role.name == "reader" || role.name == "revoked" || role.name == "delegated owner" {
 							r := Writer
@@ -168,7 +171,7 @@ func TestAccessMatrix(t *testing.T) {
 							e = c.DeleteFolder(ctx, f.ID)
 						case "limits":
 							allowed = role.manage
-							e = c.SetLimits(ctx, f.ID, Limits{})
+							e = c.SetLimits(ctx, f.ID, f.Limits)
 						case "list":
 							allowed = role.p.valid()
 							var folders []Folder
@@ -204,8 +207,8 @@ func TestOpaqueDenialAndBlobBinding(t *testing.T) {
 			s, _ := testServer(t)
 			cc := clients(t, s, httpMode)
 			admin := cc(owner)
-			f, k := folderFor(t, admin, Limits{})
-			g, _ := folderFor(t, admin, Limits{})
+			f, k := sharedFor(t, admin)
+			g, _ := sharedFor(t, admin)
 			row := put(t, admin, f, k, "secret", 0, []byte("bytes"))
 			ctx := context.Background()
 			stranger := cc(Principal{"tenant", "other"})
@@ -250,7 +253,7 @@ func TestImmediateRevocation(t *testing.T) {
 			s, _ := testServer(t)
 			cc := clients(t, s, httpMode)
 			admin := cc(owner)
-			f, k := folderFor(t, admin, Limits{})
+			f, k := sharedFor(t, admin)
 			p := Principal{"tenant", "writer"}
 			_ = admin.Grant(context.Background(), f.ID, p, Writer)
 			c := cc(p)
@@ -354,6 +357,9 @@ func TestLimitsBoundaries(t *testing.T) {
 				if _, e = c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}}); e != nil {
 					t.Fatal(e)
 				}
+				if e = s.CollectGarbage(ctx); e != nil {
+					t.Fatal(e)
+				}
 				if which == "bytes" {
 					if e = c.SetLimits(ctx, f.ID, Limits{MaxTotalBytes: RowCost + RowCost + SealedSize(1)}); e != nil {
 						t.Fatal(e)
@@ -443,6 +449,9 @@ func TestOwnerQuotaAndLowering(t *testing.T) {
 	if _, e := c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}}); e != nil {
 		t.Fatal(e)
 	}
+	if e := s.CollectGarbage(ctx); e != nil {
+		t.Fatal(e)
+	}
 	// The retained tombstone still costs a row, so restore enough quota.
 	max.Store(2*RowCost + 1)
 	if _, e := c.Reserve(ctx, g.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1}); e != nil {
@@ -455,7 +464,7 @@ func TestEveryOperationAfterDeletion(t *testing.T) {
 		t.Run(fmt.Sprint(httpMode), func(t *testing.T) {
 			s, _ := testServer(t)
 			c := clients(t, s, httpMode)(owner)
-			f, k := folderFor(t, c, Limits{})
+			f, k := sharedFor(t, c)
 			ctx := context.Background()
 			row := put(t, c, f, k, "file", 0, []byte("file"))
 			pid, _ := PathID(k, f.ID, "pending")
@@ -473,7 +482,7 @@ func TestEveryOperationAfterDeletion(t *testing.T) {
 				}, "upload": func() error { return c.Upload(ctx, f.ID, ticket, bytes.NewReader([]byte{1})) }, "cancel": func() error { return c.CancelUpload(ctx, f.ID, ticket.ID) }, "commit": func() error {
 					_, e := c.Commit(ctx, f.ID, []Mutation{{PathID: row.PathID, BaseVersion: row.Version, Deleted: true}})
 					return e
-				}, "grant": func() error { return c.Grant(ctx, f.ID, Principal{"t", "p"}, Reader) }, "revoke": func() error { return c.Revoke(ctx, f.ID, Principal{"t", "p"}) }, "delete": func() error { return c.DeleteFolder(ctx, f.ID) }, "limits": func() error { return c.SetLimits(ctx, f.ID, Limits{}) }, "subscribe": func() error { _, e := s.Subscribe(ctx, owner, f.ID, 0); return e }}
+				}, "grant": func() error { return c.Grant(ctx, f.ID, Principal{"t", "p"}, Reader) }, "revoke": func() error { return c.Revoke(ctx, f.ID, Principal{"t", "p"}) }, "delete": func() error { return c.DeleteFolder(ctx, f.ID) }, "limits": func() error { return c.SetLimits(ctx, f.ID, f.Limits) }, "subscribe": func() error { _, e := s.Subscribe(ctx, owner, f.ID, 0); return e }}
 			for name, fn := range methods {
 				if e := fn(); e != ErrDenied {
 					t.Errorf("%s: %v", name, e)
@@ -493,7 +502,7 @@ func TestInvalidUTF8PrincipalsNeverAlias(t *testing.T) {
 			s, _ := testServer(t)
 			cc := clients(t, s, httpMode)
 			admin := cc(owner)
-			f, k := folderFor(t, admin, Limits{})
+			f, k := sharedFor(t, admin)
 			ctx := context.Background()
 			replacement := Principal{"tenant", "\uFFFD"}
 			if e := admin.Grant(ctx, f.ID, replacement, Reader); e != nil {
@@ -526,4 +535,8 @@ func accountedTestFile(path string, content []byte) int64 {
 	pid, _ := PathID(k, id, path)
 	meta, _ := SealMetadata(k, id, pid, FileMetadata{Path: path, BlobID: id, Size: int64(len(content)), Mode: 0600, Hash: hashBytes(content)})
 	return RowCost + int64(len(meta)) + SealedSize(int64(len(content)))
+}
+
+func sharedFor(t testing.TB, c Client) (Folder, FolderKey) {
+	return folderFor(t, c, Limits{MaxTotalBytes: 64 << 20, MaxRows: 10000})
 }
