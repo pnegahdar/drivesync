@@ -611,7 +611,7 @@ func TestLargeFolderChunkCheckAndPullStayBounded(t *testing.T) {
 	}
 	pull := time.Since(start)
 	t.Logf("%T: %d rows; blob check %s per chunk read, full pull of %d rows %s", m, n, perCheck, len(d.Rows), pull.Round(time.Millisecond))
-	if perCheck > 5*time.Millisecond || pull > 3*time.Second {
+	if perCheck > raceSlowdown*5*time.Millisecond || pull > raceSlowdown*3*time.Second {
 		t.Fatalf("blob check %s per chunk, full pull %s for a %d-row folder", perCheck, pull.Round(time.Millisecond), n)
 	}
 }
