@@ -151,9 +151,7 @@ func TestUnrelatedTenantRowsAreNotDecoded(t *testing.T) {
 	evil := Principal{"evil", "owner"}
 	g, _ := folderFor(t, s.Client(evil), Limits{})
 	data := fmt.Sprintf(`{"FolderID":%q,"PathID":%q,"SealedSize":"bad"}`, g.ID, strings.Repeat("a", 64))
-	if _, e := m.db.Exec("INSERT INTO files(folder,path,data) VALUES(?,?,?)", g.ID, strings.Repeat("a", 64), []byte(data)); e != nil {
-		t.Fatal(e)
-	}
+	insertFileRow(t, m, g.ID, strings.Repeat("a", 64), data)
 	if _, e := c.GetFolder(context.Background(), f.ID); e != nil {
 		t.Fatal("unrelated row decoded", e)
 	}

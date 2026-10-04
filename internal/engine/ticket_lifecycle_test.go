@@ -14,13 +14,13 @@ import (
 
 // Counting the transactions makes the trickle-upload regression deterministic.
 type countedMetadata struct {
-	*SQLiteMetaStore
+	testStore
 	transactions int
 }
 
 func (m *countedMetadata) Transaction(ctx context.Context, fn func(*Metadata) error) error {
 	m.transactions++
-	return m.SQLiteMetaStore.Transaction(ctx, fn)
+	return m.testStore.Transaction(ctx, fn)
 }
 
 type singleByteReader struct{ io.Reader }
@@ -28,7 +28,7 @@ type singleByteReader struct{ io.Reader }
 func (r singleByteReader) Read(p []byte) (int, error) { return r.Reader.Read(p[:1]) }
 func TestTicketRenewOnlyAfterHalfTTL(t *testing.T) {
 	s, m := testServer(t)
-	count := &countedMetadata{SQLiteMetaStore: m}
+	count := &countedMetadata{testStore: m}
 	s.Meta = count
 	c := s.Client(owner)
 	f, k := folderFor(t, c, Limits{})
@@ -70,9 +70,7 @@ func TestSameOwnerUnrelatedRowsAreNotDecoded(t *testing.T) {
 		t.Fatal(e)
 	}
 	data := fmt.Sprintf(`{"FolderID":%q,"PathID":%q,"SealedSize":"bad"}`, private.ID, strings.Repeat("a", 64))
-	if _, e := m.db.Exec("INSERT INTO files(folder,path,data) VALUES(?,?,?)", private.ID, strings.Repeat("a", 64), []byte(data)); e != nil {
-		t.Fatal(e)
-	}
+	insertFileRow(t, m, private.ID, strings.Repeat("a", 64), data)
 	guest := s.Client(p)
 	pid, _ := PathID(k, shared.ID, "new")
 	ticket, e := guest.Reserve(context.Background(), shared.ID, UploadRequest{PathID: pid, SealedSize: 1})

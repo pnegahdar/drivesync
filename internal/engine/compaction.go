@@ -10,11 +10,25 @@ func (s *Server) CompactTombstones(ctx context.Context) error {
 	if s.TombstoneTTL <= 0 {
 		return nil
 	}
+	release, ok, err := s.maintenance(ctx)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cutoff := s.now().Add(-s.TombstoneTTL).UnixNano()
 	candidates := map[string][]string{}
-	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+	if pg, ok := s.Meta.(*PostgresMetaStore); ok {
+		var e error
+		candidates, e = pg.emptyTombstones(ctx, cutoff)
+		if e != nil {
+			return e
+		}
+	} else if db, ok := s.Meta.(*SQLiteMetaStore); ok {
 		rows, e := db.reads.QueryContext(ctx, `SELECT folder,path FROM files WHERE json_extract(data,'$.Deleted')=1 AND json_extract(data,'$.BlobID')='' AND json_extract(data,'$.DeletedAt')>0 AND json_extract(data,'$.DeletedAt')<?`, cutoff)
 		if e != nil {
 			return e

@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"sort"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -19,10 +20,14 @@ type Server struct {
 	Now            func() time.Time
 	wakes          *notifications
 	TombstoneTTL   time.Duration
+	// writerID marks leases this authority publishes. Another authority,
+	// including one in the same process, leaves that lease alone until it
+	// expires. This authority retires its own ticket once publication ends.
+	writerID string
 }
 
 func NewServer(meta MetaStore, blobs BlobStore) *Server {
-	s := &Server{Meta: meta, Blobs: blobs, ReservationTTL: 5 * time.Minute, Now: time.Now, wakes: newNotifications(), TombstoneTTL: 30 * 24 * time.Hour}
+	s := &Server{Meta: meta, Blobs: blobs, ReservationTTL: 5 * time.Minute, Now: time.Now, wakes: newNotifications(), TombstoneTTL: 30 * 24 * time.Hour, writerID: randomID()}
 	if source, ok := meta.(NotificationSource); ok {
 		s.wakes = source.Notifications()
 	}
@@ -46,6 +51,23 @@ func access(m *Metadata, p Principal, id string, write, owner bool) (FolderRecor
 	}
 	return f, nil
 }
+
+func (s *Server) stampLease(t *Ticket) {
+	if t.Writing {
+		t.Lease = t.Expires
+		if t.Writer == "" {
+			t.Writer = s.writerID
+		}
+	}
+}
+
+func (s *Server) reservationTTL() time.Duration {
+	if s.ReservationTTL <= 0 {
+		return 5 * time.Minute
+	}
+	return s.ReservationTTL
+}
+
 func (s *Server) now() time.Time {
 	if s.Now != nil {
 		return s.Now()
@@ -55,6 +77,9 @@ func (s *Server) now() time.Time {
 func (s *Server) notify(id string) { s.wakes.notify(id) }
 func (s *Server) expire(m *Metadata) {
 	for id, t := range m.Tickets {
+		if s.writingLive(t) {
+			continue
+		}
 		if !t.Expires.After(s.now()) {
 			s.retireTicket(m, t)
 
@@ -155,7 +180,9 @@ func (s *Server) CreateFolder(ctx context.Context, p Principal, spec FolderSpec)
 	if !p.valid() {
 		return f, ErrDenied
 	}
-	if spec.Name == "" || !utf8.ValidString(spec.Name) || !utf8.ValidString(spec.Description) || len(spec.Name) > 255 || len(spec.Description) > 4096 || !s.validCreation(p, spec) || !validLimits(spec.Limits) {
+	// NUL is valid UTF-8. Postgres and SQLite both reject it here so a name
+	// cannot collide with one that drops the byte, and both stores share the rule.
+	if spec.Name == "" || strings.ContainsRune(spec.Name, 0) || !utf8.ValidString(spec.Name) || strings.ContainsRune(spec.Description, 0) || !utf8.ValidString(spec.Description) || len(spec.Name) > 255 || len(spec.Description) > 4096 || !s.validCreation(p, spec) || !validLimits(spec.Limits) {
 		return f, ErrInvalid
 	}
 	e := s.transaction(ctx, p, "", true, func(m *Metadata) error {
@@ -280,7 +307,9 @@ func (s *Server) ListFolders(ctx context.Context, p Principal) ([]Folder, error)
 	// index probe at a time. Under the race detector that exceeds the list
 	// budget long before the result is quadratic. Ownership is a grant row,
 	// so one principal index range produces the same folders and cached usage.
-	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
+	if db, ok := s.Meta.(interface {
+		listFolders(context.Context, Principal) ([]Folder, error)
+	}); ok {
 		out, e := db.listFolders(ctx, p)
 		if e != nil {
 			return nil, e
@@ -454,6 +483,8 @@ func (s *Server) Upload(ctx context.Context, p Principal, id string, provided Ti
 			return ErrBusy
 		}
 		v.Writing = true
+		v.Writer = s.writerID
+		v.Lease = s.now().Add(s.reservationTTL())
 		m.Tickets[t.ID] = v
 		return nil
 	})
@@ -543,6 +574,9 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 	}
 	ctx = context.WithValue(ctx, ticketIDsKey{}, ids)
 	ctx = context.WithValue(ctx, garbageIDsKey{}, []string{})
+	// out is assigned once, from a Delta built inside this attempt. A retried
+	// callback replaces it. Appending to the outer value would return rows
+	// from an attempt that did not commit.
 	var out Delta
 	e := s.transaction(ctx, p, id, true, func(m *Metadata) error {
 		f, e := access(m, p, id, true, false)
@@ -594,6 +628,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 		if f.Folder.Version == math.MaxUint64 {
 			return ErrInvalid
 		}
+		delta := Delta{}
 		f.Folder.Version++
 		for _, v := range mut {
 			old := m.Files[id][v.PathID]
@@ -643,7 +678,7 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 				retired = append(retired, old)
 			}
 			m.Files[id][v.PathID] = row
-			out.Rows = append(out.Rows, row)
+			delta.Rows = append(delta.Rows, row)
 		}
 		for _, row := range retired {
 			s.retireRow(m, row)
@@ -670,7 +705,8 @@ func (s *Server) Commit(ctx context.Context, p Principal, id string, mut []Mutat
 			}
 		}
 		m.Folders[id] = f
-		out.Version = f.Folder.Version
+		delta.Version = f.Folder.Version
+		out = delta
 		return nil
 	})
 	if e == nil {

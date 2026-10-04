@@ -42,9 +42,10 @@ func NewServer(meta *MetaStore, blobs BlobStore, opts ServerOptions) *Server {
 }
 
 // Run recovers interrupted uploads and maintains expired reservations, garbage
-// and tombstones until ctx is cancelled. Use a single authority process for
-// these metadata/blob stores: recovery cannot prove another process stopped
-// publishing. Cancel and join Run before closing the stores.
+// and tombstones until ctx is cancelled. SQLite metadata is one authority
+// process per database file. Postgres metadata can be shared: an upload lease
+// is renewed while bytes flow, and recovery retires only an expired lease.
+// Cancel and join Run before closing the stores.
 func (s *Server) Run(ctx context.Context) error { return publicError(s.server.Run(ctx, s.interval)) }
 
 type Authenticator func(*http.Request) (Principal, error)

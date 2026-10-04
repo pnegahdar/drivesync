@@ -7,11 +7,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            store: sqlite
+          - os: macos-latest
+            store: sqlite
+          - os: ubuntu-latest
+            store: postgres
+    name: ${{ matrix.os }} ${{ matrix.store }}
     runs-on: ${{ matrix.os }}
     env:
       # Timing probes compete inside their own server, not with other packages.
       GOFLAGS: -p=1
+      DRIVESYNC_STORE: ${{ matrix.store }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

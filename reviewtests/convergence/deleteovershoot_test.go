@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 type failingDeletes struct{ *ds.MemoryBlobStore }
@@ -20,11 +21,7 @@ func (failingDeletes) Delete(context.Context, string, string) error {
 // exactly the cap, so stored bytes/rows exceed the charge until GC succeeds; a
 // failing blob store makes the excess persistent (documented as "brief").
 func TestExistingRowDeletesExceedAllocatedCharge(t *testing.T) {
-	m, e := ds.OpenSQLiteMetaStore(t.TempDir() + "/m.sqlite")
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := testkit.OpenEngine(t)
 	s := ds.NewServer(m, failingDeletes{ds.NewMemoryBlobStore()})
 	owner := s.Client(ds.Principal{Tenant: "t", Subject: "owner"})
 	const files = 40

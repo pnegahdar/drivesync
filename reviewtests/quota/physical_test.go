@@ -8,13 +8,13 @@ import (
 	"testing"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 // Reserve -> Upload -> CancelUpload frees the logical reservation but keeps the
 // uploaded object, so physical storage grows without bound under a fixed quota.
 func TestCancelLeavesBlobsOutsideQuota(t *testing.T) {
-	m, _ := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	defer m.Close()
+	m := testkit.OpenEngine(t)
 	blobDir := filepath.Join(t.TempDir(), "blobs")
 	bs, _ := ds.OpenDirectoryBlobStore(blobDir)
 	defer bs.Close()

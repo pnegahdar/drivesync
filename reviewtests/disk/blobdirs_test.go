@@ -8,16 +8,13 @@ import (
 	"time"
 
 	"github.com/pnegahdar/drivesync"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 // Every folder that ever stored a blob leaves a directory in the
 // DirectoryBlobStore forever, even after deletion and full collection.
 func TestDirectoryBlobStoreLeaksPerFolderDirectories(t *testing.T) {
-	meta, e := drivesync.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer meta.Close()
+	meta := testkit.OpenPublic(t)
 	root := filepath.Join(t.TempDir(), "blobs")
 	blobs, e := drivesync.OpenDirectoryBlobStore(root)
 	if e != nil {

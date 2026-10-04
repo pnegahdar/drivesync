@@ -6,24 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 	"github.com/zeebo/blake3"
 )
 
 var bg = context.Background()
 var seq atomic.Int64
 
-func newServer(t testing.TB) (*ds.Server, *ds.SQLiteMetaStore) {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+func newServer(t testing.TB) (*ds.Server, testkit.EngineStore) {
+	m := testkit.OpenEngine(t)
 	return ds.NewServer(m, ds.NewMemoryBlobStore()), m
 }
 

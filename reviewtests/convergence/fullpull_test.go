@@ -16,6 +16,7 @@ import (
 type compactingClient struct {
 	ds.Client
 	s    *ds.Server
+	t    *testing.T
 	once sync.Once
 	arm  bool
 }
@@ -24,7 +25,7 @@ func (c *compactingClient) Changes(ctx context.Context, id string, after uint64)
 	if c.arm && after > 0 {
 		c.once.Do(func() {
 			if e := c.s.CollectGarbage(ctx); e != nil {
-				panic(e)
+				c.t.Fatal(e)
 			}
 		})
 	}
@@ -47,7 +48,7 @@ func TestPullIgnoresFullDelta(t *testing.T) {
 				c = httpClients(t, s)(p)
 			}
 			f, k := mkFolder(t, c, ds.Limits{})
-			wrapped := &compactingClient{Client: c, s: s}
+			wrapped := &compactingClient{Client: c, s: s, t: t}
 			a, b := attach(t, c, f, k, "a"), attach(t, wrapped, f, k, "b")
 			write(t, a, "keep.txt", "keep")
 			write(t, a, "gone.txt", "deleted elsewhere")

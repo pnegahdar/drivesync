@@ -12,9 +12,16 @@ can do, and the local-disk guarantees.
 
 ## Quickstart
 
-Run one authority process per metadata and blob store. `auth` authenticates
-each HTTP request and returns a `Principal{Tenant, Subject}`. `plans`
-implements `QuotaPolicy`.
+SQLite metadata is one authority process per database file. Postgres metadata,
+opened with `OpenPostgresMetaStore`, can be shared by several authority
+processes. The pool needs at least three connections: one stays on LISTEN and
+two remain for transactions. Each process listens for the others' commits. An
+upload records a lease renewed while bytes flow; recovery retires only a
+ticket whose lease has expired. A garbage-collection pass claims a lease row
+(a holder id and an expiry, renewed during the pass) or skips when another
+process holds an unexpired lease. A frozen holder stops blocking once that
+lease expires. `auth` authenticates each HTTP request and returns a
+`Principal{Tenant, Subject}`. `plans` implements `QuotaPolicy`.
 
 ```go
 meta, err := drivesync.OpenSQLiteMetaStore("authority.sqlite")
@@ -125,7 +132,8 @@ and escapes are reported as unsupported.
 
 The included blob stores are an in-memory store and a durable local directory.
 `BlobStore.Put` must publish only after a clean EOF. An embedder can add an
-object-store backend without taking an SDK dependency. Metadata is SQLite.
+object-store backend without taking an SDK dependency. Metadata is SQLite or
+Postgres. `OpenPostgresMetaStore` needs a pool of at least three connections.
 `QuotaPolicy` is the other extension point.
 
 Fresh databases are required. This version does not migrate older schemas, and

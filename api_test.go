@@ -16,11 +16,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pnegahdar/drivesync/internal/embedpg"
 	"github.com/pnegahdar/drivesync/internal/engine"
 )
 
 func apiServer(t testing.TB, opts ServerOptions) *Server {
 	t.Helper()
+	if embedpg.Postgres() {
+		db := embedpg.SharedDB(t)
+		schema := embedpg.NewSchema()
+		meta, e := OpenPostgresMetaStore(context.Background(), db, schema)
+		if e != nil {
+			t.Fatal(e)
+		}
+		t.Cleanup(func() {
+			meta.Close()
+			embedpg.DropSchema(db, schema)
+		})
+		return NewServer(meta, NewMemoryBlobStore(), opts)
+	}
 	meta, e := OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
 	if e != nil {
 		t.Fatal(e)

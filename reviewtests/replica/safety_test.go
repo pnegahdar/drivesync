@@ -18,11 +18,17 @@ import (
 
 	ds "github.com/pnegahdar/drivesync"
 	e "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 var owner = e.Principal{Tenant: "tenant", Subject: "owner"}
 
 func TestCompletedUploadAckFailureDoesNotPinCapacityForever(t *testing.T) {
+	if testkit.Postgres() {
+		// The fault is a SQLite trigger on the acknowledgement write.
+		// Cross-process recovery is TestMultiAuthority.
+		t.Skip("SQLite trigger aborts the acknowledgement write")
+	}
 	for _, httpMode := range []bool{false, true} {
 		t.Run(fmt.Sprint(httpMode), func(t *testing.T) {
 			file := filepath.Join(t.TempDir(), "meta.sqlite")
@@ -74,13 +80,9 @@ func TestCompletedUploadAckFailureDoesNotPinCapacityForever(t *testing.T) {
 	}
 }
 
-func server(t *testing.T) (*e.Server, *e.SQLiteMetaStore) {
+func server(t *testing.T) (*e.Server, testkit.EngineStore) {
 	t.Helper()
-	m, err := e.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := testkit.OpenEngine(t)
 	return e.NewServer(m, e.NewMemoryBlobStore()), m
 }
 
@@ -109,11 +111,7 @@ func TestPublicReplicaCanRetryQuarantinedDownload(t *testing.T) {
 	for _, httpMode := range []bool{false, true} {
 		t.Run(fmt.Sprint(httpMode), func(t *testing.T) {
 			ctx := context.Background()
-			meta, err := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer meta.Close()
+			meta := testkit.OpenPublic(t)
 			blobs := &corruptOnce{BlobStore: ds.NewMemoryBlobStore()}
 			s := ds.NewServer(meta, blobs, ds.ServerOptions{})
 			p := ds.Principal{Tenant: "tenant", Subject: "owner"}
@@ -182,11 +180,7 @@ func TestPublicCreateRejectsUninitializedFolderKey(t *testing.T) {
 
 func publicFixture(t *testing.T, httpMode bool) (*ds.Client, ds.Folder, ds.FolderKey) {
 	t.Helper()
-	m, err := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := testkit.OpenPublic(t)
 	s := ds.NewServer(m, ds.NewMemoryBlobStore(), ds.ServerOptions{})
 	p := ds.Principal{Tenant: "owner", Subject: "owner"}
 	c := s.Client(p)
@@ -366,11 +360,7 @@ func TestOversizedUploadRetainsActualCharge(t *testing.T) {
 func TestDeniedMutationDoesNotObserveUnrelatedWriter(t *testing.T) {
 	for _, httpMode := range []bool{false, true} {
 		t.Run(fmt.Sprint(httpMode), func(t *testing.T) {
-			meta, err := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer meta.Close()
+			meta := testkit.OpenPublic(t)
 			entered, release := make(chan struct{}), make(chan struct{})
 			s := ds.NewServer(meta, ds.NewMemoryBlobStore(), ds.ServerOptions{Quotas: ds.QuotaFunc(func(ctx context.Context, p ds.Principal) (ds.Quota, error) {
 				if p.Tenant == "victim" {
@@ -392,7 +382,8 @@ func TestDeniedMutationDoesNotObserveUnrelatedWriter(t *testing.T) {
 				attacker = ds.NewHTTPClient(h.URL, nil)
 			}
 			target := strings.Repeat("0", 32) // no grant, and no knowledge of any folder ID
-			if err = attacker.DeleteFolder(context.Background(), target); !errors.Is(err, ds.ErrDenied) {
+			err := attacker.DeleteFolder(context.Background(), target)
+			if !errors.Is(err, ds.ErrDenied) {
 				t.Fatal(err)
 			}
 			done := make(chan error, 1)

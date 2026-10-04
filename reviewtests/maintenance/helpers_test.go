@@ -16,6 +16,7 @@ import (
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 	"github.com/zeebo/blake3"
 )
 
@@ -30,12 +31,8 @@ type clock struct {
 func (c *clock) Now() time.Time      { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
 func (c *clock) Add(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
-func newServer(t testing.TB) (*ds.Server, *ds.SQLiteMetaStore, ds.BlobStore) {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+func newServer(t testing.TB) (*ds.Server, testkit.EngineStore, ds.BlobStore) {
+	m := testkit.OpenEngine(t)
 	b := ds.NewMemoryBlobStore()
 	return ds.NewServer(m, b), m, b
 }

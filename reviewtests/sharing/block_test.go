@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 // slowDelete models an object store whose deletes take ~100ms (S3-like).
@@ -34,8 +34,7 @@ func (s slowDelete) Put(c context.Context, f, id string, r io.Reader) (int64, er
 // A cross-tenant writer turns reused rename credits into garbage far beyond the
 // folder's allocation; until GC drains it, the owner's private writes fail.
 func TestCrossTenantGarbageBlocksOwner(t *testing.T) {
-	m, _ := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	defer m.Close()
+	m := testkit.OpenEngine(t)
 	var deletions atomic.Int64
 	s := ds.NewServer(m, slowDelete{BlobStore: ds.NewMemoryBlobStore(), calls: &deletions})
 	now := time.Now()

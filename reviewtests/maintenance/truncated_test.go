@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 type countingBlobs struct {
@@ -26,11 +27,7 @@ func (c *countingBlobs) Open(ctx context.Context, f, id string) (io.ReadCloser, 
 // the complete-but-truncated object as a transient EOF forever: it re-downloads
 // the whole blob on every sync, and its own edits to that path are never sent.
 func TestStoredTruncatedBlobRetriesForeverAndPinsLocalEdits(t *testing.T) {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer m.Close()
+	m := testkit.OpenEngine(t)
 	blobs := &countingBlobs{BlobStore: ds.NewMemoryBlobStore()}
 	s := ds.NewServer(m, blobs)
 	a := s.Client(alice)

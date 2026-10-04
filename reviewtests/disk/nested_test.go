@@ -10,16 +10,13 @@ import (
 	"testing"
 
 	"github.com/pnegahdar/drivesync"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 var bg = context.Background()
 
 func newServer(t *testing.T) *drivesync.Server {
-	meta, e := drivesync.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { meta.Close() })
+	meta := testkit.OpenPublic(t)
 	return drivesync.NewServer(meta, drivesync.NewMemoryBlobStore(), drivesync.ServerOptions{})
 }
 

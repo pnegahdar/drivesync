@@ -6,25 +6,21 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 	"github.com/zeebo/blake3"
 )
 
 var bg = context.Background()
 var seq atomic.Int64
 
-func newServer(t testing.TB) (*ds.Server, *ds.SQLiteMetaStore) {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+func newServer(t testing.TB) (*ds.Server, testkit.EngineStore) {
+	m := testkit.OpenEngine(t)
 	return ds.NewServer(m, ds.NewMemoryBlobStore()), m
 }
 
@@ -97,19 +93,14 @@ func httpClients(t testing.TB, s *ds.Server) func(ds.Principal) ds.Client {
 	}
 }
 
-func newServerMeta(t testing.TB) (*ds.SQLiteMetaStore, error) {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
-	return m, nil
+func newServerMeta(t testing.TB) (testkit.EngineStore, error) {
+	return testkit.OpenEngine(t), nil
 }
 
 // Admit one representative through the public API, then populate equivalent
 // idle owners in one transaction. Measurements retain the original cardinality
 // and run only through public APIs; race instrumentation need not price setup.
-func seedOwners(t testing.TB, s *ds.Server, m *ds.SQLiteMetaStore, n int, shared *ds.Principal) {
+func seedOwners(t testing.TB, s *ds.Server, m testkit.EngineStore, n int, shared *ds.Principal) {
 	t.Helper()
 	first := ds.Principal{Tenant: "tenant-0", Subject: "u"}
 	limits := ds.Limits{}
@@ -155,7 +146,7 @@ func seedOwners(t testing.TB, s *ds.Server, m *ds.SQLiteMetaStore, n int, shared
 	}
 }
 
-func seedTombstones(t testing.TB, m *ds.SQLiteMetaStore, c ds.Client, f ds.Folder, k ds.FolderKey, prefix string, n int) {
+func seedTombstones(t testing.TB, m testkit.EngineStore, c ds.Client, f ds.Folder, k ds.FolderKey, prefix string, n int) {
 	t.Helper()
 	var muts []ds.Mutation
 	for j := 0; j < min(256, n); j++ {

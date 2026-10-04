@@ -32,6 +32,11 @@ type Garbage struct {
 	Owner            Principal
 	Size             int64
 	Writing          bool
+	// Writer and Lease are copied from the ticket that became this garbage.
+	// Another authority's lease is still live until Lease, so collection must
+	// not delete the blob early.
+	Writer string
+	Lease  time.Time
 }
 type Metadata struct {
 	Folders           map[string]FolderRecord
@@ -88,7 +93,7 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		// row grows with the table. 16MiB and a 40MiB WAL threshold keep one pass linear.
 		"PRAGMA journal_mode=WAL", "PRAGMA busy_timeout=10000", "PRAGMA synchronous=FULL",
 		"PRAGMA cache_size=-16384", "PRAGMA wal_autocheckpoint=10000",
-		`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, data BLOB NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS folders (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', live INTEGER NOT NULL DEFAULT 1, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS grants (folder TEXT NOT NULL, principal TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(folder,principal))`,
 		`CREATE INDEX IF NOT EXISTS grants_principal ON grants(principal,folder)`,
 		`CREATE INDEX IF NOT EXISTS folders_owner ON folders(owner)`,
@@ -96,7 +101,7 @@ func OpenSQLiteMetaStore(name string) (*SQLiteMetaStore, error) {
 		`CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, folder TEXT NOT NULL, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS garbage (id TEXT PRIMARY KEY, folder TEXT NOT NULL, size INTEGER NOT NULL DEFAULT 0, writing INTEGER NOT NULL DEFAULT 0, data BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, data BLOB NOT NULL)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner,json_extract(data,'$.Folder.Name')) WHERE json_extract(data,'$.Deleted')=0`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS folder_names ON folders(owner, name) WHERE live<>0`,
 		`CREATE INDEX IF NOT EXISTS tickets_folder ON tickets(folder,id)`,
 		`CREATE INDEX IF NOT EXISTS tickets_path ON tickets(folder,json_extract(data,'$.PathID'))`,
 		`CREATE INDEX IF NOT EXISTS garbage_folder ON garbage(folder,id)`,
@@ -224,382 +229,15 @@ func (s *SQLiteMetaStore) Transaction(ctx context.Context, fn func(*Metadata) er
 			return e
 		}
 	}
-	m := newMetadata()
-	old := map[string]map[string][]byte{}
-	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
-		old[table] = map[string][]byte{}
-		q := "SELECT id,data FROM " + table
-		if table == "files" {
-			q = "SELECT folder || '/' || path,data FROM files"
-		}
-		if table == "grants" {
-			q = "SELECT folder || '/' || principal,data FROM grants"
-		}
-		var args []any
-		if scope, ok := ctx.Value(scopeKey{}).(Scope); ok {
-			m.filesLoaded = !scope.NoFiles && !scope.GC && scope.Paths == nil
-			filter := "id=?"
-			args = []any{scope.Folder}
-			if scope.Folder == "" {
-				if scope.Create {
-					filter = "0"
-					args = nil
-				} else {
-					filter = `id IN (SELECT folder FROM grants WHERE principal=?)`
-					args = []any{principalKey(scope.Principal)}
-				}
-			}
-			if scope.GC {
-				args = nil
-				if table == "files" {
-					q += " WHERE 0"
-				}
-			} else if scope.NoFiles && table == "files" {
-				q += " WHERE 0"
-				args = nil
-			} else if table == "folders" {
-				q += " WHERE " + filter
-			} else if table == "files" {
-				q += " WHERE folder IN (SELECT id FROM folders WHERE " + filter + ")"
-				if scope.Paths != nil {
-					if len(scope.Paths) == 0 {
-						q += " AND 0"
-					} else {
-						q += " AND path IN (" + strings.TrimSuffix(strings.Repeat("?,", len(scope.Paths)), ",") + ")"
-						for _, p := range scope.Paths {
-							args = append(args, p)
-						}
-					}
-				}
-			} else {
-				q += ` WHERE folder IN (SELECT id FROM folders WHERE ` + filter + ")"
-			}
-		}
-		if scoped && !scope.GC && (table == "tickets" || table == "garbage") {
-			ids := scope.Tickets
-			if table == "garbage" {
-				ids = scope.Garbage
-			}
-			if table == "tickets" && scope.TicketPaths != nil && ids == nil {
-				m.transfersPartial = true
-				if len(scope.TicketPaths) == 0 {
-					q += " AND 0"
-				} else {
-					q += " AND json_extract(data,'$.PathID') IN (" + strings.TrimSuffix(strings.Repeat("?,", len(scope.TicketPaths)), ",") + ")"
-					for _, pid := range scope.TicketPaths {
-						args = append(args, pid)
-					}
-				}
-			}
-			if ids != nil {
-				m.transfersPartial = true
-				if len(ids) == 0 {
-					q += " AND 0"
-				} else {
-					q += " AND id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + ")"
-					for _, id := range ids {
-						args = append(args, id)
-					}
-				}
-			}
-		}
-		rs, e := tx.QueryContext(ctx, q, args...)
-		if e != nil {
-			return e
-		}
-		for rs.Next() {
-			var id string
-			var data []byte
-			if e = rs.Scan(&id, &data); e != nil {
-				rs.Close()
-				return e
-			}
-			old[table][id] = data
-			switch table {
-			case "grants":
-				var role Role
-				e = json.Unmarshal(data, &role)
-				f := m.Folders[id[:32]]
-				if id[33:] != principalKey(f.Folder.Owner) {
-					f.Grants[id[33:]] = role
-				}
-				m.Folders[id[:32]] = f
-			case "garbage":
-				var v Garbage
-				if e = json.Unmarshal(data, &v); e == nil {
-					m.Garbage[id] = v
-				}
-			case "folders":
-				var v FolderRecord
-				if e = json.Unmarshal(data, &v); e == nil {
-					v.Grants = map[string]Role{}
-					m.Folders[id] = v
-					if m.Files[id] == nil {
-						m.Files[id] = map[string]Row{}
-					}
-				}
-			case "tickets":
-				var v Ticket
-				if e = json.Unmarshal(data, &v); e == nil {
-					m.Tickets[id] = v
-				}
-			case "files":
-				var v Row
-				if e = json.Unmarshal(data, &v); e == nil {
-					if m.Files[v.FolderID] == nil {
-						m.Files[v.FolderID] = map[string]Row{}
-					}
-					m.Files[v.FolderID][v.PathID] = v
-				}
-			}
-			if e != nil {
-				rs.Close()
-				return e
-			}
-		}
-		e = rs.Err()
-		rs.Close()
-		if e != nil {
-			return e
-		}
-		if table == "grants" {
-			if scope, ok := ScopeFromContext(ctx); ok && scope.Folder != "" && scope.Principal.valid() {
-				if _, e = access(m, scope.Principal, scope.Folder, false, false); e != nil {
-					return e
-				}
-			}
-		}
-
-	}
-	if scoped && scope.ReadOnly {
-		m.Prepare(m.filesLoaded)
-		m.ctx = ctx
-		return fn(m)
-	}
-	keys := map[string]bool{}
-	if scope, ok := ctx.Value(scopeKey{}).(Scope); ok && scope.Folder == "" && scope.Principal.valid() {
-		keys[principalKey(scope.Principal)] = true
-	}
-	for _, f := range m.Folders {
-		keys[principalKey(f.Folder.Owner)] = true
-	}
-	for _, g := range m.Garbage {
-		keys[principalKey(g.Owner)] = true
-	}
-	if scoped && scope.GC {
-		rows, qe := tx.QueryContext(ctx, "SELECT id,data FROM accounts")
-		if qe != nil {
-			return qe
-		}
-		for rows.Next() {
-			var key string
-			var data []byte
-			var a Account
-			if qe = rows.Scan(&key, &data); qe == nil {
-				qe = json.Unmarshal(data, &a)
-			}
-			if qe != nil {
-				rows.Close()
-				return qe
-			}
-			m.Accounts[key] = a
-		}
-		qe = rows.Err()
-		rows.Close()
-		if qe != nil {
-			return qe
-		}
-	} else {
-		for key := range keys {
-			var data []byte
-			e = tx.QueryRowContext(ctx, "SELECT data FROM accounts WHERE id=?", key).Scan(&data)
-			if e != nil && !errors.Is(e, sql.ErrNoRows) {
-				return e
-			}
-			var a Account
-			if len(data) > 0 {
-				if e = json.Unmarshal(data, &a); e != nil {
-					return e
-				}
-			}
-			m.Accounts[key] = a
-		}
-	}
-	beforeAccounts := make(map[string]Account, len(m.Accounts))
-	for k, a := range m.Accounts {
-		beforeAccounts[k] = a
-	}
-	m.Prepare(m.filesLoaded)
-	if e = fn(m); e != nil {
+	changed, e := persistScoped(ctx, tx, fn, false)
+	if e != nil {
 		return e
 	}
-	m.Finish()
-	accounts := []any{}
-	for key, a := range m.Accounts {
-		if a == beforeAccounts[key] {
-			continue
-		}
-		b, err := json.Marshal(a)
-		if err != nil {
-			return err
-		}
-		accounts = append(accounts, key, b)
-	}
-	if e = writeValues(ctx, tx, "INSERT INTO accounts(id,data) VALUES ", " ON CONFLICT(id) DO UPDATE SET data=excluded.data", 2, accounts); e != nil {
-		return e
-	}
-
-	next := map[string]map[string][]byte{"folders": {}, "grants": {}, "files": {}, "tickets": {}, "garbage": {}}
-	for id, v := range m.Folders {
-		b, e := json.Marshal(v)
-		if e != nil {
-			return e
-		}
-		next["folders"][id] = b
-		if !v.Deleted {
-			next["grants"][id+"/"+principalKey(v.Folder.Owner)], _ = json.Marshal(Owner)
-			for key, role := range v.Grants {
-				next["grants"][id+"/"+key], _ = json.Marshal(role)
-			}
-		}
-	}
-	for f, rows := range m.Files {
-		for p, v := range rows {
-			b, e := json.Marshal(v)
-			if e != nil {
-				return e
-			}
-			next["files"][f+"/"+p] = b
-		}
-	}
-	for id, v := range m.Garbage {
-		b, e := json.Marshal(v)
-		if e != nil {
-			return e
-		}
-		next["garbage"][id] = b
-	}
-	for id, v := range m.Tickets {
-		b, e := json.Marshal(v)
-		if e != nil {
-			return e
-		}
-		next["tickets"][id] = b
-	}
-	for _, table := range []string{"folders", "grants", "files", "tickets", "garbage"} {
-		prefix := "INSERT INTO " + table + "(id,folder,data) VALUES "
-		suffix := " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder"
-		if table == "files" {
-			prefix = "INSERT INTO files(folder,path,data) VALUES "
-			suffix = " ON CONFLICT(folder,path) DO UPDATE SET data=excluded.data"
-		}
-		if table == "grants" {
-			prefix = "INSERT INTO grants(folder,principal,data) VALUES "
-			suffix = " ON CONFLICT(folder,principal) DO UPDATE SET data=excluded.data"
-		}
-		if table == "folders" {
-			prefix = "INSERT INTO folders(id,owner,data) VALUES "
-			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,owner=excluded.owner"
-		}
-		width := 3
-		if table == "garbage" {
-			prefix = "INSERT INTO garbage(id,folder,size,writing,data) VALUES "
-			suffix = " ON CONFLICT(id) DO UPDATE SET data=excluded.data,folder=excluded.folder,size=excluded.size,writing=excluded.writing"
-			width = 5
-		}
-		updated, created := []any{}, []any{}
-		for id, b := range next[table] {
-			if bytes.Equal(b, old[table][id]) {
-				continue
-			}
-			var args []any
-			switch table {
-			case "files", "grants":
-				args = []any{id[:32], id[33:], b}
-			case "folders":
-				args = []any{id, principalKey(m.Folders[id].Folder.Owner), b}
-			case "tickets":
-				args = []any{id, m.Tickets[id].FolderID, b}
-			case "garbage":
-				writing := 0
-				if m.Garbage[id].Writing {
-					writing = 1
-				}
-				args = []any{id, m.Garbage[id].FolderID, m.Garbage[id].Size, writing, b}
-			}
-			if table == "folders" && old[table][id] == nil {
-				created = append(created, args...)
-			} else {
-				updated = append(updated, args...)
-			}
-		}
-		if e = writeValues(ctx, tx, prefix, suffix, width, updated); e != nil {
-			return e
-		}
-		if e = writeValues(ctx, tx, prefix, "", width, created); e != nil {
-			if strings.Contains(e.Error(), "UNIQUE constraint failed") {
-				return ErrConflict
-			}
-			return e
-		}
-		if table == "files" || table == "grants" {
-			var remove *sql.Stmt
-			for id := range old[table] {
-				if _, ok := next[table][id]; ok {
-					continue
-				}
-				q := "DELETE FROM files WHERE folder=? AND path=?"
-				args := []any{id[:32], id[33:]}
-				if table == "grants" {
-					q = "DELETE FROM grants WHERE folder=? AND principal=?"
-				}
-				if remove == nil {
-					remove, e = tx.PrepareContext(ctx, q)
-					if e != nil {
-						return e
-					}
-				}
-				if _, e = remove.ExecContext(ctx, args...); e != nil {
-					remove.Close()
-					return e
-				}
-			}
-			if remove != nil {
-				remove.Close()
-			}
-			continue
-		}
-		gone := make([]any, 0)
-		for id := range old[table] {
-			if _, ok := next[table][id]; !ok {
-				gone = append(gone, id)
-			}
-		}
-		if e = execIn(ctx, tx, "DELETE FROM "+table+" WHERE id IN (", gone); e != nil {
-			return e
-		}
+	if scope.ReadOnly {
+		return nil
 	}
 	if e = tx.Commit(); e != nil {
 		return e
-	}
-	changed := map[string]bool{}
-	for _, table := range []string{"folders", "grants"} {
-		for id, b := range next[table] {
-			if !bytes.Equal(b, old[table][id]) {
-				if table == "grants" {
-					id = id[:32]
-				}
-				changed[id] = true
-			}
-		}
-		for id := range old[table] {
-			if _, ok := next[table][id]; !ok {
-				if table == "grants" {
-					id = id[:32]
-				}
-				changed[id] = true
-			}
-		}
 	}
 	for id := range changed {
 		s.wakes.notify(id)
@@ -1129,7 +767,7 @@ func (s *SQLiteMetaStore) deleteGarbageBatch(ctx context.Context, folder string,
 	return nil
 }
 
-func execIn(ctx context.Context, tx *sql.Tx, prefix string, args []any) error {
+func execIn(ctx context.Context, tx sqlTx, prefix string, args []any) error {
 	for len(args) > 0 {
 		n := min(len(args), 256)
 		q := prefix + strings.TrimSuffix(strings.Repeat("?,", n), ",") + ")"
@@ -1143,7 +781,7 @@ func execIn(ctx context.Context, tx *sql.Tx, prefix string, args []any) error {
 
 // Bounded parameterized batches preserve the transaction boundary and avoid
 // preparing/executing a statement for every fixture or multi-path commit row.
-func writeValues(ctx context.Context, tx *sql.Tx, prefix, suffix string, width int, args []any) error {
+func writeValues(ctx context.Context, tx sqlTx, prefix, suffix string, width int, args []any) error {
 	for len(args) > 0 {
 		n := min(len(args), 256*width)
 		values := strings.TrimSuffix(strings.Repeat("("+strings.TrimSuffix(strings.Repeat("?,", width), ",")+"),", n/width), ",")

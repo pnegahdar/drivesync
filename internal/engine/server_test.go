@@ -8,24 +8,110 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pnegahdar/drivesync/internal/embedpg"
 )
 
 var owner = Principal{"tenant", "owner"}
 
-func testServer(t testing.TB) (*Server, *SQLiteMetaStore) {
+// testStore is the metadata backend selected by DRIVESYNC_STORE.
+type testStore interface {
+	MetaStore
+	Close() error
+	Notifications() *Notifications
+	authorize(context.Context, Principal, string, bool, string, string, time.Time) (Ticket, error)
+	folderVersion(context.Context, Principal, string) (uint64, error)
+	changesPage(context.Context, Principal, string, uint64, uint64, string) (Delta, error)
+}
+
+func postgresMode() bool { return os.Getenv("DRIVESYNC_STORE") == "postgres" }
+
+func openMeta(t testing.TB) testStore {
 	t.Helper()
-	m, e := OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
+	if !postgresMode() {
+		m, err := OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { m.Close() })
+		return m
 	}
-	t.Cleanup(func() { m.Close() })
+	db := embedpg.SharedDB(t)
+	schema := embedpg.NewSchema()
+	m, err := OpenPostgresMetaStore(context.Background(), db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		m.Close()
+		embedpg.DropSchema(db, schema)
+	})
+	return m
+}
+
+func openMetaPair(t testing.TB) (testStore, testStore) {
+	t.Helper()
+	if !postgresMode() {
+		name := filepath.Join(t.TempDir(), "meta.sqlite")
+		a, err := OpenSQLiteMetaStore(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := OpenSQLiteMetaStore(name)
+		if err != nil {
+			a.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { a.Close(); b.Close() })
+		return a, b
+	}
+	db := embedpg.SharedDB(t)
+	schema := embedpg.NewSchema()
+	a, err := OpenPostgresMetaStore(context.Background(), db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenPostgresMetaStore(context.Background(), db, schema)
+	if err != nil {
+		a.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		a.Close()
+		b.Close()
+		embedpg.DropSchema(db, schema)
+	})
+	return a, b
+}
+
+func testServer(t testing.TB) (*Server, testStore) {
+	t.Helper()
+	m := openMeta(t)
 	return NewServer(m, NewMemoryBlobStore()), m
+}
+
+func insertFileRow(t testing.TB, m testStore, folder, path, data string) {
+	t.Helper()
+	switch s := m.(type) {
+	case *SQLiteMetaStore:
+		if _, err := s.db.Exec("INSERT INTO files(folder,path,data) VALUES(?,?,?)", folder, path, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+	case *PostgresMetaStore:
+		_, err := s.db.Exec(`INSERT INTO "`+s.schema+`".files(folder,path,data) VALUES($1,$2,$3)`, folder, path, []byte(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("%T", m)
+	}
 }
 func folderFor(t testing.TB, c Client, l Limits) (Folder, FolderKey) {
 	t.Helper()

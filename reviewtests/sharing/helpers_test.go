@@ -15,17 +15,14 @@ import (
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 	"github.com/zeebo/blake3"
 )
 
 var bg = context.Background()
 
 func newServer(t testing.TB) *ds.Server {
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := testkit.OpenEngine(t)
 	return ds.NewServer(m, ds.NewMemoryBlobStore())
 }
 func mkFolder(t testing.TB, c ds.Client, l ds.Limits) (ds.Folder, ds.FolderKey) {

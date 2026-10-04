@@ -2,15 +2,22 @@ package drivesync
 
 import (
 	"context"
+	"database/sql"
 	"io"
 
 	"github.com/pnegahdar/drivesync/internal/engine"
 )
 
-// MetaStore is the SQLite authority store. Metadata storage is concrete because
+// metaStore is the private authority store. SQLite and Postgres both implement it.
+type metaStore interface {
+	engine.MetaStore
+	Close() error
+}
+
+// MetaStore is the authority metadata store. Metadata storage is concrete because
 // a custom transaction interface would expose private replication/accounting
 // records. BlobStore and QuotaPolicy remain the pluggable extension points.
-type MetaStore struct{ store *engine.SQLiteMetaStore }
+type MetaStore struct{ store metaStore }
 
 func OpenSQLiteMetaStore(path string) (*MetaStore, error) {
 	s, e := engine.OpenSQLiteMetaStore(path)
@@ -19,6 +26,24 @@ func OpenSQLiteMetaStore(path string) (*MetaStore, error) {
 	}
 	return &MetaStore{store: s}, nil
 }
+
+// OpenPostgresMetaStore uses db, which the caller owns and must open with the
+// pgx stdlib driver (driver name "pgx"). schema is created when missing; an
+// empty schema name uses "drivesync". Close does not close db. Several
+// authority processes may share one schema. db must allow at least three
+// connections: one stays on LISTEN and two remain for transactions. A limit
+// of one or two is rejected; unlimited (zero) is accepted. Garbage collection
+// claims a lease row in the schema (a holder id and an expiry, renewed during
+// the pass) and does not hold a pooled connection. A frozen holder stops
+// blocking after the lease expires.
+func OpenPostgresMetaStore(ctx context.Context, db *sql.DB, schema string) (*MetaStore, error) {
+	s, e := engine.OpenPostgresMetaStore(ctx, db, schema)
+	if e != nil {
+		return nil, e
+	}
+	return &MetaStore{store: s}, nil
+}
+
 func (m *MetaStore) Close() error { return m.store.Close() }
 
 // BlobStore holds immutable sealed blobs. Keys are authority-generated IDs.

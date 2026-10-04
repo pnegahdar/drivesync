@@ -1,7 +1,8 @@
 # Contributor guide
 
 drivesync is a standalone Go module. Keep direct dependencies to fsnotify,
-purego, blake3, modernc SQLite, golang.org/x/text, and the standard library.
+purego, blake3, modernc SQLite, pgx, embedded-postgres, golang.org/x/text, and
+the standard library.
 Support pure-Go Linux and macOS builds. Security takes priority over convenience.
 [SECURITY.md](SECURITY.md) is the public statement of these rules.
 
@@ -90,7 +91,7 @@ Support pure-Go Linux and macOS builds. Security takes priority over convenience
 Protocol and accounting records stay in `internal/engine`. The public package
 manages folders and attaches replicas. `Folder`, `Usage`, and `Status` are the
 caller-facing state. Policy, clock, and TTLs belong in `ServerOptions`.
-Maintenance is `Run`. Metadata is concrete SQLite. `BlobStore` and `QuotaPolicy`
+Maintenance is `Run`. Metadata is SQLite or Postgres. `BlobStore` and `QuotaPolicy`
 stay pluggable.
 
 ## Testing

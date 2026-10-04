@@ -64,6 +64,17 @@ func (n *notifications) notify(id string) {
 	}
 }
 
+// wakeAll wakes every folder waiter once. A Postgres listener that dropped and
+// reconnected calls this so a commit during the gap is not missed.
+func (n *notifications) wakeAll() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, w := range n.folders {
+		close(w.ch)
+		w.ch = make(chan struct{})
+	}
+}
+
 // Authorities opening the same SQLite database in this process share wakes.
 // The embedder must route cross-process notifications through its transport;
 // external stores can provide NotificationSource for that purpose.

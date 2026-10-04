@@ -107,6 +107,11 @@ type Ticket struct {
 	Expires                                  time.Time
 	Uploaded                                 bool
 	Writing                                  bool
+	// Writer is the process publishing this ticket. Lease is when that claim
+	// expires. Recovery and garbage collection treat a writing ticket as live
+	// until Lease, including across processes. A zero Lease is already expired.
+	Writer string
+	Lease  time.Time
 }
 type Mutation struct {
 	PathID      string

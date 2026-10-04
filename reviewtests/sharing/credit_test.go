@@ -11,6 +11,7 @@ import (
 	"time"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 )
 
 func diskBytes(dir string) (total int64) {
@@ -30,8 +31,7 @@ func diskBytes(dir string) (total int64) {
 // One live row offered as a rename credit to many reservations: each ticket is
 // reserved at ~0 bytes, but each may upload a full copy.
 func TestRenameCreditReusedAcrossTickets(t *testing.T) {
-	m, _ := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "m.sqlite"))
-	defer m.Close()
+	m := testkit.OpenEngine(t)
 	blobDir := filepath.Join(t.TempDir(), "blobs")
 	bs, _ := ds.OpenDirectoryBlobStore(blobDir)
 	defer bs.Close()

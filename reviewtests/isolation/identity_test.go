@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	ds "github.com/pnegahdar/drivesync/internal/engine"
+	"github.com/pnegahdar/drivesync/internal/testkit"
 	"github.com/zeebo/blake3"
 )
 
@@ -24,11 +25,7 @@ var owner = ds.Principal{Tenant: "private-tenant", Subject: "owner"}
 
 func setup(t *testing.T) (*ds.Server, ds.Client) {
 	t.Helper()
-	m, e := ds.OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := testkit.OpenEngine(t)
 	s := ds.NewServer(m, ds.NewMemoryBlobStore())
 	return s, s.Client(owner)
 }

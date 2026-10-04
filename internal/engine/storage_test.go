@@ -12,28 +12,53 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pnegahdar/drivesync/internal/embedpg"
 )
 
 func TestSQLiteRollbackAndReopen(t *testing.T) {
-	name := filepath.Join(t.TempDir(), "meta.sqlite")
-	m, e := OpenSQLiteMetaStore(name)
-	if e != nil {
-		t.Fatal(e)
+	var m testStore
+	var reopen func() testStore
+	if postgresMode() {
+		db := embedpg.SharedDB(t)
+		schema := embedpg.NewSchema()
+		t.Cleanup(func() { embedpg.DropSchema(db, schema) })
+		reopen = func() testStore {
+			t.Helper()
+			s, err := OpenPostgresMetaStore(context.Background(), db, schema)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
+		m = reopen()
+	} else {
+		name := filepath.Join(t.TempDir(), "meta.sqlite")
+		opened, e := OpenSQLiteMetaStore(name)
+		if e != nil {
+			t.Fatal(e)
+		}
+		m = opened
+		reopen = func() testStore {
+			t.Helper()
+			s, err := OpenSQLiteMetaStore(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
 	}
 	s := NewServer(m, NewMemoryBlobStore())
 	c := s.Client(owner)
 	f, k := folderFor(t, c, Limits{})
 	row := put(t, c, f, k, "file", 0, []byte("persisted"))
-	if e = m.Transaction(context.Background(), func(meta *Metadata) error { delete(meta.Folders, f.ID); return errNetwork }); e != errNetwork {
+	if e := m.Transaction(context.Background(), func(meta *Metadata) error { delete(meta.Folders, f.ID); return errNetwork }); e != errNetwork {
 		t.Fatal(e)
 	}
-	if e = m.Close(); e != nil {
+	if e := m.Close(); e != nil {
 		t.Fatal(e)
 	}
-	mm, e := OpenSQLiteMetaStore(name)
-	if e != nil {
-		t.Fatal(e)
-	}
+	mm := reopen()
 	defer mm.Close()
 	ss := NewServer(mm, s.Blobs)
 	d, e := ss.Client(owner).Changes(context.Background(), f.ID, 0)
@@ -42,17 +67,7 @@ func TestSQLiteRollbackAndReopen(t *testing.T) {
 	}
 }
 func TestConcurrentAuthorities(t *testing.T) {
-	name := filepath.Join(t.TempDir(), "meta.sqlite")
-	a, e := OpenSQLiteMetaStore(name)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer a.Close()
-	b, e := OpenSQLiteMetaStore(name)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer b.Close()
+	a, b := openMetaPair(t)
 	sa, sb := NewServer(a, NewMemoryBlobStore()), NewServer(b, NewMemoryBlobStore())
 	f, _ := folderFor(t, sa.Client(owner), Limits{MaxTotalBytes: 7 * (RowCost + 1)})
 	var accepted atomic.Int32

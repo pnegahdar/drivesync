@@ -53,17 +53,17 @@ func TestCapFloorIncludesPendingAndGarbage(t *testing.T) {
 }
 
 type versionCounter struct {
-	*SQLiteMetaStore
+	testStore
 	calls atomic.Int32
 }
 
 func (m *versionCounter) folderVersion(ctx context.Context, p Principal, id string) (uint64, error) {
 	m.calls.Add(1)
-	return m.SQLiteMetaStore.folderVersion(ctx, p, id)
+	return m.testStore.folderVersion(ctx, p, id)
 }
 func TestWaitsAreIdleAndFolderScoped(t *testing.T) {
 	_, m := testServer(t)
-	cm := &versionCounter{SQLiteMetaStore: m}
+	cm := &versionCounter{testStore: m}
 	s := NewServer(cm, NewMemoryBlobStore())
 	c := s.Client(owner)
 	f, _ := folderFor(t, c, Limits{})
@@ -98,12 +98,17 @@ func TestWaitsAreIdleAndFolderScoped(t *testing.T) {
 }
 func TestSQLiteIndexedAccessPlans(t *testing.T) {
 	_, m := testServer(t)
+	sqlite, ok := m.(*SQLiteMetaStore)
+	if !ok {
+		// Postgres uses the same folder, owner, and grant columns. EXPLAIN QUERY PLAN is SQLite.
+		t.Skip("SQLite planner output")
+	}
 	for _, q := range []string{
 		"SELECT data FROM tickets WHERE folder='f'", "SELECT data FROM garbage WHERE folder='f'",
 		"SELECT data FROM grants WHERE folder='f' AND principal='p'",
 		"SELECT data FROM folders WHERE id IN (SELECT folder FROM grants WHERE principal='p')",
 	} {
-		rows, e := m.db.Query("EXPLAIN QUERY PLAN " + q)
+		rows, e := sqlite.db.Query("EXPLAIN QUERY PLAN " + q)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -125,8 +130,12 @@ func TestSQLiteIndexedAccessPlans(t *testing.T) {
 	}
 }
 func TestWaitAcrossSQLiteAuthorities(t *testing.T) {
+	if postgresMode() {
+		// Two Postgres authorities share a schema. That wake is TestMultiAuthority.
+		t.Skip("SQLite same-file notification hub")
+	}
 	s, m := testServer(t)
-	second, e := OpenSQLiteMetaStore(mName(t, m))
+	second, e := OpenSQLiteMetaStore(mName(t, m.(*SQLiteMetaStore)))
 	if e != nil {
 		t.Fatal(e)
 	}

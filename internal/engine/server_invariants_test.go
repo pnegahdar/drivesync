@@ -133,13 +133,13 @@ func TestStateSymlinkIntoAttachmentIsRejectedBeforeMutation(t *testing.T) {
 }
 
 type compactAfterFirstPage struct {
-	*SQLiteMetaStore
+	testStore
 	compact func() error
 	fired   bool
 }
 
 func (m *compactAfterFirstPage) changesPage(ctx context.Context, p Principal, id string, after, until uint64, page string) (Delta, error) {
-	d, e := m.SQLiteMetaStore.changesPage(ctx, p, id, after, until, page)
+	d, e := m.testStore.changesPage(ctx, p, id, after, until, page)
 	if e == nil && after > 0 && page == "" && d.Next != "" && !m.fired {
 		m.fired = true
 		e = m.compact()
@@ -165,7 +165,7 @@ func TestInProcessChangesRestartsFullAfterCompactionBetweenPages(t *testing.T) {
 	}
 	s.TombstoneTTL = time.Hour
 	s.Now = func() time.Time { return time.Now().Add(2 * time.Hour) }
-	reader := &compactAfterFirstPage{SQLiteMetaStore: meta}
+	reader := &compactAfterFirstPage{testStore: meta}
 	// Use a separate authority on the same WAL store to keep the reader stable.
 	maintenance := NewServer(meta, s.Blobs)
 	maintenance.Now, maintenance.TombstoneTTL = s.Now, s.TombstoneTTL
@@ -188,13 +188,18 @@ func TestMaintenanceRetiresFailedUploadAcknowledgmentWithoutCancellation(t *test
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = meta.db.Exec(`CREATE TRIGGER fail_ack BEFORE UPDATE ON tickets WHEN json_extract(NEW.data,'$.Uploaded')=1 BEGIN SELECT RAISE(ABORT,'failed acknowledgment'); END`); e != nil {
+	sqlite, ok := meta.(*SQLiteMetaStore)
+	if !ok {
+		// Postgres has no SQLite trigger. Lease recovery is TestMultiAuthorityRecovery.
+		t.Skip("SQLite trigger aborts the acknowledgement write")
+	}
+	if _, e = sqlite.db.Exec(`CREATE TRIGGER fail_ack BEFORE UPDATE ON tickets WHEN json_extract(NEW.data,'$.Uploaded')=1 BEGIN SELECT RAISE(ABORT,'failed acknowledgment'); END`); e != nil {
 		t.Fatal(e)
 	}
 	if e = c.Upload(ctx, f.ID, ticket, strings.NewReader("x")); e == nil {
 		t.Fatal("ack fault did not fire")
 	}
-	if _, e = meta.db.Exec("DROP TRIGGER fail_ack"); e != nil {
+	if _, e = sqlite.db.Exec("DROP TRIGGER fail_ack"); e != nil {
 		t.Fatal(e)
 	}
 	// No CancelUpload and no clock advance: ordinary maintenance must recover.

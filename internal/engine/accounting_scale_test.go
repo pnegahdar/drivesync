@@ -37,13 +37,13 @@ func TestFinishAccountingLinear(t *testing.T) {
 }
 
 type inspectedPaths struct {
-	*SQLiteMetaStore
+	testStore
 	observed int
 	largest  int
 }
 
 func (m *inspectedPaths) Transaction(ctx context.Context, fn func(*Metadata) error) error {
-	return m.SQLiteMetaStore.Transaction(ctx, func(v *Metadata) error {
+	return m.testStore.Transaction(ctx, func(v *Metadata) error {
 		scope, _ := ScopeFromContext(ctx)
 		if scope.Folder != "" && !scope.ReadOnly {
 			m.observed++
@@ -71,7 +71,7 @@ func TestWritesLoadOnlyTouchedPaths(t *testing.T) {
 	}); e != nil {
 		t.Fatal(e)
 	}
-	wrapped := &inspectedPaths{SQLiteMetaStore: m}
+	wrapped := &inspectedPaths{testStore: m}
 	s.Meta = wrapped
 	put(t, c, f, k, "fresh", 0, []byte("value"))
 	if wrapped.observed < 4 || wrapped.largest > 1 {

@@ -64,7 +64,7 @@ func (s *Server) retireTicket(m *Metadata, t Ticket) {
 		return
 	}
 	f := m.Folders[t.FolderID]
-	m.Garbage[t.FolderID+"/"+t.BlobID] = Garbage{FolderID: t.FolderID, BlobID: t.BlobID, Owner: f.Folder.Owner, Size: sat(t.SealedSize, RowCost), Writing: t.Writing}
+	m.Garbage[t.FolderID+"/"+t.BlobID] = Garbage{FolderID: t.FolderID, BlobID: t.BlobID, Owner: f.Folder.Owner, Size: sat(t.SealedSize, RowCost), Writing: t.Writing, Writer: t.Writer, Lease: t.Lease}
 }
 func (s *Server) retireRow(m *Metadata, r Row) {
 	if r.BlobID != "" {
@@ -77,6 +77,63 @@ func (s *Server) retireRow(m *Metadata, r Row) {
 func (s *Server) CollectGarbage(ctx context.Context) error {
 	gcctx := context.WithValue(ctx, scopeKey{}, Scope{GC: true})
 	return errors.Join(s.collect(gcctx), s.CompactTombstones(ctx))
+}
+
+// writingLive is true while this authority is publishing the ticket, or while
+// another authority's lease is still open. A finished publication on this
+// authority, including a failed acknowledgement, is not live: maintenance
+// here may retire it without waiting out the lease.
+func (s *Server) writingLive(t Ticket) bool {
+	if !t.Writing {
+		return false
+	}
+	if s.wakes.live(t.FolderID + "/" + t.BlobID) {
+		return true
+	}
+	return t.Writer != "" && t.Writer != s.writerID && t.Lease.After(s.now())
+}
+
+// ticketStale reports a reservation collect may retire. Another authority's
+// writing ticket stays until its lease expires. This authority's own ticket
+// is stale once publication has left this server.
+func (s *Server) ticketStale(t Ticket, folderDeleted bool, epoch string) bool {
+	// An epoch change used to retire another authority's upload immediately.
+	// A live lease still owns the blob, so the ticket stays until it expires.
+	if !folderDeleted && s.writingLive(t) {
+		return false
+	}
+	if folderDeleted || t.AuthEpoch != epoch {
+		return true
+	}
+	return t.Writing || !t.Expires.After(s.now())
+}
+
+// garbageHeld is true while this process is still publishing the blob, or
+// while another authority's copied lease has not expired.
+func (s *Server) garbageHeld(g Garbage) bool {
+	if s.wakes.live(g.FolderID + "/" + g.BlobID) {
+		return true
+	}
+	return g.Writer != "" && g.Writer != s.writerID && g.Lease.After(s.now())
+}
+
+func (s *Server) ticketReferences(m *Metadata, key string) bool {
+	for _, t := range m.Tickets {
+		if t.FolderID+"/"+t.BlobID == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) maintenance(ctx context.Context) (func(), bool, error) {
+	g, ok := s.Meta.(interface {
+		tryMaintenance(context.Context) (func(), bool, error)
+	})
+	if !ok {
+		return func() {}, true, nil
+	}
+	return g.tryMaintenance(ctx)
 }
 
 // RunGC runs maintenance in a background worker owned by the embedder. Start
@@ -110,15 +167,20 @@ func (s *Server) surveyCollect(ctx context.Context) (map[string]Garbage, map[str
 				deleted[id] = true
 			}
 		}
+		liveBlob := map[string]bool{}
 		for _, t := range m.Tickets {
-			if deleted[t.FolderID] || t.AuthEpoch != m.Folders[t.FolderID].AuthEpoch || !t.Expires.After(s.now()) || (t.Writing && !s.wakes.live(t.FolderID+"/"+t.BlobID)) {
+			if s.writingLive(t) {
+				liveBlob[t.FolderID+"/"+t.BlobID] = true
+			}
+			if s.ticketStale(t, deleted[t.FolderID], m.Folders[t.FolderID].AuthEpoch) {
 				expired[t.FolderID] = append(expired[t.FolderID], t)
 			}
 		}
 		for key, g := range m.Garbage {
-			if !g.Writing || !s.wakes.live(key) {
-				pending[key] = g
+			if liveBlob[key] || s.wakes.live(key) {
+				continue
 			}
+			pending[key] = g
 		}
 		return nil
 	})
@@ -170,7 +232,7 @@ func (s *Server) surveyCollectSQL(ctx context.Context, db *SQLiteMetaStore) (map
 			rows.Close()
 			return nil, nil, nil, e
 		}
-		if deleted[t.FolderID] || t.AuthEpoch != folders[t.FolderID].AuthEpoch || !t.Expires.After(s.now()) || (t.Writing && !s.wakes.live(t.FolderID+"/"+t.BlobID)) {
+		if s.ticketStale(t, deleted[t.FolderID], folders[t.FolderID].AuthEpoch) {
 			expired[t.FolderID] = append(expired[t.FolderID], t)
 		}
 	}
@@ -199,6 +261,14 @@ func maintenanceScope(ctx context.Context, folder string, paths, tickets, garbag
 }
 
 func (s *Server) collect(ctx context.Context) error {
+	release, ok, err := s.maintenance(ctx)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	pending, expired, deleted, e := s.surveyCollect(ctx)
@@ -214,27 +284,35 @@ func (s *Server) collect(ctx context.Context) error {
 				ids = append(ids, t.ID)
 				blobs = append(blobs, folder+"/"+t.BlobID)
 			}
+			var staged map[string]Garbage
 			e = s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, ids, blobs), func(m *Metadata) error {
+				// A failed attempt must not keep blobs it did not retire.
+				next := map[string]Garbage{}
 				for tid, t := range m.Tickets {
 					// A retry may have renewed it since the survey. Completed publications
 					// remain charged until this durable retirement succeeds.
-					live := s.wakes.live(folder + "/" + t.BlobID)
-					if !m.Folders[folder].Deleted && t.AuthEpoch == m.Folders[folder].AuthEpoch && t.Expires.After(s.now()) && (!t.Writing || live) {
+					if !s.ticketStale(t, m.Folders[folder].Deleted, m.Folders[folder].AuthEpoch) {
 						continue
 					}
 					s.retireTicket(m, t)
 					delete(m.Tickets, tid)
 					key := folder + "/" + t.BlobID
-					if g, ok := m.Garbage[key]; ok && !live {
-						g.Writing = false
-						m.Garbage[key] = g
-						pending[key] = g
+					g, ok := m.Garbage[key]
+					if !ok || s.garbageHeld(g) || s.writingLive(t) {
+						continue
 					}
+					g.Writing = false
+					m.Garbage[key] = g
+					next[key] = g
 				}
+				staged = next
 				return nil
 			})
 			if e != nil {
 				return e
+			}
+			for key, g := range staged {
+				pending[key] = g
 			}
 		}
 	}
@@ -255,8 +333,11 @@ func (s *Server) collect(ctx context.Context) error {
 					blobs = append(blobs, folder+"/"+row.BlobID)
 				}
 			}
+			var staged map[string]Garbage
 			e = s.Meta.Transaction(maintenanceScope(ctx, folder, paths, []string{}, blobs), func(m *Metadata) error {
+				next := map[string]Garbage{}
 				if !m.Folders[folder].Deleted {
+					staged = next
 					return nil
 				}
 				for pid, row := range m.Files[folder] {
@@ -264,14 +345,18 @@ func (s *Server) collect(ctx context.Context) error {
 						key := folder + "/" + row.BlobID
 						g := Garbage{FolderID: folder, BlobID: row.BlobID, Owner: m.Folders[folder].Folder.Owner, Size: rowBytes(row)}
 						m.Garbage[key] = g
-						pending[key] = g
+						next[key] = g
 					}
 					delete(m.Files[folder], pid)
 				}
+				staged = next
 				return nil
 			})
 			if e != nil {
 				return e
+			}
+			for key, g := range staged {
+				pending[key] = g
 			}
 		}
 	}
@@ -429,15 +514,40 @@ func (s *Server) collectLoadedGarbage(ctx context.Context, pending map[string]Ga
 			}
 			batch := garbage[:min(len(garbage), garbageBatch)]
 			garbage = garbage[len(batch):]
-			collected := map[string]bool{}
-			ids := []string{}
+			ids := make([]string, 0, len(batch))
 			for _, g := range batch {
+				ids = append(ids, folder+"/"+g.BlobID)
+			}
+			// Confirm against the committed rows before any blob delete. The
+			// lease is checked here, and again immediately before Delete.
+			var doomed []Garbage
+			e := s.Meta.Transaction(maintenanceScope(ctx, folder, nil, nil, ids), func(m *Metadata) error {
+				next := []Garbage{}
+				for _, id := range ids {
+					g, ok := m.Garbage[id]
+					if !ok || s.garbageHeld(g) || s.ticketReferences(m, id) {
+						continue
+					}
+					next = append(next, g)
+				}
+				doomed = next
+				return nil
+			})
+			if serializationFailure(e) {
+				continue
+			}
+			if e != nil {
+				return errors.Join(append(*errs, e)...)
+			}
+			collected := map[string]bool{}
+			drop := []string{}
+			for _, g := range doomed {
 				if e := ctx.Err(); e != nil {
 					*errs = append(*errs, e)
 					break
 				}
 				key := folder + "/" + g.BlobID
-				if s.wakes.live(key) {
+				if s.garbageHeld(g) || s.wakes.live(key) {
 					continue
 				}
 				if de := s.Blobs.Delete(ctx, folder, g.BlobID); de != nil && !errors.Is(de, os.ErrNotExist) {
@@ -445,19 +555,26 @@ func (s *Server) collectLoadedGarbage(ctx context.Context, pending map[string]Ga
 					continue
 				}
 				collected[key] = true
-				ids = append(ids, key)
+				drop = append(drop, key)
 			}
-			if len(ids) == 0 {
+			if len(drop) == 0 {
 				continue
 			}
-			e := s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, ids), func(m *Metadata) error {
+			// A batch that loses a serializable race stays charged for the next
+			// pass. Stopping here would abandon the rest of the backlog.
+			e = s.Meta.Transaction(maintenanceScope(ctx, folder, nil, nil, drop), func(m *Metadata) error {
 				for key := range collected {
-					if !s.wakes.live(key) {
-						delete(m.Garbage, key)
+					g, ok := m.Garbage[key]
+					if !ok || s.garbageHeld(g) || s.ticketReferences(m, key) || s.wakes.live(key) {
+						continue
 					}
+					delete(m.Garbage, key)
 				}
 				return nil
 			})
+			if serializationFailure(e) {
+				continue
+			}
 			if e != nil {
 				return errors.Join(append(*errs, e)...)
 			}
@@ -466,9 +583,21 @@ func (s *Server) collectLoadedGarbage(ctx context.Context, pending map[string]Ga
 	return nil
 }
 
+func (s *Server) blobLeased(m *Metadata, key string) bool {
+	for _, t := range m.Tickets {
+		if t.FolderID+"/"+t.BlobID == key && s.writingLive(t) {
+			return true
+		}
+	}
+	return false
+}
+
 // Selection stays on WAL readers; no unrelated rows enter a write transaction.
 func (s *Server) maintenanceRows(ctx context.Context, folder string, tombstones bool, count int) ([]Row, error) {
 	out := []Row{}
+	if pg, ok := s.Meta.(*PostgresMetaStore); ok {
+		return pg.selectFiles(ctx, folder, tombstones, count)
+	}
 	if db, ok := s.Meta.(*SQLiteMetaStore); ok {
 		query := "SELECT data FROM files WHERE 1=1"
 		args := []any{}
@@ -547,6 +676,7 @@ func (s *Server) renew(ctx context.Context, p Principal, id, tid string) error {
 		// the renewal across this write is what the stream already earned.
 		if !inFlight && t.Expires.Equal(observed) {
 			t.Expires = s.now().Add(ttl)
+			s.stampLease(&t)
 			m.Tickets[tid] = t
 			return nil
 		}
@@ -558,6 +688,7 @@ func (s *Server) renew(ctx context.Context, p Principal, id, tid string) error {
 			return nil
 		}
 		t.Expires = s.now().Add(ttl)
+		s.stampLease(&t)
 		m.Tickets[tid] = t
 		return nil
 	})
@@ -653,9 +784,11 @@ func durableDirectory(dir string) error {
 
 var syncDirectoryFile = func(f *os.File) error { return f.Sync() }
 
-// RecoverUploads retires interrupted publications after a process restart.
-// Call only after all writers using these stores have stopped. A generic remote
-// BlobStore cannot prove that another process's Put has stopped publishing.
+// RecoverUploads retires interrupted publications. A writing ticket records the
+// publishing authority and a lease that is renewed while bytes flow. This
+// authority retires its own ticket once that publication ends. Another
+// authority retires it only after the lease expires. SQLite is one process
+// per database file and uses the same rule.
 func (s *Server) RecoverUploads(ctx context.Context) error {
 	// The ordinary collector also retires publications with no live Put. Use
 	// the same bounded transitions during recovery instead of a global write.
@@ -663,7 +796,11 @@ func (s *Server) RecoverUploads(ctx context.Context) error {
 }
 
 // Run recovers interrupted publications, then performs background collection
-// and compaction. Only one authority process may publish to these stores.
+// and compaction. Postgres authorities share one schema: each pass claims the
+// maintenance lease or skips. An in-flight upload is not a reason to wait.
+// This process's publication is visible through wakes.live, and another
+// authority's lease stays charged until it expires. SQLite remains one
+// process per database file.
 func (s *Server) Run(ctx context.Context, interval time.Duration) error {
 	s.wakes.mu.Lock()
 	if s.wakes.running {
@@ -673,20 +810,7 @@ func (s *Server) Run(ctx context.Context, interval time.Duration) error {
 	s.wakes.running = true
 	s.wakes.mu.Unlock()
 	defer func() { s.wakes.mu.Lock(); s.wakes.running = false; s.wakes.mu.Unlock() }()
-	// Recovery must not race an active publication in this process. The wait
-	// honors cancellation and never queries SQLite while a stream is flowing.
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for !s.wakes.publication.TryLock() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-	e := s.RecoverUploads(ctx)
-	s.wakes.publication.Unlock()
-	if e != nil {
+	if e := s.RecoverUploads(ctx); e != nil {
 		return e
 	}
 	return s.RunGC(ctx, interval)

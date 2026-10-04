@@ -19,7 +19,13 @@ sent to the authority. A salt stops deterministic linkage between folders. It
 does not stop offline guessing, so use a random key from `NewFolderKey`.
 Passphrases and hashes of passphrases are not suitable keys.
 
-Use one authority process per metadata and blob store. `Server.Client` trusts
+Use one authority process per SQLite database file. Several processes may share
+a Postgres metadata store. Upload leases keep recovery from retiring a
+publication that is still writing. Those leases assume the authorities' clocks
+are reasonably synced. Garbage collection claims a lease row instead of holding
+a session lock. Anyone who can connect to the database can LISTEN on the
+NOTIFY channel. Its payloads show folder ids and when those folders change.
+`Server.Client` trusts
 the principal it is given; call it only after the embedding application has
 authenticated that principal. HTTP clients should use HTTPS. `/rpc` requires
 `Content-Type: application/json`.
