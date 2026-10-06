@@ -15,19 +15,29 @@ type notifications struct {
 	mu          sync.Mutex
 	folders     map[string]*folderWake
 	principals  map[string]int
+	maxWaits    int
 }
 
 func newNotifications() *notifications {
-	return &notifications{creationKey: NewFolderKey(), active: map[string]bool{}, folders: map[string]*folderWake{}, principals: map[string]int{}}
+	return &notifications{creationKey: NewFolderKey(), active: map[string]bool{}, folders: map[string]*folderWake{}, principals: map[string]int{}, maxWaits: defaultMaxWaitsPerPrincipal}
 }
 
-const MaxWaitsPerPrincipal = 256
+const defaultMaxWaitsPerPrincipal = 256
+
+func (n *notifications) setMaxWaits(limit int) {
+	if limit <= 0 {
+		limit = defaultMaxWaitsPerPrincipal
+	}
+	n.mu.Lock()
+	n.maxWaits = limit
+	n.mu.Unlock()
+}
 
 func (n *notifications) acquire(p Principal, id string) (func(), error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	key := principalKey(p)
-	if n.principals[key] >= MaxWaitsPerPrincipal {
+	if n.principals[key] >= n.maxWaits {
 		return nil, ErrWaitLimit
 	}
 	n.principals[key]++

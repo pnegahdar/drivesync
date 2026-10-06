@@ -67,6 +67,9 @@ type FolderKey [32]byte
 
 func NewFolderKey() FolderKey { return FolderKey(engine.NewFolderKey()) }
 
+// String is the 64-character hex form ParseFolderKey accepts.
+func (k FolderKey) String() string { return hex.EncodeToString(k[:]) }
+
 // ParseFolderKey imports a 64-character hex encoding of a random 256-bit key.
 // Passphrases and hashes of passphrases are not suitable folder keys.
 func ParseFolderKey(s string) (FolderKey, error) {
@@ -104,6 +107,9 @@ type Options struct {
 	Debounce, RescanInterval, RetryInterval time.Duration
 	Ignore                                  []string
 	Manual                                  bool
+	// Moved tells Attach this directory is the same root renamed on the same
+	// volume. A matching marker token and inode keep the replica index.
+	Moved bool
 }
 type Rejection struct{ Path, Reason string }
 type Status struct {

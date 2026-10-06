@@ -1,6 +1,6 @@
 module github.com/pnegahdar/drivesync
 
-go 1.27.1
+go 1.26.0
 
 require (
 	github.com/ebitengine/purego v0.11.1
@@ -10,7 +10,7 @@ require (
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.42.0
-	modernc.org/sqlite v1.60.1
+	modernc.org/sqlite v1.40.1
 )
 
 require (

@@ -27,6 +27,8 @@ type Options struct {
 	Debounce, RescanInterval, RetryInterval time.Duration
 	Ignore                                  []string
 	Manual                                  bool
+	// Moved reports that dir is the attached root renamed on the same volume.
+	Moved bool
 }
 type Rejection struct {
 	Path, Reason string
@@ -156,6 +158,11 @@ func Attach(ctx context.Context, c Client, id string, k FolderKey, dir string, o
 	defer release()
 	if e = checkAttachments(ctx, dir, id); e != nil {
 		return nil, e
+	}
+	if o.Moved {
+		if e = relocateMovedRoot(dir, id, o.StateDir); e != nil {
+			return nil, e
+		}
 	}
 	o.StateDir, e = prepareState(dir, id, o.StateDir)
 	if e != nil {

@@ -22,6 +22,11 @@ import (
 
 func apiServer(t testing.TB, opts ServerOptions) *Server {
 	t.Helper()
+	return apiServerWith(t, NewMemoryBlobStore(), opts)
+}
+
+func apiServerWith(t testing.TB, blobs BlobStore, opts ServerOptions) *Server {
+	t.Helper()
 	if embedpg.Postgres() {
 		db := embedpg.SharedDB(t)
 		schema := embedpg.NewSchema()
@@ -33,14 +38,14 @@ func apiServer(t testing.TB, opts ServerOptions) *Server {
 			meta.Close()
 			embedpg.DropSchema(db, schema)
 		})
-		return NewServer(meta, NewMemoryBlobStore(), opts)
+		return NewServer(meta, blobs, opts)
 	}
 	meta, e := OpenSQLiteMetaStore(filepath.Join(t.TempDir(), "meta.sqlite"))
 	if e != nil {
 		t.Fatal(e)
 	}
 	t.Cleanup(func() { meta.Close() })
-	return NewServer(meta, NewMemoryBlobStore(), opts)
+	return NewServer(meta, blobs, opts)
 }
 
 type testReplica struct {
@@ -68,8 +73,8 @@ func apiWrite(t testing.TB, r *testReplica, p, data string) {
 func TestParseFolderKey(t *testing.T) {
 	key := NewFolderKey()
 	got, e := ParseFolderKey(hex.EncodeToString(key[:]))
-	if e != nil || got != key {
-		t.Fatal(got, e)
+	if e != nil || got != key || key.String() != hex.EncodeToString(key[:]) {
+		t.Fatal(got, e, key.String())
 	}
 	for _, text := range []string{"", "password", strings.Repeat("z", 64), strings.Repeat("0", 64), strings.Repeat("1", 62), strings.Repeat("1", 66)} {
 		if _, e := ParseFolderKey(text); !errors.Is(e, ErrKey) {

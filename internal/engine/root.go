@@ -21,6 +21,9 @@ const stateMarker = ".drivesync-state"
 type rootIdentity struct {
 	Folder, Token string
 	Inode         uint64
+	// Device is checked when a renamed root is reattached. It is not part of
+	// the persistent identity: device numbers change across remounts.
+	Device uint64
 }
 
 func identifyRoot(dir string) (rootIdentity, error) {
@@ -46,7 +49,7 @@ func identifyRoot(dir string) (rootIdentity, error) {
 	}
 	v := reflect.Indirect(reflect.ValueOf(info.Sys()))
 	if v.IsValid() && v.Kind() == reflect.Struct {
-		for name, dst := range map[string]*uint64{"Ino": &id.Inode} {
+		for name, dst := range map[string]*uint64{"Ino": &id.Inode, "Dev": &id.Device} {
 			field := v.FieldByName(name)
 			if field.IsValid() && field.CanUint() {
 				*dst = field.Uint()
@@ -185,10 +188,17 @@ func writeMarker(name string, b []byte) error {
 	if e != nil {
 		return e
 	}
-	_, e = f.Write(b)
-	if e == nil {
-		e = f.Sync()
+	if _, e = f.Write(b); e != nil {
+		f.Close()
+		return e
 	}
+	return finishMarkerWrite(f)
+}
+
+// finishMarkerWrite syncs the file and its directory. The caller chooses
+// O_EXCL or a temporary file; that is the only difference between the markers.
+func finishMarkerWrite(f *os.File) error {
+	e := f.Sync()
 	ce := f.Close()
 	if e == nil {
 		e = ce
@@ -196,7 +206,7 @@ func writeMarker(name string, b []byte) error {
 	if e != nil {
 		return e
 	}
-	d, e := os.Open(filepath.Dir(name))
+	d, e := os.Open(filepath.Dir(f.Name()))
 	if e != nil {
 		return e
 	}
@@ -243,7 +253,7 @@ func (r *Replica) validRoot() error {
 	id, e := identifyRoot(r.dir)
 	info, le := os.Lstat(r.dir)
 	held, he := r.root.Stat(".")
-	if e != nil || le != nil || he != nil || !info.IsDir() || !os.SameFile(info, held) || id != r.identity {
+	if e != nil || le != nil || he != nil || !info.IsDir() || !os.SameFile(info, held) || !samePersistentIdentity(id, r.identity) {
 		return fmt.Errorf("attachment root identity missing or changed; sync paused")
 	}
 	if r.rootLock != nil {
@@ -260,6 +270,11 @@ func (r *Replica) validRoot() error {
 		}
 	}
 	return nil
+}
+
+func samePersistentIdentity(a, b rootIdentity) bool {
+	a.Device, b.Device = 0, 0
+	return a == b
 }
 
 func lockExisting(name string) (*os.File, error) {

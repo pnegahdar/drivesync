@@ -16,6 +16,10 @@ type ServerOptions struct {
 	Quotas                                   QuotaPolicy
 	ReservationTTL, TombstoneTTL, GCInterval time.Duration
 	Clock                                    func() time.Time
+	// MaxWaitsPerPrincipal caps concurrent long-polls for one principal.
+	// Zero keeps the default of 256. Embedders that share one principal
+	// across many clients set this higher.
+	MaxWaitsPerPrincipal int
 }
 
 // Server authorizes every operation independently of transport authentication.
@@ -37,6 +41,9 @@ func NewServer(meta *MetaStore, blobs BlobStore, opts ServerOptions) *Server {
 	}
 	if opts.Clock != nil {
 		s.Now = opts.Clock
+	}
+	if opts.MaxWaitsPerPrincipal > 0 {
+		s.SetMaxWaitsPerPrincipal(opts.MaxWaitsPerPrincipal)
 	}
 	return &Server{server: s, interval: opts.GCInterval}
 }

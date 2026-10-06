@@ -75,6 +75,14 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 func (s *Server) notify(id string) { s.wakes.notify(id) }
+
+// SetMaxWaitsPerPrincipal raises or lowers the long-poll cap for every
+// principal on this authority. Zero restores the default.
+func (s *Server) SetMaxWaitsPerPrincipal(n int) {
+	if s != nil && s.wakes != nil {
+		s.wakes.setMaxWaits(n)
+	}
+}
 func (s *Server) expire(m *Metadata) {
 	for id, t := range m.Tickets {
 		if s.writingLive(t) {
