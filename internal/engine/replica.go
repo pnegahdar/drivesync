@@ -107,6 +107,7 @@ type Replica struct {
 	retryRows         map[string]Row
 	blockedLocal      map[string]bool
 	scanBounds        *dirBounds
+	scanHashes        map[string]scanHash
 	rejected          map[string]Rejection
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -626,6 +627,15 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 	// directory; files reuse that result instead of stating the root again.
 	r.scanBounds = &dirBounds{dev: device(rootInfo), seen: map[string]error{}}
 	defer func() { r.scanBounds = nil }()
+	r.mu.Lock()
+	prior := r.scanHashes
+	r.mu.Unlock()
+	next := make(map[string]scanHash, len(prior))
+	defer func() {
+		r.mu.Lock()
+		r.scanHashes = next
+		r.mu.Unlock()
+	}()
 	patterns := r.patterns()
 	skipped := []string{}
 	for _, rule := range patterns {
@@ -681,7 +691,7 @@ func (r *Replica) ScanLocal() (map[string]LocalFile, error) {
 		if prior, ok := r.index[p]; d.IsDir() && ok && prior.Deleted && prior.Directory {
 			return nil
 		}
-		v, err := r.inspect(p, local)
+		v, err := r.inspectScan(p, local, prior, next)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -736,6 +746,13 @@ func (r *Replica) safe(p string) error {
 	return nil
 }
 func (r *Replica) inspect(p, local string) (LocalFile, error) {
+	return r.inspectScan(p, local, nil, nil)
+}
+
+// inspectScan reuses the hash from the previous scan when a regular file's
+// stat signature is unchanged, so a rescan reads only files that changed.
+// Nil maps always read the file.
+func (r *Replica) inspectScan(p, local string, prior, next map[string]scanHash) (LocalFile, error) {
 	v := LocalFile{Path: p, Local: local}
 	if e := r.safe(local); e != nil {
 		return v, e
@@ -746,6 +763,17 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 	}
 	if !before.IsDir() && !before.Mode().IsRegular() {
 		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
+	}
+	if before.Mode().IsRegular() {
+		if sig, ok := statSignature(before); ok {
+			if cached, ok := prior[local]; ok && cached.sig == sig {
+				next[local] = cached
+				v.Mode = uint32(before.Mode().Perm())
+				v.Size = before.Size()
+				v.Hash = cached.hash
+				return v, nil
+			}
+		}
 	}
 	f, e := openLocal(r.root, local)
 	if e != nil {
@@ -770,11 +798,15 @@ func (r *Replica) inspect(p, local string) (LocalFile, error) {
 	if !s.Mode().IsRegular() {
 		return v, fmt.Errorf("%w: unsupported entry %s", errLocalObstacle, local)
 	}
+	started := time.Now()
 	h := blake3.New()
 	if _, e = io.CopyN(h, f, v.Size); e != nil {
 		return v, e
 	}
 	v.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	if sig, ok := statSignature(s); ok && next != nil && sig.settledBefore(started) {
+		next[local] = scanHash{sig: sig, hash: v.Hash}
+	}
 	return v, nil
 }
 func sameFile(v LocalFile, i IndexEntry) bool {
