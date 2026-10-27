@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"io"
+	"time"
 
 	"github.com/pnegahdar/drivesync/internal/engine"
 )
@@ -50,11 +51,24 @@ func (m *MetaStore) Close() error { return m.store.Close() }
 // Put streams bytes, Size reports actual stored bytes, and Delete is idempotent
 // (os.ErrNotExist is also accepted). Implementations must honor cancellation.
 // Put must publish only after clean EOF; a reader error must discard staging.
+// Besides hexadecimal blob IDs, stores must accept the reserved key "snapshot"
+// for a folder's replaceable packed file list. The authority deletes it before
+// replacement; it is derived data and is excluded from quota.
 type BlobStore interface {
 	Put(context.Context, string, string, io.Reader) (int64, error)
 	Open(context.Context, string, string) (io.ReadCloser, error)
 	Size(context.Context, string, string) (int64, error)
 	Delete(context.Context, string, string) error
+}
+
+// BlobURLStore is an optional BlobStore extension. When the authority's store
+// implements it, an authorized download answers with a URL valid for ttl that
+// the replica fetches directly, so blob bytes skip the authority. The URL is a
+// bearer capability for one sealed blob: it must name only that blob, expire,
+// and never appear in errors or logs.
+// Implementations also sign the reserved key "snapshot" for packed file lists.
+type BlobURLStore interface {
+	DownloadURL(ctx context.Context, folder, id string, ttl time.Duration) (string, error)
 }
 
 // MemoryBlobStore is useful for tests and small in-process deployments.

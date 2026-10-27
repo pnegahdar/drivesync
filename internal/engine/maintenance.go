@@ -413,6 +413,12 @@ func (s *Server) collect(ctx context.Context) error {
 		}
 	}
 	for folder := range deleted {
+		// The packed snapshot is derived and uncharged. It goes before the
+		// folder record, which is what keeps this cleanup scheduled.
+		if e = s.deleteSnapshot(ctx, folder); e != nil {
+			errs = append(errs, e)
+			continue
+		}
 		e = s.Meta.Transaction(maintenanceScope(ctx, folder, []string{}, []string{}, []string{}), func(m *Metadata) error {
 			f, ok := m.Folders[folder]
 			if !ok || !f.Deleted {

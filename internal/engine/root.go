@@ -367,16 +367,24 @@ func (r *Replica) deleteSafety(local map[string]LocalFile) error {
 		if entry.Deleted || entry.Directory || r.localBlocked(p) || r.ignore(entry.Local, entry.Directory, patterns) {
 			continue
 		}
+		// Expected remote-only absence is virtual presence and does not enter
+		// the baseline. Losing its physical container is an actual subtree
+		// removal, so protect that deletion just like missing placeholders.
+		if entry.RemoteOnly {
+			if _, present := local[p]; present {
+				continue
+			}
+		}
 		tracked++
 		if v, ok := local[p]; ok && !v.Directory {
 			present++
 			presentBytes += v.Size
 			continue
 		}
-		if sizes := moved[entry.Hash]; len(sizes) > 0 {
+		if sizes := moved[entry.hashString()]; len(sizes) > 0 {
 			present++
 			presentBytes += sizes[len(sizes)-1]
-			moved[entry.Hash] = sizes[:len(sizes)-1]
+			moved[entry.hashString()] = sizes[:len(sizes)-1]
 			continue
 		}
 		missing++
@@ -562,7 +570,7 @@ func (r *Replica) rebindRoot() error {
 		return e
 	}
 	defer tx.Rollback()
-	for _, table := range []string{"entries", "pending", "tombstones"} {
+	for _, table := range []string{"entries", "pending", "tombstones", "dirs"} {
 		if _, e = tx.Exec("DELETE FROM " + table); e != nil {
 			return e
 		}
@@ -586,8 +594,12 @@ func (r *Replica) rebindRoot() error {
 	r.version = 0
 	r.baselineFiles = 0
 	r.baselineBytes = 0
+	r.mu.Lock()
+	r.status.Placeholders = 0
+	r.status.PlaceholderBytes = 0
+	r.mu.Unlock()
 	r.index = map[string]IndexEntry{}
-	r.byID = map[string]string{}
+	r.byID = map[[32]byte]string{}
 	r.byLocal = map[string]string{}
 	r.byFold = map[string]string{}
 	r.tombstones = map[string]uint64{}

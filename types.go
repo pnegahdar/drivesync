@@ -110,6 +110,23 @@ type Options struct {
 	// Moved tells Attach this directory is the same root renamed on the same
 	// volume. A matching marker token and inode keep the replica index.
 	Moved bool
+	// OnDemand lists every remote file but downloads one only when Fetch asks
+	// for it. Until then the file is an empty placeholder with no permissions,
+	// so opening it fails instead of reading wrong bytes. Downloaded files stay
+	// downloaded and sync both ways.
+	OnDemand bool
+	// Downloads bounds concurrent blob downloads; zero selects 8.
+	Downloads int
+	// MaxPlaceholders bounds the placeholders an on-demand replica creates,
+	// breadth first; zero selects 20,000. MaxFolderPlaceholders bounds one
+	// folder's direct placeholders; zero selects 1,000. A folder past either
+	// limit is collapsed: its contents stay listed in the index and its guide,
+	// and Fetch still downloads them.
+	MaxPlaceholders, MaxFolderPlaceholders int
+	// GuideName and Guide, when both are set on an on-demand replica, write a
+	// local-only file named GuideName at the root and in each collapsed folder:
+	// Guide followed by that folder's entries not downloaded here. It never syncs.
+	GuideName, Guide string
 }
 type Rejection struct{ Path, Reason string }
 type Status struct {
@@ -119,4 +136,7 @@ type Status struct {
 	Quarantined                      []string
 	LastSync                         time.Time
 	Errors                           []string
+	// Placeholders counts on-demand files not downloaded here, and
+	// PlaceholderBytes their plaintext size.
+	Placeholders, PlaceholderBytes int64
 }

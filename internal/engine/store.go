@@ -254,6 +254,11 @@ type BlobStore interface {
 	Size(context.Context, string, string) (int64, error)
 	Delete(context.Context, string, string) error
 }
+
+// BlobURLStore is the optional BlobStore extension for direct downloads.
+type BlobURLStore interface {
+	DownloadURL(ctx context.Context, folder, id string, ttl time.Duration) (string, error)
+}
 type MemoryBlobStore struct {
 	mu    sync.RWMutex
 	blobs map[string][]byte
@@ -328,7 +333,7 @@ func OpenDirectoryBlobStore(dir string) (*DirectoryBlobStore, error) {
 }
 func (b *DirectoryBlobStore) Close() error { return b.root.Close() }
 func blobPath(f, id string) (string, error) {
-	if !validID(f) || !validID(id) {
+	if !validID(f) || !validID(id) && id != SnapshotBlobID {
 		return "", ErrInvalid
 	}
 	return filepath.Join(f, id), nil

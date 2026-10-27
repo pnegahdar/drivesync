@@ -177,7 +177,7 @@ func TestAccessMatrix(t *testing.T) {
 				p                   Principal
 				read, write, manage bool
 			}{{"owner", owner, true, true, true}, {"delegated owner", Principal{"tenant", "delegated"}, true, true, true}, {"writer", Principal{"tenant", "writer"}, true, true, false}, {"reader", Principal{"tenant", "reader"}, true, false, false}, {"other tenant", Principal{"other", "owner"}, false, false, false}, {"ungranted", Principal{"tenant", "stranger"}, false, false, false}, {"revoked", Principal{"tenant", "revoked"}, false, false, false}, {"anonymous", Principal{}, false, false, false}}
-			methods := []string{"get", "changes", "wait", "download", "reserve", "upload", "commit", "cancel", "grant", "revoke", "delete", "limits", "list", "create", "prepare"}
+			methods := []string{"get", "changes", "wait", "download", "download_urls", "reserve", "upload", "commit", "cancel", "grant", "revoke", "delete", "limits", "list", "create", "prepare"}
 			for _, role := range roles {
 				for _, method := range methods {
 					t.Run(role.name+"/"+method, func(t *testing.T) {
@@ -212,6 +212,8 @@ func TestAccessMatrix(t *testing.T) {
 							_, e = c.Changes(ctx, f.ID, 0)
 						case "wait":
 							_, e = c.Wait(ctx, f.ID, 0)
+						case "download_urls":
+							_, e = c.DownloadURLs(ctx, f.ID, []string{row.BlobID})
 						case "download":
 							var r io.ReadCloser
 							r, e = c.Download(ctx, f.ID, row.BlobID)
@@ -571,7 +573,8 @@ func TestEveryOperationAfterDeletion(t *testing.T) {
 				t.Fatal(e)
 			}
 			methods := map[string]func() error{
-				"get": func() error { _, e := c.GetFolder(ctx, f.ID); return e }, "changes": func() error { _, e := c.Changes(ctx, f.ID, 0); return e }, "wait": func() error { _, e := c.Wait(ctx, f.ID, 0); return e }, "download": func() error { _, e := c.Download(ctx, f.ID, row.BlobID); return e }, "reserve": func() error {
+				"download_urls": func() error { _, e := c.DownloadURLs(ctx, f.ID, []string{row.BlobID}); return e },
+				"get":           func() error { _, e := c.GetFolder(ctx, f.ID); return e }, "changes": func() error { _, e := c.Changes(ctx, f.ID, 0); return e }, "wait": func() error { _, e := c.Wait(ctx, f.ID, 0); return e }, "download": func() error { _, e := c.Download(ctx, f.ID, row.BlobID); return e }, "reserve": func() error {
 					_, e := c.Reserve(ctx, f.ID, UploadRequest{PathID: pid, BaseVersion: 0, SealedSize: 1})
 					return e
 				}, "upload": func() error { return c.Upload(ctx, f.ID, ticket, bytes.NewReader([]byte{1})) }, "cancel": func() error { return c.CancelUpload(ctx, f.ID, ticket.ID) }, "commit": func() error {

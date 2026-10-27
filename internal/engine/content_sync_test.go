@@ -406,25 +406,26 @@ func TestBulkMoveReuploadsAndRedownloadsEverything(t *testing.T) {
 		writeLocal(t, a, fmt.Sprintf("datasets/raw/f%d.bin", i), strings.Repeat(fmt.Sprint(i), 64<<10/len(fmt.Sprint(i))))
 	}
 	syncTree(t, a, b)
-	up.n, down.n = 0, 0
+	up.n.Store(0)
+	down.n.Store(0)
 	if e := os.Rename(filepath.Join(a.dir, "datasets"), filepath.Join(a.dir, "archive-2026")); e != nil {
 		t.Fatal(e)
 	}
 	syncTree(t, a, b)
-	if down.n > 1<<20 {
-		t.Fatalf("renaming a 4 MB directory uploaded %d and re-downloaded %d bytes", up.n, down.n)
+	if down.n.Load() > 1<<20 {
+		t.Fatalf("renaming a 4 MB directory uploaded %d and re-downloaded %d bytes", up.n.Load(), down.n.Load())
 	}
 }
 
 type byteCounter struct {
 	Client
-	n int64
+	n atomic.Int64
 }
 
 func (c *byteCounter) Upload(ctx context.Context, id string, t Ticket, r io.Reader) error {
 	cr := &countReader{Reader: r}
 	e := c.Client.Upload(ctx, id, t, cr)
-	c.n += cr.n
+	c.n.Add(cr.n)
 	return e
 }
 func (c *byteCounter) Download(ctx context.Context, id, blob string) (io.ReadCloser, error) {
@@ -442,7 +443,7 @@ type countingReader struct {
 
 func (r *countingReader) Read(p []byte) (int, error) {
 	n, e := r.ReadCloser.Read(p)
-	r.c.n += int64(n)
+	r.c.n.Add(int64(n))
 	return n, e
 }
 

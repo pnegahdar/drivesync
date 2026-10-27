@@ -192,8 +192,13 @@ func TestCaseAliasCollision(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer db.Close()
-	var count int
-	e = db.QueryRow("SELECT COUNT(*) FROM entries WHERE json_extract(data,'$.Local')=?", alias).Scan(&count)
+	count := 0
+	e = ds.LoadIndex(db, func(v ds.IndexEntry) error {
+		if v.Local == alias {
+			count++
+		}
+		return nil
+	})
 	if e != nil {
 		t.Fatal(e)
 	}

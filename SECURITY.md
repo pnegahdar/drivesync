@@ -46,6 +46,20 @@ the same error. Revocation and deletion invalidate open waits and outstanding
 upload tickets. Bytes already delivered stay readable, because revocation does
 not rotate the key.
 
+An authorized principal may receive a short-lived signed URL for one sealed
+blob when the blob store supports it. These URLs expire within five minutes.
+Revocation and deletion cannot recall URLs already issued; the bearer can read
+that ciphertext until expiry. The bytes remain encrypted and authenticated, and
+replicas send no authority credentials to the blob URL. Signed URLs must never
+appear in status, errors, or logs.
+
+The same authorization and five-minute lifetime apply to packed file-list
+snapshots. They carry opaque paths and sealed metadata, never plaintext names
+or contents. The fixed blob key `snapshot` is derived data outside folder quota
+and is removed during folder cleanup. Ordinary download/upload operations do
+not grant access to that key. Replicas validate its folder, version and bounded
+framing, authenticate each row, and catch up through the regular change feed.
+
 ### Malicious authority
 
 A malicious authority can delete files or roll them back to older ciphertext
@@ -114,6 +128,48 @@ Replica state stores plaintext paths. The default directory is under the user
 cache, private to that folder and root. An explicit state directory must be
 dedicated to that attachment and outside every attachment. Nested and
 overlapping attachments are refused.
+
+On-demand replicas represent unfetched files with empty regular files whose
+permission bits are `0000`. Placeholders contain no content, and their real
+sizes, hashes, modes and blob references from authenticated metadata live in
+private replica state. Ordinary
+unprivileged reads fail until `Fetch` authenticates and publishes the content.
+Privileged processes can bypass permissions and must consult replica state.
+Scans identify placeholders by device and inode and never upload their empty
+bytes. A move is hydrated before its atomic rename commit. An empty `0000`
+file matching an authenticated incoming row can be adopted as its placeholder;
+other unrecognized empty `0000` files are skipped. Unlocking a placeholder
+requests hydration, and a real local write is treated as a normal edit.
+
+Placeholder creation batches at most 1,000 index entries. Empty files need no
+data flush; each affected parent directory is synced before the index batch
+commits. A crash can leave unindexed placeholders, which a replayed incoming
+row adopts, while the pull cursor stays behind uncommitted entries. Downloaded
+contents still authenticate and fsync before their index entries can commit.
+
+The private index shares directory prefixes and uses a versioned binary entry
+format. Existing JSON indexes migrate in one SQLite transaction. Entries do not
+retain sealed metadata: hydration derives the original path id and sealed size,
+authenticates the content stream bound to that folder, blob and path, and checks
+the plaintext size and hash against the index before publication. A moved
+placeholder keeps its original path binding until the rename commits. Unapplied
+remote updates retain their sealed metadata until authenticated and applied.
+
+Large on-demand folders may collapse: their directory exists, while unfetched
+descendants live only in the private index. Their intentional absence never
+becomes a local delete or contributes to the mass-removal baseline. Removing
+the containing collapsed directory requests deletion of its subtree under the
+same deletion guard, counting the removed container's unfetched files as missing.
+A new local file at an unseen remote path is preserved as
+a conflict copy. Fetching one path leaves other remote-only entries untouched.
+
+An optional guide is local derived data, atomically replaced and regenerated
+after restart; it contains plaintext names, counts and sizes already available
+in the private index. Its configured name is reserved at every directory level,
+and matching remote entries are ignored locally. Guides never upload or enter
+replica accounting. Placeholder publication and scans use verified per-directory
+handles, refusing symlinks and foreign markers throughout the traversal. A pull
+rechecks each directory's identity before making its index entries durable.
 
 ## Reporting a vulnerability
 

@@ -24,6 +24,10 @@ type Server struct {
 	// including one in the same process, leaves that lease alone until it
 	// expires. This authority retires its own ticket once publication ends.
 	writerID string
+	// SnapshotRows is the live-row count at which Snapshot offers a packed
+	// snapshot. Zero selects 1,000; negative disables snapshots.
+	SnapshotRows int
+	snapshots    snapshotCache
 }
 
 func NewServer(meta MetaStore, blobs BlobStore) *Server {
@@ -783,6 +787,10 @@ func (s *Server) Changes(ctx context.Context, p Principal, id string, after uint
 	return out, e
 }
 func (s *Server) blobAccess(ctx context.Context, p Principal, id, blob string) error {
+	// Only ticketed hex ids are downloadable; derived keys never are.
+	if !validID(blob) {
+		return ErrDenied
+	}
 	if reader, ok := s.Meta.(authorizationReader); ok {
 		_, e := reader.authorize(ctx, p, id, false, "", blob, s.now())
 		return e
@@ -808,6 +816,30 @@ func (s *Server) Download(ctx context.Context, p Principal, id, blob string) (io
 		return nil, e
 	}
 	return &checkedReadCloser{checkedReader{r, func() error { return s.blobAccess(ctx, p, id, blob) }}, r}, nil
+}
+
+// DownloadURLs authorizes the entire request before issuing bearer URLs.
+func (s *Server) DownloadURLs(ctx context.Context, p Principal, id string, blobs []string) ([]string, error) {
+	if len(blobs) > 256 {
+		return nil, ErrInvalid
+	}
+	if _, e := s.GetFolder(ctx, p, id); e != nil {
+		return nil, e
+	}
+	for _, blob := range blobs {
+		if e := s.blobAccess(ctx, p, id, blob); e != nil {
+			return nil, e
+		}
+	}
+	urls := make([]string, len(blobs))
+	if store, ok := s.Blobs.(BlobURLStore); ok {
+		for i, blob := range blobs {
+			if u, e := store.DownloadURL(ctx, id, blob, 5*time.Minute); e == nil {
+				urls[i] = u
+			}
+		}
+	}
+	return urls, nil
 }
 
 type checkedReader struct {
@@ -933,6 +965,12 @@ func (c *InProcessClient) Changes(x context.Context, id string, v uint64) (Delta
 }
 func (c *InProcessClient) Download(x context.Context, id, blob string) (io.ReadCloser, error) {
 	return c.Server.Download(x, c.Principal, id, blob)
+}
+func (c *InProcessClient) DownloadURLs(ctx context.Context, id string, blobs []string) ([]string, error) {
+	return c.Server.DownloadURLs(ctx, c.Principal, id, blobs)
+}
+func (c *InProcessClient) Snapshot(x context.Context, id string) (uint64, string, error) {
+	return c.Server.Snapshot(x, c.Principal, id)
 }
 func (c *InProcessClient) Wait(x context.Context, id string, v uint64) (uint64, error) {
 	return c.Server.Wait(x, c.Principal, id, v)

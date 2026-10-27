@@ -19,6 +19,7 @@ import (
 type Authenticator func(*http.Request) (Principal, error)
 type WireRequest struct {
 	Op, Folder, Ticket, Blob string
+	Blobs                    []string `json:",omitempty"`
 	Spec                     FolderSpec
 	Grantee                  Principal
 	Role                     Role
@@ -41,6 +42,8 @@ type wireResponse struct {
 	Ticket    Ticket
 	Delta     Delta
 	Version   uint64
+	URLs      []string   `json:",omitempty"`
+	URL       string     `json:",omitempty"`
 	Error     *wireError `json:",omitempty"`
 }
 
@@ -203,6 +206,10 @@ func (s *Server) Handler(auth Authenticator) http.Handler {
 				out.Delta, e = c.Commit(r.Context(), req.Folder, req.Mutations)
 			case "changes":
 				out.Delta, e = s.ChangesPage(r.Context(), p, req.Folder, req.After, req.Until, req.Page)
+			case "download_urls":
+				out.URLs, e = c.DownloadURLs(r.Context(), req.Folder, req.Blobs)
+			case "snapshot":
+				out.Version, out.URL, e = c.Snapshot(r.Context(), req.Folder)
 			case "wait":
 				ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 				out.Version, e = c.Wait(ctx, req.Folder, req.After)
@@ -456,6 +463,25 @@ func (c *HTTPClient) Download(x context.Context, id, blob string) (io.ReadCloser
 		return nil, decodeError(v.Error)
 	}
 	return r.Body, nil
+}
+
+func (c *HTTPClient) DownloadURLs(ctx context.Context, folder string, blobs []string) ([]string, error) {
+	if len(blobs) > 256 {
+		return nil, ErrInvalid
+	}
+	r, e := c.rpc(ctx, WireRequest{Op: "download_urls", Folder: folder, Blobs: blobs})
+	return r.URLs, e
+}
+
+func (c *HTTPClient) Snapshot(ctx context.Context, folder string) (uint64, string, error) {
+	r, e := c.rpc(ctx, WireRequest{Op: "snapshot", Folder: folder})
+	if e != nil {
+		return 0, "", e
+	}
+	if r.Version == 0 || r.URL == "" {
+		return 0, "", nil
+	}
+	return r.Version, r.URL, nil
 }
 
 func (c *HTTPClient) decodeResponse(r io.Reader, v any) error {

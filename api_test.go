@@ -199,7 +199,7 @@ func TestAPIHidesProtocolFields(t *testing.T) {
 		reflect.TypeFor[Folder]():     {"ID", "Name", "Description", "Owner", "Role", "Limits", "Usage"},
 		reflect.TypeFor[FolderSpec](): {"Name", "Description", "Limits"},
 		reflect.TypeFor[Usage]():      {"Bytes", "Files", "Reserved"},
-		reflect.TypeFor[Status]():     {"PendingUpBytes", "PendingDownBytes", "Conflicts", "Rejected", "Quarantined", "LastSync", "Errors"},
+		reflect.TypeFor[Status]():     {"PendingUpBytes", "PendingDownBytes", "Conflicts", "Rejected", "Quarantined", "LastSync", "Errors", "Placeholders", "PlaceholderBytes"},
 	}
 	for typ, fields := range want {
 		if typ.NumField() != len(fields) {

@@ -2,6 +2,7 @@ package drivesync
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"github.com/pnegahdar/drivesync/internal/engine"
 	"os"
@@ -58,7 +59,13 @@ func scanBenchmark(b *testing.B, indexed bool) {
 			b.Fatal(e)
 		}
 		for _, v := range files {
-			r.replica.Remember(engine.IndexEntry{Path: v.Path, Local: v.Local, Hash: v.Hash, Directory: v.Directory, Mode: v.Mode, Version: 1})
+			var hash [32]byte
+			if !v.Directory {
+				if _, e := hex.Decode(hash[:], []byte(v.Hash)); e != nil {
+					b.Fatal(e)
+				}
+			}
+			r.replica.Remember(engine.IndexEntry{Path: v.Path, Local: v.Local, Hash: hash, Directory: v.Directory, Mode: v.Mode, Version: 1})
 		}
 	}
 	b.ResetTimer()

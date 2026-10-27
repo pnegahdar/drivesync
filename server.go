@@ -20,6 +20,10 @@ type ServerOptions struct {
 	// Zero keeps the default of 256. Embedders that share one principal
 	// across many clients set this higher.
 	MaxWaitsPerPrincipal int
+	// SnapshotRows is the live-row count at which a folder whose blob store
+	// signs URLs offers new replicas a packed snapshot. Zero selects 1,000;
+	// negative disables snapshots.
+	SnapshotRows int
 }
 
 // Server authorizes every operation independently of transport authentication.
@@ -42,6 +46,7 @@ func NewServer(meta *MetaStore, blobs BlobStore, opts ServerOptions) *Server {
 	if opts.Clock != nil {
 		s.Now = opts.Clock
 	}
+	s.SnapshotRows = opts.SnapshotRows
 	if opts.MaxWaitsPerPrincipal > 0 {
 		s.SetMaxWaitsPerPrincipal(opts.MaxWaitsPerPrincipal)
 	}

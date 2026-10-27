@@ -620,7 +620,7 @@ func BenchmarkIndexedScan10K(b *testing.B) {
 		b.Fatal(e)
 	}
 	for _, v := range scanned {
-		r.Remember(IndexEntry{Path: v.Path, Local: v.Local, Hash: v.Hash, Directory: v.Directory, Mode: v.Mode, Version: 1})
+		r.Remember(IndexEntry{Path: v.Path, Local: v.Local, Hash: indexHash(v.Hash), Directory: v.Directory, Mode: v.Mode, Version: 1})
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

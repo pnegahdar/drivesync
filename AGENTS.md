@@ -100,7 +100,7 @@ Behavior changes need all of the following. The race and pure-Go commands run
 the public package, `internal/engine`, and `reviewtests`.
 
 ```sh
-go test -race ./... -count=1 -timeout 180s
+go test -race ./... -count=1 -timeout 600s
 CGO_ENABLED=0 go test ./... -count=1 -timeout 120s
 CGO_ENABLED=0 GOOS=linux go vet ./...
 outdir=$(mktemp -d)

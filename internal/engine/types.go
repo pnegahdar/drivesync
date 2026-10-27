@@ -159,6 +159,10 @@ type Client interface {
 	Commit(context.Context, string, []Mutation) (Delta, error)
 	Changes(context.Context, string, uint64) (Delta, error)
 	Download(context.Context, string, string) (io.ReadCloser, error)
+	DownloadURLs(context.Context, string, []string) ([]string, error)
+	// Snapshot returns a packed snapshot's version and a short-lived bearer
+	// URL, or zero and "" when none is offered. Decode it with ReadSnapshot.
+	Snapshot(context.Context, string) (uint64, string, error)
 	Wait(context.Context, string, uint64) (uint64, error)
 }
 
