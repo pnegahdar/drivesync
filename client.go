@@ -16,6 +16,18 @@ func NewHTTPClient(url string, headers http.Header) *Client {
 	return &Client{client: engine.NewHTTPClient(url, headers)}
 }
 
+// NewHTTPClientWithClient is NewHTTPClient sending authority requests through
+// client, such as one whose transport adds credentials that rotate. Blob
+// transfers to presigned URLs never use it, so those credentials stay off
+// blob hosts. A nil client behaves as NewHTTPClient.
+func NewHTTPClientWithClient(url string, headers http.Header, client *http.Client) *Client {
+	c := engine.NewHTTPClient(url, headers)
+	if client != nil {
+		c.HTTP = client
+	}
+	return &Client{client: c}
+}
+
 // CreateFolder computes the key check locally; the key is never sent to the
 // authority. Keep it securely and supply the same key to every attachment.
 func (c *Client) CreateFolder(ctx context.Context, spec FolderSpec, key FolderKey) (Folder, error) {
